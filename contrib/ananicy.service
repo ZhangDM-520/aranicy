@@ -1,0 +1,31 @@
+[Unit]
+Description=aranicy - auto-nice daemon (eBPF exec events)
+Documentation=https://github.com/ZhangDM-520/aranicy
+After=local-fs.target
+Conflicts=ananicy-cpp.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/aranicy start
+ExecReload=/usr/bin/aranicy --reload
+Nice=-5
+OOMScoreAdjust=-999
+Restart=always
+RestartSec=10
+
+# Hardening (kept from the ananicy-cpp unit shape; cgroups must stay writable)
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectControlGroups=no
+PrivateUsers=no
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_BPF CAP_PERFMON
+
+[Install]
+WantedBy=multi-user.target

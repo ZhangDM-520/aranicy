@@ -1,0 +1,14 @@
+[package]
+name = "aranicy-apply"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "aranicy_apply"
+
+[dependencies]
+aranicy-model.workspace = true
+libc.workspace = true

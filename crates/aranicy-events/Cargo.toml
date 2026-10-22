@@ -1,0 +1,15 @@
+[package]
+name = "aranicy-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "aranicy_events"
+
+[dependencies]
+thiserror.workspace = true
+libc.workspace = true
+libbpf-rs = "0.27"

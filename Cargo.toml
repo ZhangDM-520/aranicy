@@ -1,0 +1,39 @@
+# aranicy workspace.
+#
+# Crate split follows the hot-path boundaries measured in Phase 0
+# (docs/BENCHMARKS.md): model/rules must be allocation-light per event, apply
+# is syscall-only, events owns the kernel interface, daemon wires them together.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/aranicy-model",
+    "crates/aranicy-rules",
+    "crates/aranicy-events",
+    "crates/aranicy-apply",
+    "crates/aranicy-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ZhangDM-520/aranicy"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aranicy-model = { path = "crates/aranicy-model" }
+aranicy-rules = { path = "crates/aranicy-rules" }
+aranicy-events = { path = "crates/aranicy-events" }
+aranicy-apply = { path = "crates/aranicy-apply" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+notify = "8"
+anyhow = "1"

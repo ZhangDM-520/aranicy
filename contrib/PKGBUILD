@@ -1,0 +1,40 @@
+# Maintainer: ZhangDM-520
+# Packager note: staging PKGBUILD; validated with bash -n and
+# makepkg --printsrcinfo once the binary ships. Conflicts with ananicy-cpp
+# (both own the auto-nice role and /etc/ananicy.d).
+
+pkgname=aranicy
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Auto-nice daemon in Rust (eBPF exec events, ananicy-compatible rules)"
+arch=('x86_64')
+url="https://github.com/ZhangDM-520/aranicy"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'libelf' 'zlib')
+makedepends=('cargo' 'clang' 'llvm')
+provides=('ananicy-cpp')
+conflicts=('ananicy-cpp')
+backup=('etc/ananicy.d/ananicy.conf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    cargo fetch --locked
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --frozen --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 target/release/aranicy "$pkgdir/usr/bin/aranicy"
+    install -Dm644 contrib/ananicy.service \
+        "$pkgdir/usr/lib/systemd/system/aranicy.service"
+    install -Dm644 contrib/ananicy.conf \
+        "$pkgdir/etc/ananicy.d/ananicy.conf"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

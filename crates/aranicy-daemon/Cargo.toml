@@ -1,0 +1,28 @@
+[package]
+name = "aranicy-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aranicy"
+path = "src/main.rs"
+
+[dependencies]
+aranicy-model.workspace = true
+aranicy-rules.workspace = true
+aranicy-events.workspace = true
+aranicy-apply.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Tests build synthetic `RuleSet`s; populating the public `regexes` field needs
+# the `regex` type directly (already in the workspace dependency set).
+regex.workspace = true
