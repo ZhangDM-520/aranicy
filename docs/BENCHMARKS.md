@@ -83,3 +83,50 @@ windows: 4–5% unruled, 8–11% ruled — even the spikes stay near the baselin
 `argv[0] = gsa-smoke-uniq` received its rule at spawn (`nice=7`,
 best-effort prio 3), i.e. the eBPF → name-resolution → match → apply chain
 works end to end, verified via the observed target state.
+
+## Packaged-binary measurements + profile (2026-10-23, `aranicy-0.1.0-1`)
+
+The gsa tree recipe builds a binary identical in behavior; two runs of the
+same package on the same host differ by **3× in wall-% — purely
+environmental**:
+
+| condition | 03:29 run (3.1 GHz, IPC 0.9) | 21:33 run (powersave 1.8 GHz, IPC 0.4) |
+|---|---|---|
+| idle | 0.0% | 0.0% |
+| 2 000 execs/s, unruled | **2.05%** | 6.55% |
+| 2 000 execs/s, ruled | **3.92%** | 8.40% |
+
+The **instruction count per run is constant** (1.22 G vs 1.32 G for the
+30 s `perf stat` window): the work per exec event is ≈ **20–22 k
+instructions** and does not depend on load, host power state, or clock.
+Wall-% is a function of the CPU governor/frequency — benchmark comparisons
+must pin the governor (or compare instruction counts), and the ≤5% target
+holds at normal boost frequencies (3.1 GHz measured).
+
+Symbol-resolved `perf record` (2 000 execs/s storm, `kptr_restrict=1`
+during capture) — cycle shares:
+
+| share | where | what |
+|---|---|---|
+| ~19% | kernel VFS | `path_openat`, `proc_root_lookup`, `d_alloc_parallel`, `proc_alloc_inode`, `new_inode`, `kmem_cache_alloc_lru*`, `memcg_post_alloc_hook` — the per-event `/proc/<pid>/cmdline` open |
+| ~7% | wakeups | `schedule`, `bpf_map_poll`, `do_epoll_wait`, `epoll_wait` — one context-switch per event (1.7 k/s) |
+| ~3% | userspace | daemon hot functions (profile captured on the stripped package binary) |
+| ~3% | misc | `memset`, `__vdso_clock_gettime`, `task_exec_state_rcu` (kernel exec-side) |
+
+### Optimization targets (ranked, for the next round)
+
+1. **Event-name fast path** — the `/proc/<pid>/cmdline` open+read is the
+   dominant cost. Exact-compat matching needs `basename(argv[0])`, so the
+   read is irreducible *by default*; an opt-in `name_source = execfile`
+   mode (trust the tracepoint's `filename` basename + comm, zero `/proc`
+   reads) would cut ~19% of cycles for users whose rules don't rely on
+   argv[0]-spoofed names (the `exec -a` case).
+2. **Batch the ringbuf drain + short busy-poll** — one wakeup per event
+   costs ~7%; draining batches and spinning briefly (e.g. 25–50 µs) after
+   each wakeup collapses context-switches under storms. Sound, no compat
+   impact.
+3. **Cheaper `/proc` read (default path)** — openat on a cached `/proc`
+   dirfd, single pread into the stack buffer; trims path-walk constants.
+4. **Profile the unstripped binary** — 3%+ of cycles sit in unsymbolized
+   daemon functions; capture with debug symbols before optimizing
+   userspace.
