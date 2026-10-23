@@ -16,7 +16,7 @@ provides=('ananicy-cpp')
 conflicts=('ananicy-cpp')
 backup=('etc/ananicy.d/ananicy.conf')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('89e9dfad141c9159a5493ddec5b1d217dba6cb2e4f351e76f2d4c1663b253ebc')
 
 prepare() {
     cd "$pkgname-$pkgver"
@@ -26,6 +26,11 @@ prepare() {
 build() {
     cd "$pkgname-$pkgver"
     cargo build --frozen --release
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test --frozen --workspace
 }
 
 package() {

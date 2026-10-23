@@ -42,6 +42,23 @@ sudo ./target/release/aranicy start        # root required
 ./target/release/aranicy dump rules        # unprivileged inspection
 ```
 
+## Install
+
+Generic installer (binary + systemd unit + config; keeps any existing
+`/etc/ananicy.d` rules corpus; replaces `ananicy-cpp` unless told otherwise):
+
+```sh
+./contrib/install.sh                  # build if needed, install, enable --now
+./contrib/install.sh --dry-run        # show actions only
+./contrib/install.sh --keep-ananicy-cpp --no-enable
+./contrib/install.sh --uninstall      # remove binary + unit, keep config
+```
+
+Arch packaging: `contrib/PKGBUILD` (or the curated gsa-tree recipe
+`packages/stable/aranicy`). After install the daemon lives in systemd like
+ananicy-cpp did: `systemctl status aranicy`, `systemctl reload aranicy`
+(rules + config reload).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Rule *data* from the ananicy ecosystem (e.g.
