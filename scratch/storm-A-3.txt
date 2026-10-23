@@ -1,0 +1,1 @@
+RESULT execs=80000 elapsed=40.001 rate=2000.0

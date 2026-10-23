@@ -1,0 +1,15 @@
+
+ Performance counter stats for process id '4180609':
+
+            73,064      context-switches                 #  57954.8 cs/sec  cs_per_second     
+             3,919      cpu-migrations                   #   3108.6 migrations/sec  migrations_per_second
+                 0      page-faults                      #      0.0 faults/sec  page_faults_per_second
+          1,260.71 msec task-clock                       #      0.0 CPUs  CPUs_utilized       
+         7,369,598      branch-misses                    #      2.2 %  branch_miss_rate         (67.08%)
+       337,536,686      branches                         #    267.7 M/sec  branch_frequency     (72.41%)
+     2,297,796,760      cpu-cycles                       #      1.8 GHz  cycles_frequency       (80.41%)
+     1,675,610,043      instructions                     #      0.7 instructions  insn_per_cycle  (64.79%)
+       701,255,789      stalled-cycles-frontend          #     0.30 frontend_cycles_idle        (43.02%)
+
+      30.001045486 seconds time elapsed
+

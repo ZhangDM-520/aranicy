@@ -130,3 +130,41 @@ during capture) — cycle shares:
 4. **Profile the unstripped binary** — 3%+ of cycles sit in unsymbolized
    daemon functions; capture with debug symbols before optimizing
    userspace.
+
+## Optimization round OPT2+OPT3 (2026-10-23, A/B same session)
+
+Method: pristine-HEAD binary (A) vs changed build (B) back-to-back in one
+session, governor pinned `performance` on all 24 CPUs (restored after),
+`ananicy-cpp` stopped for the windows, full corpus, storm at 2000 execs/s.
+Instructions/event = perf instructions over a 30 s window (60 000 events).
+Raw data: `~/Workspace/aranicy-bench/results-opt23.jsonl`; perf captures,
+strace proof and runner scripts in the worktree's `scratch/`.
+
+| metric | A (HEAD) | B spin=30 µs (brief default) | B spin=0 (**shipped**) |
+|---|---|---|---|
+| wall-% idle | 0.00 | 0.03 | 0.03 |
+| wall-% unruled, median [range] | 4.83 [4.52–5.03] | **12.42** [11.12–13.37] | 7.60 [4.45–9.05] |
+| wall-% ruled, median [range] | 8.75 [6.12–9.72] | **12.37** [12.03–14.87] | 8.75 [5.93–8.85] |
+| instructions/event (3 captures) | 24.4k / 24.1k / 25.1k | **111.5k** | 24.3k / 23.3k / 25.3k |
+| cs/s @2000 execs/s | 2006 / 2082 / 2167 | 2014 | 2035 / 2056 / 2159 |
+| cycles_frequency | 1.7–2.0 GHz | 2.4 GHz | 1.8 GHz |
+
+Verdicts (deltas called only where they clear noise):
+
+- **30 µs busy-spin: clear regression, expected effect absent.** +157% wall
+  (unruled), +357% instructions/event, cs/s unchanged (2006→2014). The paced
+  generator's arrivals are ~uniform (1.0 cs/event): the spin rides its window
+  empty (~30 µs CPU per event) and collapses nothing. Shipped default is
+  therefore **0 µs** (consume-all-before-blocking drain stays unconditional);
+  `ANANICY_RS_BUSY_SPIN_US` raises the window for genuinely bursty workloads.
+- **B spin=0 vs A: within noise at the invariants.** instructions/event means
+  24.5k vs 24.3k (paired capture deltas −0.04% / −3.7% / +1.0%), cs/s
+  identical (~1.0/event). Wall-% deltas are not callable: run-to-run spread
+  reached ±35% and IPC drifted 0.87→0.67 across the session (same-session
+  pairing mitigates but does not remove this).
+- OPT3 mechanism verified by strace: `openat(fd, "NNN/cmdline")` /
+  `readlinkat(fd, "NNN/exe")` on the startup-opened `/proc` dirfd — 3 534
+  dirfd-relative resolver opens vs 0 absolute. The `/proc` root component is
+  a cached dentry lookup; skipping it saves less than the profile's 19%
+  open-path share suggests (the per-`<pid>` and per-file dentry/inode allocs
+  remain). Functional spoofed-argv[0] proof green (nice 7 + best-effort 3).

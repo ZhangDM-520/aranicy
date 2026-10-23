@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::load;
 use crate::paths::{self, Paths};
 use crate::pidfile::{self, PidFile};
-use crate::procname::{self, NAME_CAP, STAT_CAP};
+use crate::procname::{self, ProcResolver, NAME_CAP, STAT_CAP};
 use crate::sdnotify;
 
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
@@ -116,6 +116,8 @@ struct Shared {
     config: RwLock<Arc<Config>>,
     cgroups: RwLock<Arc<CgroupManager>>,
     caps: Capabilities,
+    /// Startup-owned `/proc` dirfd resolver (openat hot path; closed on drop).
+    proc: ProcResolver,
     counters: Mutex<Counters>,
     shutdown: AtomicBool,
     drift_cv: Condvar,
@@ -195,6 +197,7 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
         config: RwLock::new(Arc::new(cfg)),
         cgroups: RwLock::new(Arc::new(cgroups)),
         caps,
+        proc: ProcResolver::open(),
         counters: Mutex::new(Counters::default()),
         shutdown: AtomicBool::new(false),
         drift_cv: Condvar::new(),
@@ -421,7 +424,7 @@ struct SummaryState {
 
 fn handle_event(shared: &Shared, ev: &ExecEvent) {
     let mut buf = [0u8; NAME_CAP];
-    let len = procname::derive_name(ev.pid, ev.comm_bytes(), &mut buf);
+    let len = shared.proc.derive_name(ev.pid, ev.comm_bytes(), &mut buf);
     if len == 0 {
         shared
             .counters
@@ -551,7 +554,7 @@ fn drift_scan(shared: &Shared) {
             continue;
         };
         let mut stat = [0u8; STAT_CAP];
-        let Some(n) = procname::read_stat(pid, &mut stat) else {
+        let Some(n) = shared.proc.read_stat(pid, &mut stat) else {
             continue;
         };
         let Some(current_nice) = procname::stat_nice(&stat[..n]) else {
@@ -560,7 +563,7 @@ fn drift_scan(shared: &Shared) {
         let comm = procname::stat_comm(&stat[..n]).unwrap_or(b"");
 
         let mut buf = [0u8; NAME_CAP];
-        let len = procname::derive_name(pid, comm, &mut buf);
+        let len = shared.proc.derive_name(pid, comm, &mut buf);
         if len == 0 {
             continue;
         }

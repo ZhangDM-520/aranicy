@@ -1,0 +1,15 @@
+
+ Performance counter stats for process id '4050723':
+
+            64,763      context-switches                 #  52250.2 cs/sec  cs_per_second     
+             2,039      cpu-migrations                   #   1645.0 migrations/sec  migrations_per_second
+                 0      page-faults                      #      0.0 faults/sec  page_faults_per_second
+          1,239.48 msec task-clock                       #      0.0 CPUs  CPUs_utilized       
+         7,493,860      branch-misses                    #      2.5 %  branch_miss_rate         (49.37%)
+       304,582,434      branches                         #    245.7 M/sec  branch_frequency     (67.63%)
+     2,266,278,476      cpu-cycles                       #      1.8 GHz  cycles_frequency       (66.85%)
+     1,518,349,110      instructions                     #      0.7 instructions  insn_per_cycle  (66.64%)
+       736,072,345      stalled-cycles-frontend          #     0.33 frontend_cycles_idle        (68.78%)
+
+      30.000907496 seconds time elapsed
+

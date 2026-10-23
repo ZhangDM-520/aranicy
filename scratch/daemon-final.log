@@ -1,0 +1,20 @@
+[libbpf:Debug] libbpf: loading object '563ecc7d967f-22b0' from buffer
+[libbpf:Debug] libbpf: elf: section(3) tp/sched/sched_process_exec, size 720, link 0, flags 6, type=1
+[libbpf:Debug] libbpf: sec 'tp/sched/sched_process_exec': found program 'handle_exec' at insn offset 0 (0 bytes), code size 90 insns (720 bytes)
+[libbpf:Debug] libbpf: elf: section(4) .reltp/sched/sched_process_exec, size 16, link 26, flags 40, type=9
+[libbpf:Debug] libbpf: elf: section(5) license, size 4, link 0, flags 3, type=1
+[libbpf:Debug] libbpf: license of 563ecc7d967f-22b0 is GPL
+[libbpf:Debug] libbpf: elf: section(6) .maps, size 16, link 0, flags 3, type=1
+[libbpf:Debug] libbpf: elf: section(16) .BTF, size 857, link 0, flags 0, type=1
+[libbpf:Debug] libbpf: elf: section(18) .BTF.ext, size 976, link 0, flags 0, type=1
+[libbpf:Debug] libbpf: elf: section(26) .symtab, size 336, link 1, flags 0, type=2
+[libbpf:Debug] libbpf: looking for externs among 14 symbols...
+[libbpf:Debug] libbpf: collected 0 externs total
+[libbpf:Debug] libbpf: map 'events': at sec_idx 6, offset 0.
+[libbpf:Debug] libbpf: map 'events': found type = 27.
+[libbpf:Debug] libbpf: map 'events': found max_entries = 1048576.
+[libbpf:Debug] libbpf: sec '.reltp/sched/sched_process_exec': collecting relocation for section(3) 'tp/sched/sched_process_exec'
+[libbpf:Debug] libbpf: sec '.reltp/sched/sched_process_exec': relo #0: insn #0 against 'events'
+[libbpf:Debug] libbpf: prog 'handle_exec': found map 0 (events, sec 6, off 0) for insn #0
+[libbpf:Debug] libbpf: object '563ecc7d967f-22': failed (-95) to create BPF token from '/sys/fs/bpf', skipping optional step...
+[libbpf:Debug] libbpf: map 'events': created successfully, fd=4

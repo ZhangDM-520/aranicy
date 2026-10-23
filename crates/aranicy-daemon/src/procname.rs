@@ -5,9 +5,16 @@
 //! COMPATIBILITY.md): `basename(argv[0])` from `/proc/<pid>/cmdline` (first
 //! NUL-terminated argument only, capped), then `basename(/proc/<pid>/exe)`
 //! with a trailing `" (deleted)"` stripped, then the event's comm bytes.
+//!
+//! `/proc` access goes through [`ProcResolver`]: `/proc` is opened once as a
+//! dirfd (`O_PATH|O_DIRECTORY|O_CLOEXEC`) and per-event reads use
+//! `openat`/`readlinkat` relative to it (one fewer path-component walk than
+//! the absolute path, pid formatted into a stack buffer, no allocation).
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// Cap for the derived name / `/proc` read buffer (brief: ~256 bytes).
 pub const NAME_CAP: usize = 256;
@@ -45,9 +52,9 @@ pub fn strip_deleted(target: &[u8]) -> &[u8] {
     }
 }
 
-/// Build the NUL-terminated `/proc/<pid>/<suffix>` path; returns the length
-/// excluding the NUL (`out[len] == 0` is guaranteed).
-fn proc_path(pid: u32, suffix: &[u8], out: &mut [u8; PROC_PATH_CAP]) -> Option<usize> {
+/// Build the NUL-terminated `"<pid>/<suffix>"` path relative to the `/proc`
+/// dirfd; returns the length excluding the NUL (`out[len] == 0` guaranteed).
+fn proc_rel_path(pid: u32, suffix: &[u8], out: &mut [u8; PROC_PATH_CAP]) -> Option<usize> {
     let mut len = 0usize;
     let mut push = |bytes: &[u8]| -> Option<()> {
         if len + bytes.len() + 1 > out.len() {
@@ -57,7 +64,6 @@ fn proc_path(pid: u32, suffix: &[u8], out: &mut [u8; PROC_PATH_CAP]) -> Option<u
         len += bytes.len();
         Some(())
     };
-    push(b"/proc/")?;
     let mut digits = [0u8; 10];
     let mut n = 0usize;
     let mut v = u64::from(pid);
@@ -77,6 +83,21 @@ fn proc_path(pid: u32, suffix: &[u8], out: &mut [u8; PROC_PATH_CAP]) -> Option<u
     push(suffix)?;
     out[len] = 0;
     Some(len)
+}
+
+/// Build the NUL-terminated `/proc/<pid>/<suffix>` path; returns the length
+/// excluding the NUL (`out[len] == 0` is guaranteed).
+fn proc_path(pid: u32, suffix: &[u8], out: &mut [u8; PROC_PATH_CAP]) -> Option<usize> {
+    const PREFIX: &[u8] = b"/proc/";
+    let mut rel = [0u8; PROC_PATH_CAP];
+    let n = proc_rel_path(pid, suffix, &mut rel)?;
+    if PREFIX.len() + n + 1 > out.len() {
+        return None;
+    }
+    out[..PREFIX.len()].copy_from_slice(PREFIX);
+    out[PREFIX.len()..PREFIX.len() + n].copy_from_slice(&rel[..n]);
+    out[PREFIX.len() + n] = 0;
+    Some(PREFIX.len() + n)
 }
 
 /// `read(2)` of a NUL-terminated path into `buf`; returns bytes read.
@@ -108,11 +129,133 @@ fn readlink_fd(path: &[u8], buf: &mut [u8]) -> Option<usize> {
     }
 }
 
+/// Cached `/proc` dirfd owner: `/proc` is opened once (`O_PATH | O_DIRECTORY |
+/// O_CLOEXEC`) and every per-event read is an `openat`/`readlinkat` relative
+/// to it, with the pid formatted into a stack buffer (no heap allocation).
+/// The fd is closed on drop (via [`OwnedFd`]).
+///
+/// If `/proc` cannot be opened at all (exotic environments), `proc_fd` is
+/// `None` and the absolute-path helpers serve the identical semantics.
+#[derive(Debug)]
+pub struct ProcResolver {
+    proc_fd: Option<OwnedFd>,
+}
+
+impl ProcResolver {
+    /// Open `/proc` once. Never fails: on open error the resolver degrades to
+    /// absolute-path resolution.
+    pub fn open() -> Self {
+        let fd = unsafe {
+            libc::open(
+                c"/proc".as_ptr().cast(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        let proc_fd = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) });
+        Self { proc_fd }
+    }
+
+    /// `read(2)` of `/proc/<pid>/<suffix>` into `buf`; returns bytes read.
+    fn read_at(&self, pid: u32, suffix: &[u8], buf: &mut [u8]) -> Option<usize> {
+        let Some(dir) = &self.proc_fd else {
+            let mut path = [0u8; PROC_PATH_CAP];
+            let len = proc_path(pid, suffix, &mut path)?;
+            return read_fd(&path[..=len], buf);
+        };
+        let mut rel = [0u8; PROC_PATH_CAP];
+        let len = proc_rel_path(pid, suffix, &mut rel)?;
+        unsafe {
+            let fd = libc::openat(
+                dir.as_raw_fd(),
+                rel[..=len].as_ptr().cast(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return None;
+            }
+            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+            libc::close(fd);
+            if n <= 0 {
+                None
+            } else {
+                Some(n as usize)
+            }
+        }
+    }
+
+    /// `readlink(2)` of `/proc/<pid>/<suffix>` into `buf`; returns bytes read.
+    fn link_at(&self, pid: u32, suffix: &[u8], buf: &mut [u8]) -> Option<usize> {
+        let Some(dir) = &self.proc_fd else {
+            let mut path = [0u8; PROC_PATH_CAP];
+            let len = proc_path(pid, suffix, &mut path)?;
+            return readlink_fd(&path[..=len], buf);
+        };
+        let mut rel = [0u8; PROC_PATH_CAP];
+        let len = proc_rel_path(pid, suffix, &mut rel)?;
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                rel[..=len].as_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n <= 0 {
+            None
+        } else {
+            Some(n as usize)
+        }
+    }
+
+    /// Read `/proc/<pid>/stat` into `buf`; returns bytes read.
+    pub fn read_stat(&self, pid: u32, buf: &mut [u8; STAT_CAP]) -> Option<usize> {
+        self.read_at(pid, b"stat", buf)
+    }
+
+    /// Derive the daemon's match name for `pid` into `buf`, returning the
+    /// name's length (0 = unresolved). `comm` is the kernel comm hint (may be
+    /// empty). No heap allocation.
+    pub fn derive_name(&self, pid: u32, comm: &[u8], buf: &mut [u8; NAME_CAP]) -> usize {
+        // 1. basename(argv[0]) from cmdline (single read, first NUL arg only).
+        if let Some(n) = self.read_at(pid, b"cmdline", buf) {
+            let arg0_len = first_nul_arg(&buf[..n]).len();
+            let name_len = compact_basename(buf, arg0_len);
+            if name_len > 0 {
+                return name_len;
+            }
+        }
+
+        // 2. basename of /proc/<pid>/exe (readlink), " (deleted)" stripped.
+        if let Some(n) = self.link_at(pid, b"exe", buf) {
+            let target_len = strip_deleted(&buf[..n]).len();
+            let name_len = compact_basename(buf, target_len);
+            if name_len > 0 {
+                return name_len;
+            }
+        }
+
+        // 3. The event's comm bytes.
+        let comm = first_nul_arg(comm);
+        if comm.is_empty() {
+            return 0;
+        }
+        let n = comm.len().min(NAME_CAP);
+        buf[..n].copy_from_slice(&comm[..n]);
+        compact_basename(buf, n)
+    }
+}
+
+/// Process-wide resolver behind the free-function entry points (tests,
+/// `dump`/`match-test` paths). The daemon's hot path owns its resolver
+/// explicitly (opened at startup, closed at shutdown) — see `daemon::Shared`.
+fn resolver() -> &'static ProcResolver {
+    static RESOLVER: LazyLock<ProcResolver> = LazyLock::new(ProcResolver::open);
+    &RESOLVER
+}
+
 /// Read `/proc/<pid>/stat` into `buf`; returns bytes read.
 pub fn read_stat(pid: u32, buf: &mut [u8; STAT_CAP]) -> Option<usize> {
-    let mut path = [0u8; PROC_PATH_CAP];
-    let len = proc_path(pid, b"stat", &mut path)?;
-    read_fd(&path[..=len], buf)
+    resolver().read_stat(pid, buf)
 }
 
 /// The comm field of a stat line: between the first `(` and the *last* `)`
@@ -160,40 +303,10 @@ fn compact_basename(buf: &mut [u8], n: usize) -> usize {
 
 /// Derive the daemon's match name for `pid` into `buf`, returning the name's
 /// length (0 = unresolved). `comm` is the kernel comm hint (may be empty).
-/// No heap allocation.
+/// No heap allocation. (Free-function entry point; the daemon hot path calls
+/// [`ProcResolver::derive_name`] on its startup-owned resolver.)
 pub fn derive_name(pid: u32, comm: &[u8], buf: &mut [u8; NAME_CAP]) -> usize {
-    let mut path = [0u8; PROC_PATH_CAP];
-
-    // 1. basename(argv[0]) from cmdline (single read, first NUL arg only).
-    if let Some(len) = proc_path(pid, b"cmdline", &mut path) {
-        if let Some(n) = read_fd(&path[..=len], buf) {
-            let arg0_len = first_nul_arg(&buf[..n]).len();
-            let name_len = compact_basename(buf, arg0_len);
-            if name_len > 0 {
-                return name_len;
-            }
-        }
-    }
-
-    // 2. basename of /proc/<pid>/exe (readlink), " (deleted)" stripped.
-    if let Some(len) = proc_path(pid, b"exe", &mut path) {
-        if let Some(n) = readlink_fd(&path[..=len], buf) {
-            let target_len = strip_deleted(&buf[..n]).len();
-            let name_len = compact_basename(buf, target_len);
-            if name_len > 0 {
-                return name_len;
-            }
-        }
-    }
-
-    // 3. The event's comm bytes.
-    let comm = first_nul_arg(comm);
-    if comm.is_empty() {
-        return 0;
-    }
-    let n = comm.len().min(NAME_CAP);
-    buf[..n].copy_from_slice(&comm[..n]);
-    compact_basename(buf, n)
+    resolver().derive_name(pid, comm, buf)
 }
 
 /// Derive the match name for a live pid (dump/drift paths).
@@ -294,6 +407,39 @@ mod tests {
         let len = proc_path(1234, b"cmdline", &mut out).unwrap();
         assert_eq!(&out[..len], b"/proc/1234/cmdline");
         assert_eq!(out[len], 0);
+    }
+
+    #[test]
+    fn proc_rel_path_shape() {
+        let mut out = [0u8; PROC_PATH_CAP];
+        let len = proc_rel_path(1234, b"cmdline", &mut out).unwrap();
+        assert_eq!(&out[..len], b"1234/cmdline");
+        assert_eq!(out[len], 0);
+    }
+
+    #[test]
+    fn resolver_openat_path_resolves_self() {
+        let r = ProcResolver::open();
+        let mut buf = [0u8; NAME_CAP];
+        let n = r.derive_name(std::process::id(), b"ignored-hint", &mut buf);
+        assert!(n > 0, "self name must resolve via the dirfd path");
+        assert_eq!(basename(&buf[..n]), &buf[..n]);
+        let mut stat = [0u8; STAT_CAP];
+        assert!(r.read_stat(std::process::id(), &mut stat).is_some());
+    }
+
+    #[test]
+    fn absolute_path_fallback_keeps_semantics() {
+        // proc_fd = None exercises the absolute-path transport; the resolution
+        // order and outputs must be identical to the dirfd path.
+        let r = ProcResolver { proc_fd: None };
+        let mut buf = [0u8; NAME_CAP];
+        let n = r.derive_name(std::process::id(), b"ignored-hint", &mut buf);
+        assert!(n > 0, "self name must resolve via the fallback path");
+        assert_eq!(basename(&buf[..n]), &buf[..n]);
+        let mut ghost = [0u8; NAME_CAP];
+        let n = r.derive_name(u32::MAX - 1, b"ghost-comm", &mut ghost);
+        assert_eq!(&ghost[..n], b"ghost-comm");
     }
 
     #[test]

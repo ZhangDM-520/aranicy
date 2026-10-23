@@ -30,3 +30,21 @@
   RwLock<Arc<RuleSet>> instead.
 - Linux `/proc/<pid>/stat` field 18 (priority) = nice + 20, not 20 - nice;
   field 19 (index 16 after the comm's last ')') is nice.
+
+## Busy-poll vs arrival distributions (measured 2026-10-23)
+
+- The paced `tools/storm` generator delivers ~uniform arrivals (~1.0
+  context-switch per exec event measured). A constant pre-block busy-spin
+  therefore burns its whole window per event and collapses no wakeups: a
+  30 µs spin measured +357% instructions/event with cs/s unchanged. Spins
+  only pay when arrivals cluster within the window (e.g. `make -j` bursts) —
+  gate or configure them, never assume "storm" implies microsecond clustering.
+- Cross-set wall-% on this host drifts with IPC/core-placement (0.67–0.87 IPC
+  observed in one session) and ambient load; instructions/event is the stable
+  invariant. Pair A/B captures back-to-back and report per-pair deltas.
+- Integration tests over `sched_process_exec` see ALL system execs: parallel
+  test-harness runs contaminate each other's no-event windows (wake-latency
+  test flaky on pristine code). Serialize such tests with a shared lock.
+- `strace` prints fds as bare numbers unless `-y`: dirfd usage shows as
+  `openat(12, "NNN/cmdline", ...)` — do not grep for `</proc>` annotations
+  when proving `openat`-on-dirfd behavior.

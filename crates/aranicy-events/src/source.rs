@@ -10,6 +10,15 @@
 //! epoll_fd`) — in one epoll set. `next_event` blocks in `epoll_wait`, so
 //! shutdown is immediate, not timeout-limited; the bounded 200 ms timeout is
 //! only a guard against pathological epoll behavior.
+//!
+//! Batching: every wakeup greedily drains ALL pending ringbuf records
+//! (`ring_buffer__consume`) into the pre-reserved queue before blocking again,
+//! and a bounded busy-poll window (`ANANICY_RS_BUSY_SPIN_US`, default 0)
+//! runs before each blocking wait — under burst arrivals the next record lands
+//! within microseconds of the previous one and is served without an epoll
+//! round trip. The spin is bounded and checks the shutdown flag every
+//! iteration, so `wake()`/shutdown latency stays far below the 200 ms
+//! worst-case budget regardless of the setting.
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -17,7 +26,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libbpf_rs::{Link, MapCore, Object, ObjectBuilder, PrintLevel, RingBuffer, RingBufferBuilder};
 
@@ -36,6 +45,22 @@ const MAP_NAME: &str = "events";
 /// lost wake can never hang shutdown longer than ~200 ms.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const POLL_TIMEOUT_MS: i32 = POLL_TIMEOUT.as_millis() as i32;
+
+/// Default busy-poll window before the blocking wait (µs). Measured A/B on
+/// the paced 2000 execs/s storm (2026-10-23, `docs/BENCHMARKS.md`): a 30 µs
+/// spin cost ~30 µs of CPU per event (+157% wall, +357% instructions/event)
+/// while context-switches stayed at ~1.0/event — paced arrivals are uniform,
+/// so the spin rides out its window empty and collapses nothing. Default is
+/// therefore 0 (the consume-all-before-blocking drain stays unconditional).
+/// For genuinely bursty workloads (e.g. `make -j` storms) raise it via
+/// [`BUSY_SPIN_ENV`]; the window is bounded and the shutdown flag is checked
+/// every iteration, so `wake()` latency stays tiny regardless of the setting.
+const BUSY_SPIN_DEFAULT_US: u64 = 0;
+/// Cap on the configurable window (µs): keeps the pre-block busy-poll bounded.
+const BUSY_SPIN_MAX_US: u64 = 1_000;
+/// Override for the busy-poll window, in µs (`0` disables the spin but keeps
+/// the consume-all-before-blocking drain).
+const BUSY_SPIN_ENV: &str = "ANANICY_RS_BUSY_SPIN_US";
 
 /// Pre-reserved steady-state queue depth (~exec bursts between polls).
 const QUEUE_CAPACITY: usize = 4096;
@@ -90,6 +115,17 @@ fn load_err(what: &str, e: std::io::Error) -> SourceError {
     SourceError::LoadFailed(with_log(format!("{what}: {e}")))
 }
 
+/// Busy-poll window in µs: unparsable values fall back to
+/// [`BUSY_SPIN_DEFAULT_US`], everything is clamped to [`BUSY_SPIN_MAX_US`]
+/// (the pre-block spin must stay bounded).
+fn busy_spin_us_from(value: Option<&std::ffi::OsStr>) -> u64 {
+    value
+        .and_then(|v| v.to_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(BUSY_SPIN_DEFAULT_US)
+        .min(BUSY_SPIN_MAX_US)
+}
+
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -126,6 +162,8 @@ pub struct BpfExecSource {
     obj: Object,
     queue: Arc<Mutex<QueueState>>,
     shutdown: AtomicBool,
+    /// Bounded busy-poll window before each blocking wait (0 = drain only).
+    busy_spin: Duration,
     wake_fd: OwnedFd,
     wait_fd: OwnedFd,
 }
@@ -225,6 +263,9 @@ impl BpfExecSource {
             obj,
             queue,
             shutdown: AtomicBool::new(false),
+            busy_spin: Duration::from_micros(busy_spin_us_from(
+                std::env::var_os(BUSY_SPIN_ENV).as_deref(),
+            )),
             wake_fd,
             wait_fd,
         })
@@ -250,6 +291,47 @@ impl BpfExecSource {
             .unwrap_or_else(PoisonError::into_inner)
             .events
             .pop_front()
+    }
+
+    /// Greedily consume ALL pending ringbuf records into the queue
+    /// (`ring_buffer__consume` runs the sample callback on this thread until
+    /// the ring is empty). `EINTR` is not an error.
+    fn drain_ring(&self) -> io::Result<()> {
+        let c = self
+            .rb
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .consume_raw();
+        if c < 0 {
+            let err = io::Error::from_raw_os_error(-c);
+            return if err.kind() == io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(err)
+            };
+        }
+        Ok(())
+    }
+
+    /// Bounded busy-poll before the blocking wait: non-blocking ring drains +
+    /// queue checks until an event is ready, shutdown is requested, or the
+    /// `busy_spin` window expires. Even with the window at zero this performs
+    /// one drain pass, so ALL pending records are consumed before blocking.
+    fn busy_poll(&self) -> io::Result<Option<ExecEvent>> {
+        let deadline = Instant::now().checked_add(self.busy_spin);
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            self.drain_ring()?;
+            if let Some(ev) = self.pop() {
+                return Ok(Some(ev));
+            }
+            match deadline {
+                Some(d) if Instant::now() < d => std::hint::spin_loop(),
+                _ => return Ok(None),
+            }
+        }
     }
 
     /// One blocking wait + drain. Errors are real (ringbuf/epoll failures).
@@ -307,15 +389,7 @@ impl BpfExecSource {
 
         if ring_ready {
             // Runs the sample callback on this thread; fills the queue.
-            let c = self.rb.lock().unwrap_or_else(PoisonError::into_inner).consume_raw();
-            if c < 0 {
-                let err = io::Error::from_raw_os_error(-c);
-                return if err.kind() == io::ErrorKind::Interrupted {
-                    Ok(())
-                } else {
-                    Err(err)
-                };
-            }
+            self.drain_ring()?;
         }
         Ok(())
     }
@@ -329,6 +403,11 @@ impl crate::ExecSource for BpfExecSource {
                 return Ok(None);
             }
             if let Some(ev) = self.pop() {
+                return Ok(Some(ev));
+            }
+            // Drain + bounded busy-poll first: consume ALL pending records and
+            // ride burst arrivals before paying for a blocking epoll round trip.
+            if let Some(ev) = self.busy_poll()? {
                 return Ok(Some(ev));
             }
             self.wait_once()?;
@@ -406,5 +485,25 @@ mod tests {
     fn source_error_no_btf_is_loud() {
         let msg = SourceError::NoBtf.to_string();
         assert!(msg.contains("BTF"), "unhelpful message: {msg}");
+    }
+
+    /// Busy-poll window parsing: default on absence/garbage, bounded above.
+    #[test]
+    fn busy_spin_env_parsing() {
+        use std::ffi::OsStr;
+        assert_eq!(busy_spin_us_from(None), BUSY_SPIN_DEFAULT_US);
+        assert_eq!(busy_spin_us_from(Some(OsStr::new("0"))), 0);
+        assert_eq!(busy_spin_us_from(Some(OsStr::new("45"))), 45);
+        assert_eq!(busy_spin_us_from(Some(OsStr::new("100000"))), BUSY_SPIN_MAX_US);
+        assert_eq!(
+            busy_spin_us_from(Some(OsStr::new("junk"))),
+            BUSY_SPIN_DEFAULT_US
+        );
+        assert_eq!(busy_spin_us_from(Some(OsStr::new(""))), BUSY_SPIN_DEFAULT_US);
+        assert_eq!(
+            busy_spin_us_from(Some(OsStr::new("-5"))),
+            BUSY_SPIN_DEFAULT_US
+        );
+        assert!(BUSY_SPIN_DEFAULT_US <= BUSY_SPIN_MAX_US);
     }
 }

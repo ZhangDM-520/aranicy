@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,9 +16,17 @@ use aranicy_events::{btf_available, BpfExecSource, ExecSource};
 
 const SPAWNS: u32 = 30;
 
+/// The event source is system-wide: every live source sees every exec on the
+/// host, including the sibling test's spawn storm. Both tests hold this lock
+/// for their whole body — without it `wake_unblocks_next_event_promptly` can
+/// consume `exec_events_deliver_unique_comm_within_2s`'s events and fail
+/// spuriously (flaky on pristine code under the default parallel harness).
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 #[ignore = "needs root + BTF kernel; run via: cargo test -- --ignored --nocapture"]
 fn exec_events_deliver_unique_comm_within_2s() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     assert!(btf_available(), "kernel BTF missing at /sys/kernel/btf/vmlinux");
     assert_eq!(
         unsafe { libc::geteuid() },
@@ -114,6 +122,7 @@ fn exec_events_deliver_unique_comm_within_2s() {
 #[test]
 #[ignore = "needs root + BTF kernel; run via: cargo test -- --ignored --nocapture"]
 fn wake_unblocks_next_event_promptly() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(unsafe { libc::geteuid() }, 0, "root required");
     let source = Arc::new(BpfExecSource::new().expect("BpfExecSource::new"));
     let waker = {

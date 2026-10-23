@@ -1,0 +1,15 @@
+
+ Performance counter stats for process id '1970424':
+
+            60,409      context-switches                 #  21310.5 cs/sec  cs_per_second     
+               877      cpu-migrations                   #    309.4 migrations/sec  migrations_per_second
+                 0      page-faults                      #      0.0 faults/sec  page_faults_per_second
+          2,834.71 msec task-clock                       #      0.1 CPUs  CPUs_utilized       
+         7,398,727      branch-misses                    #      0.5 %  branch_miss_rate         (49.21%)
+     1,496,327,765      branches                         #    527.9 M/sec  branch_frequency     (71.68%)
+     6,767,098,651      cpu-cycles                       #      2.4 GHz  cycles_frequency       (83.09%)
+     6,688,169,690      instructions                     #      1.0 instructions  insn_per_cycle  (84.42%)
+     2,719,872,124      stalled-cycles-frontend          #     0.39 frontend_cycles_idle        (57.81%)
+
+      30.000972539 seconds time elapsed
+
