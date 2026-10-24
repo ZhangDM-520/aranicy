@@ -1,0 +1,215 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 440" width="100%" height="auto">
+  <defs>
+    <!-- Background Dark Rust Gradient -->
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#140b07" />
+      <stop offset="45%" stop-color="#21120b" />
+      <stop offset="85%" stop-color="#180e09" />
+      <stop offset="100%" stop-color="#0c0704" />
+    </linearGradient>
+
+    <!-- Rust Primary Accent Gradient -->
+    <linearGradient id="rust-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff7a45" />
+      <stop offset="40%" stop-color="#e05638" />
+      <stop offset="100%" stop-color="#b8381e" />
+    </linearGradient>
+
+    <!-- Hot Copper / Molten Text Gradient -->
+    <linearGradient id="title-grad" x1="0%" y1="0%" x2="70%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="35%" stop-color="#ffe8df" />
+      <stop offset="70%" stop-color="#ff8e53" />
+      <stop offset="100%" stop-color="#e25329" />
+    </linearGradient>
+
+    <!-- Amber Glow -->
+    <filter id="ember-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="9" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <!-- Subtle Shadow for Ferris -->
+    <radialGradient id="crab-shadow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Hex Grid Pattern -->
+    <pattern id="hex-grid" width="40" height="69.282" patternUnits="userSpaceOnUse" patternTransform="scale(0.85)">
+      <path d="M 40 0 L 20 11.547 L 0 0 L 0 23.094 L 20 34.641 L 40 23.094 Z M 0 34.641 L 20 46.188 L 0 57.735 L 0 80.829 L 20 92.376 L 40 80.829 L 40 57.735 L 20 46.188 Z" fill="none" stroke="#e05638" stroke-width="0.75" stroke-opacity="0.08" />
+    </pattern>
+  </defs>
+
+  <!-- Base Plate -->
+  <rect width="1200" height="440" rx="16" fill="url(#bg-grad)" stroke="#3d1f14" stroke-width="2" />
+
+  <!-- Background Hex & Circuit Matrix -->
+  <rect width="1200" height="440" rx="16" fill="url(#hex-grid)" />
+
+  <!-- Industrial Rust Gear 1 (Backdrop for Ferris) -->
+  <g transform="translate(195, 220)">
+    <circle cx="0" cy="0" r="145" fill="none" stroke="#d44b28" stroke-width="1.5" stroke-opacity="0.15" stroke-dasharray="6 8" />
+    <circle cx="0" cy="0" r="126" fill="none" stroke="#b3381a" stroke-width="16" stroke-opacity="0.22" stroke-dasharray="16 17" />
+    <circle cx="0" cy="0" r="110" fill="none" stroke="#e05638" stroke-width="2.5" stroke-opacity="0.35" />
+    <circle cx="0" cy="0" r="82" fill="none" stroke="#e05638" stroke-width="1.5" stroke-opacity="0.2" stroke-dasharray="4 6" />
+  </g>
+
+  <!-- Industrial Rust Gear 2 (Subtle, Top Right Corner) -->
+  <g transform="translate(1140, 40)" opacity="0.3">
+    <circle cx="0" cy="0" r="90" fill="none" stroke="#e05638" stroke-width="10" stroke-dasharray="14 14" />
+    <circle cx="0" cy="0" r="76" fill="none" stroke="#e05638" stroke-width="1.5" />
+  </g>
+
+  <!-- Realtime Scheduling Waves / CPU Priority Threads -->
+  <g opacity="0.45">
+    <path d="M 380,110 C 520,70 650,150 820,105 C 960,70 1080,120 1200,90" fill="none" stroke="#b8381e" stroke-width="1.5" stroke-dasharray="5 5" />
+    <path d="M 380,125 C 560,95 720,165 910,120 C 1050,90 1140,140 1200,115" fill="none" stroke="url(#rust-grad)" stroke-width="2.5" filter="url(#ember-glow)" />
+    <path d="M 380,140 C 600,120 780,185 990,135 C 1100,110 1160,150 1200,130" fill="none" stroke="#ff7a45" stroke-width="1" opacity="0.5" />
+  </g>
+
+  <!-- Ambient Floating Embers -->
+  <g fill="#ff7a45">
+    <circle cx="430" cy="80" r="2" opacity="0.7" filter="url(#ember-glow)" />
+    <circle cx="590" cy="160" r="1.5" opacity="0.5" />
+    <circle cx="780" cy="65" r="2.5" opacity="0.8" filter="url(#ember-glow)" />
+    <circle cx="940" cy="180" r="2" opacity="0.6" />
+    <circle cx="1110" cy="100" r="1.5" opacity="0.4" />
+    <circle cx="1160" cy="270" r="2" opacity="0.7" filter="url(#ember-glow)" />
+  </g>
+
+  <!-- ==================== FERRIS THE RUST CRAB ==================== -->
+  <g transform="translate(195, 215)">
+    <!-- Floor Shadow -->
+    <ellipse cx="0" cy="105" rx="90" ry="16" fill="url(#crab-shadow)" />
+
+    <!-- Legs (6 Walking Legs) -->
+    <g stroke="#962916" stroke-width="6" stroke-linecap="round" fill="none">
+      <!-- Left Legs -->
+      <path d="M -40,35 Q -68,40 -82,62" />
+      <path d="M -32,48 Q -58,62 -65,84" />
+      <path d="M -16,56 Q -34,78 -38,98" />
+      <!-- Right Legs -->
+      <path d="M 40,35 Q 68,40 82,62" />
+      <path d="M 32,48 Q 58,62 65,84" />
+      <path d="M 16,56 Q 34,78 38,98" />
+    </g>
+
+    <!-- Claws / Pincers -->
+    <!-- Left Pincer (Lower/Resting) -->
+    <g>
+      <path d="M -48,15 Q -80,5 -92,-15" stroke="#b3341c" stroke-width="8" stroke-linecap="round" fill="none" />
+      <!-- Outer Claw -->
+      <path d="M -92,-15 C -122,-35 -130,5 -100,18 C -86,24 -75,6 -92,-15 Z" fill="#e05638" stroke="#962916" stroke-width="3" />
+      <!-- Inner Claw -->
+      <path d="M -92,-15 C -115,-48 -80,-48 -78,-25 Z" fill="#f16545" stroke="#962916" stroke-width="3" />
+    </g>
+
+    <!-- Right Pincer (Raised in Friendly High-Priority Wave) -->
+    <g>
+      <path d="M 48,15 Q 78,-5 96,-30" stroke="#b3341c" stroke-width="8" stroke-linecap="round" fill="none" />
+      <!-- Outer Claw -->
+      <path d="M 96,-30 C 128,-55 142,-15 116,4 C 100,12 88,-5 96,-30 Z" fill="#e05638" stroke="#962916" stroke-width="3" />
+      <!-- Inner Claw -->
+      <path d="M 96,-30 C 122,-68 86,-65 82,-42 Z" fill="#f16545" stroke="#962916" stroke-width="3" />
+    </g>
+
+    <!-- Main Crab Body -->
+    <ellipse cx="0" cy="22" rx="66" ry="52" fill="#e05638" stroke="#962916" stroke-width="4" />
+    <!-- Underbelly Highlight -->
+    <ellipse cx="0" cy="32" rx="48" ry="34" fill="#f06d4e" opacity="0.85" />
+    <path d="M -35,38 Q 0,56 35,38" fill="none" stroke="#d44b28" stroke-width="3" opacity="0.5" />
+
+    <!-- Eye Stems & Eyeballs -->
+    <!-- Left Eye -->
+    <g>
+      <circle cx="-25" cy="-28" r="19" fill="#ffffff" stroke="#962916" stroke-width="4" />
+      <circle cx="-22" cy="-28" r="9" fill="#1c0f0a" />
+      <circle cx="-25" cy="-32" r="3.5" fill="#ffffff" />
+      <circle cx="-19" cy="-25" r="1.5" fill="#ffffff" opacity="0.8" />
+    </g>
+    <!-- Right Eye -->
+    <g>
+      <circle cx="25" cy="-28" r="19" fill="#ffffff" stroke="#962916" stroke-width="4" />
+      <circle cx="22" cy="-28" r="9" fill="#1c0f0a" />
+      <circle cx="19" cy="-32" r="3.5" fill="#ffffff" />
+      <circle cx="25" cy="-25" r="1.5" fill="#ffffff" opacity="0.8" />
+    </g>
+
+    <!-- Friendly Smile -->
+    <path d="M -15,30 Q 0,44 15,30" fill="none" stroke="#7a1f10" stroke-width="4" stroke-linecap="round" />
+    <!-- Rosy Crab Cheeks -->
+    <ellipse cx="-35" cy="28" rx="7" ry="4" fill="#ff8a70" opacity="0.5" />
+    <ellipse cx="35" cy="28" rx="7" ry="4" fill="#ff8a70" opacity="0.5" />
+  </g>
+
+  <!-- ==================== CONTENT REGION ==================== -->
+  <!-- Top Meta / Release Pill -->
+  <g transform="translate(370, 75)">
+    <rect x="0" y="0" width="168" height="26" rx="13" fill="#2b140c" stroke="#5c2617" stroke-width="1.2" />
+    <circle cx="13" cy="13" r="4.5" fill="#ff7a45" filter="url(#ember-glow)" />
+    <text x="26" y="17" font-family="-apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, monospace" font-size="11.5" font-weight="700" fill="#ffa07a" letter-spacing="1">RUST POWERED</text>
+
+    <rect x="180" y="0" width="186" height="26" rx="13" fill="#1f110a" stroke="#421a10" stroke-width="1.2" />
+    <text x="192" y="17" font-family="-apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, monospace" font-size="11.5" font-weight="600" fill="#c77b63" letter-spacing="0.5">LINUX SCHEDULER</text>
+  </g>
+
+  <!-- Main Title -->
+  <text x="366" y="180" font-family="-apple-system, BlinkMacSystemFont, &#39;Inter&#39;, &#39;Segoe UI&#39;, Roboto, sans-serif" font-size="82" font-weight="900" fill="url(#title-grad)" letter-spacing="-2">
+    aranicy
+  </text>
+
+  <!-- Realtime Process Priority Level Bar (Decorative Graphic) -->
+  <g transform="translate(735, 138)">
+    <text x="0" y="12" font-family="monospace" font-size="11" fill="#8f5745" letter-spacing="1.5">NICE PRIORITY RANGE</text>
+    <rect x="0" y="22" width="220" height="7" rx="3.5" fill="#24130c" stroke="#451e12" stroke-width="1" />
+    <!-- Molten indicator for high priority (-20 to 0) -->
+    <rect x="0" y="22" width="118" height="7" rx="3.5" fill="url(#rust-grad)" filter="url(#ember-glow)" />
+    <circle cx="118" cy="25.5" r="5" fill="#ffffff" stroke="#e05638" stroke-width="2" />
+    <text x="0" y="44" font-family="monospace" font-size="10.5" fill="#ff7a45" font-weight="700">-20 RT</text>
+    <text x="110" y="44" font-family="monospace" font-size="10.5" fill="#d67b60">0</text>
+    <text x="195" y="44" font-family="monospace" font-size="10.5" fill="#784333">+19 IDLE</text>
+  </g>
+
+  <!-- Subtitle / Mission Statement -->
+  <text x="370" y="226" font-family="-apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, sans-serif" font-size="22" font-weight="500" fill="#f2cfc4" letter-spacing="0.2">
+    Intelligent, Zero-Overhead Process Auto-Nicing & Latency Daemon
+  </text>
+
+  <text x="370" y="258" font-family="-apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, sans-serif" font-size="15" font-weight="400" fill="#a8715f" letter-spacing="0.2">
+    Eliminate stuttering and frame-drops by dynamically shifting CPU & I/O priority slices.
+  </text>
+
+  <!-- Bottom Feature Badges -->
+  <g transform="translate(370, 310)">
+    <!-- Badge 1: Safe & Memory-Protected -->
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="145" height="34" rx="8" fill="#20110a" stroke="#542315" stroke-width="1.2" />
+      <path d="M 16,17 L 23,24 L 34,11" fill="none" stroke="#ff7a45" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+      <text x="44" y="22" font-family="monospace" font-size="12" font-weight="700" fill="#f08864">100% SAFE</text>
+    </g>
+
+    <!-- Badge 2: Kernel Latency Control -->
+    <g transform="translate(157, 0)">
+      <rect x="0" y="0" width="170" height="34" rx="8" fill="#20110a" stroke="#542315" stroke-width="1.2" />
+      <circle cx="24" cy="17" r="6" fill="none" stroke="#ff8e53" stroke-width="2" />
+      <circle cx="24" cy="17" r="2.5" fill="#ff8e53" />
+      <text x="38" y="22" font-family="monospace" font-size="12" font-weight="700" fill="#f08864">CGROUPS & SCHED</text>
+    </g>
+
+    <!-- Badge 3: Async Engine -->
+    <g transform="translate(339, 0)">
+      <rect x="0" y="0" width="158" height="34" rx="8" fill="#20110a" stroke="#542315" stroke-width="1.2" />
+      <!-- Lightning Bolt -->
+      <polygon points="21,9 14,19 21,19 19,27 28,15 21,15" fill="#ff9e66" />
+      <text x="36" y="22" font-family="monospace" font-size="12" font-weight="700" fill="#f08864">SUB-MS JITTER</text>
+    </g>
+
+    <!-- Badge 4: Dynamic IO Nice -->
+    <g transform="translate(509, 0)">
+      <rect x="0" y="0" width="155" height="34" rx="8" fill="#20110a" stroke="#542315" stroke-width="1.2" />
+      <path d="M 18,17 L 30,17 M 26,12 L 31,17 L 26,22" fill="none" stroke="#ff9e66" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      <text x="40" y="22" font-family="monospace" font-size="12" font-weight="700" fill="#f08864">BFQ / IO-NICE</text>
+    </g>
+  </g>
+</svg>
