@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".banner.svg" alt="aranicy banner" width="100%">
+  <img src="./banner.svg" alt="aranicy banner" width="100%">
 </p>
 
 # aranicy
