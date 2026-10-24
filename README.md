@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".banner.svg" alt="aranicy banner" width="100%">
+</p>
+
 # aranicy
 
 Auto-nice daemon in Rust: applies nice / ionice / sched / cgroup / cpuset
