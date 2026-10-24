@@ -173,11 +173,11 @@
 
   <!-- Subtitle / Mission Statement -->
   <text x="370" y="226" font-family="-apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, sans-serif" font-size="22" font-weight="500" fill="#f2cfc4" letter-spacing="0.2">
-    Intelligent, Zero-Overhead Process Auto-Nicing & Latency Daemon
+    Intelligent, Zero-Overhead Process Auto-Nicing - Latency Daemon
   </text>
 
   <text x="370" y="258" font-family="-apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, sans-serif" font-size="15" font-weight="400" fill="#a8715f" letter-spacing="0.2">
-    Eliminate stuttering and frame-drops by dynamically shifting CPU & I/O priority slices.
+    Eliminate stuttering and frame-drops by dynamically shifting CPU - I/O priority slices.
   </text>
 
   <!-- Bottom Feature Badges -->
@@ -194,7 +194,7 @@
       <rect x="0" y="0" width="170" height="34" rx="8" fill="#20110a" stroke="#542315" stroke-width="1.2" />
       <circle cx="24" cy="17" r="6" fill="none" stroke="#ff8e53" stroke-width="2" />
       <circle cx="24" cy="17" r="2.5" fill="#ff8e53" />
-      <text x="38" y="22" font-family="monospace" font-size="12" font-weight="700" fill="#f08864">CGROUPS & SCHED</text>
+      <text x="38" y="22" font-family="monospace" font-size="12" font-weight="700" fill="#f08864">CGROUPS - SCHED</text>
     </g>
 
     <!-- Badge 3: Async Engine -->
