@@ -214,3 +214,20 @@
   no window), test extended for the stale-mark case, mutation probe red on
   the named test, 75 daemon tests green.
 - Verdict: fix delta shippable; pending only the clean storm gate numbers.
+
+## 2026-10-28 (shipped: a34eaf8)
+
+- Clean gate round (quiet config log_applied_rule=false, fresh state,
+  3 captures/condition): storm gates PASS both variants both conditions
+  (unruled 3.88/3.07, ruled 4.93/4.75 median wall-% at 2000 execs/s, <=5%);
+  instr/event 35.19k vs 34.75k medians = +1.3% within noise (the earlier
+  one-capture +21% did not reproduce); 115-entry populated state +2.2%
+  single capture (no map-size cliff); sampler 0.15% one core. Count
+  attribution corrected with exact greps (179,589 rule="gsa-storm-probe").
+- Final validation: 117 workspace tests, clippy clean, secret-pattern scan
+  clean, inventory exactly 16 modified + 3 new files.
+- Committed a34eaf8 (19 files, +3510/-37) with Co-authored-by trailer and
+  PUSHED to ZhangDM-520/aranicy main (7b0dcc1..a34eaf8). Host left healthy:
+  aranicy.service active/enabled, scx_lavd original args, governors
+  restored, toys/kthread residue cleaned. Not done (not requested): tag /
+  gsa recipe bump to a post-bias release.

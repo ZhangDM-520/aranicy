@@ -69,7 +69,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aranicy-apply"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aranicy-model",
  "libc",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "aranicy-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aranicy-apply",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "aranicy-events"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libbpf-rs",
  "libc",
@@ -104,11 +104,11 @@ dependencies = [
 
 [[package]]
 name = "aranicy-model"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "aranicy-rules"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aranicy-model",
  "regex",

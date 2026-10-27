@@ -38,3 +38,15 @@
   Evidence → ~/Workspace/aranicy-bias-val/evidence/. After results:
   BENCHMARKS.md bias section, packaging + gsa tree, commit disposition ask.
   No commits so far.
+
+## 2026-10-28 (dynamic nice bias shipped)
+
+- a34eaf8 pushed to ZhangDM-520/aranicy main: dynamic nice bias (lavd-only
+  learning, closed loop, aging-capped history) + `dump bias` + audit fixes.
+  Gates: storm both variants <=5% (3.88/4.93 bias-on), instr/event delta
+  +1.3% noise-level, sampler 0.15%. Full evidence:
+  ~/Workspace/aranicy-bias-val/evidence/{,postfix,postfix2}.
+- Open items (owner's call): tag a post-bias release and bump
+  packages/stable/aranicy in the gsa tree; live cutover already done
+  (ananicy-cpp retired 2026-10-24) but the running service is v0.1.0-1 —
+  rebuild/install to pick this up.
