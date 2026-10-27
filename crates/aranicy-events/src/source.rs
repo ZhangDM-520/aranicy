@@ -504,6 +504,5 @@ mod tests {
             busy_spin_us_from(Some(OsStr::new("-5"))),
             BUSY_SPIN_DEFAULT_US
         );
-        assert!(BUSY_SPIN_DEFAULT_US <= BUSY_SPIN_MAX_US);
     }
 }

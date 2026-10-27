@@ -67,21 +67,16 @@ impl Default for ApplyOptions {
 }
 
 /// Per-action outcome. `Skipped` is a gate or a missing field, not an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActionOutcome {
     Applied,
+    #[default]
     Skipped,
     /// ESRCH: the process died mid-apply. Expected under spawn storms.
     Gone,
     /// EPERM/EACCES or kernel-unsupported. The label is the dimension name.
     Denied(&'static str),
     Failed(i32),
-}
-
-impl Default for ActionOutcome {
-    fn default() -> Self {
-        ActionOutcome::Skipped
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

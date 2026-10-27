@@ -24,6 +24,17 @@ pub struct Config {
     pub loglevel: String,
     pub log_applied_rule: bool,
     pub x3d_mode: String,
+    // Dynamic nice bias (plan.md §4.3) — driven by scx_lavd samples only.
+    pub bias_enable: bool,
+    pub bias_min: i8,
+    pub bias_max: i8,
+    pub bias_window_s: u64,
+    pub bias_deadband_pct: u64,
+    pub bias_min_samples: u64,
+    pub bias_cadence_ms: u64,
+    pub bias_max_entries: usize,
+    pub bias_half_life_s: u64,
+    pub bias_state_path: String,
     pub warnings: Vec<String>,
 }
 
@@ -46,6 +57,16 @@ impl Default for Config {
             loglevel: "info".into(),
             log_applied_rule: false,
             x3d_mode: "auto".into(),
+            bias_enable: true,
+            bias_min: -1,
+            bias_max: 3,
+            bias_window_s: 60,
+            bias_deadband_pct: 15,
+            bias_min_samples: 30,
+            bias_cadence_ms: 500,
+            bias_max_entries: 4096,
+            bias_half_life_s: 1800,
+            bias_state_path: "/var/lib/aranicy/bias-state".into(),
             warnings: Vec::new(),
         }
     }
@@ -110,8 +131,53 @@ impl Config {
                         bad(&mut cfg, "x3d_mode");
                     }
                 }
+                "bias_enable" => set_bool(value, &mut cfg.bias_enable, idx, &mut cfg.warnings),
+                "bias_min" => match value.parse::<i8>() {
+                    Ok(v) => cfg.bias_min = v,
+                    Err(_) => bad(&mut cfg, "bias_min (i8)"),
+                },
+                "bias_max" => match value.parse::<i8>() {
+                    Ok(v) => cfg.bias_max = v,
+                    Err(_) => bad(&mut cfg, "bias_max (i8)"),
+                },
+                "bias_window_s" => match value.parse::<u64>() {
+                    Ok(v) => cfg.bias_window_s = v,
+                    Err(_) => bad(&mut cfg, "bias_window_s (u64)"),
+                },
+                "bias_deadband_pct" => match value.parse::<u64>() {
+                    Ok(v) => cfg.bias_deadband_pct = v,
+                    Err(_) => bad(&mut cfg, "bias_deadband_pct (u64)"),
+                },
+                "bias_min_samples" => match value.parse::<u64>() {
+                    Ok(v) => cfg.bias_min_samples = v,
+                    Err(_) => bad(&mut cfg, "bias_min_samples (u64)"),
+                },
+                "bias_cadence_ms" => match value.parse::<u64>() {
+                    Ok(v) => cfg.bias_cadence_ms = v,
+                    Err(_) => bad(&mut cfg, "bias_cadence_ms (u64)"),
+                },
+                "bias_max_entries" => match value.parse::<usize>() {
+                    Ok(v) => cfg.bias_max_entries = v,
+                    Err(_) => bad(&mut cfg, "bias_max_entries (usize)"),
+                },
+                "bias_half_life_s" => match value.parse::<u64>() {
+                    Ok(v) => cfg.bias_half_life_s = v,
+                    Err(_) => bad(&mut cfg, "bias_half_life_s (u64)"),
+                },
+                "bias_state_path" => cfg.bias_state_path = value.to_string(),
                 other => cfg.warnings.push(format!("line {}: unknown key {other:?}", idx + 1)),
             }
+        }
+        // An inverted clamp range would panic inside i8::clamp on the bias
+        // thread; refuse it here with the warn-and-fallback convention.
+        if cfg.bias_min > cfg.bias_max {
+            cfg.warnings.push(format!(
+                "bias_min ({}) > bias_max ({}); using defaults",
+                cfg.bias_min, cfg.bias_max
+            ));
+            let d = Self::default();
+            cfg.bias_min = d.bias_min;
+            cfg.bias_max = d.bias_max;
         }
         cfg
     }
@@ -126,6 +192,20 @@ impl Config {
                 Ok(cfg)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Map the `bias_*` config keys onto the bias engine's knobs (plan.md §4.3).
+    pub fn bias_config(&self) -> crate::bias::BiasConfig {
+        crate::bias::BiasConfig {
+            window_s: self.bias_window_s,
+            deadband_pct: self.bias_deadband_pct,
+            min_samples: self.bias_min_samples,
+            half_life_s: self.bias_half_life_s,
+            max_entries: self.bias_max_entries,
+            min_bias: self.bias_min,
+            max_bias: self.bias_max,
+            ..crate::bias::BiasConfig::default()
         }
     }
 
@@ -205,5 +285,15 @@ mod tests {
         let cfg = Config::load(Path::new("/nonexistent/ananicy.conf")).unwrap();
         assert_eq!(cfg.check_freq, 60);
         assert_eq!(cfg.warnings.len(), 1);
+    }
+
+    #[test]
+    fn inverted_bias_clamps_warn_and_reset_to_defaults() {
+        // bias_min > bias_max would panic i8::clamp on the bias thread.
+        let cfg = Config::parse("bias_min = 5\nbias_max = 2\n");
+        let d = Config::default();
+        assert_eq!(cfg.bias_min, d.bias_min);
+        assert_eq!(cfg.bias_max, d.bias_max);
+        assert!(cfg.warnings.iter().any(|w| w.contains("bias_min")));
     }
 }

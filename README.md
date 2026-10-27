@@ -19,18 +19,28 @@ clean-room rewrite with a hard performance budget: **≤ 5% of one core at
 ## Design in one paragraph
 
 A single `sched_process_exec` eBPF tracepoint (fork/exit are never
-subscribed); a comm prescreen skips `/proc` reads for unruled names; rules are
-flattened into small `Copy`-friendly policy structs at load; exact-name lookup
-is a `HashMap`, `name_regex` patterns are compiled once at load; the apply
-layer walks `/proc/<pid>/task` once per process and issues syscalls only;
-failures are counted, not logged per event.
+subscribed); every event resolves its name with one stack-buffered
+`/proc/<pid>/cmdline` read (no comm prescreen — `exec -a` spoofing makes
+comm-only filtering unsafe) followed by an O(1) `HashMap` lookup; rules are
+flattened into small `Copy`-friendly policy structs at load and `name_regex`
+patterns are compiled once at load; the apply layer walks `/proc/<pid>/task`
+once per process and issues syscalls only; failures are counted, not logged
+per event.
+
+Optional superset: **dynamic nice bias** — per-name nice deltas learned from
+`sched_ext` `scx_lavd` samples (bulk work nudged nicer, latency-sensitive work
+less nice), applied as `clamp(rule_nice + bias, -20, 19)` with closed-loop
+verification against the observed nice and half-life-capped history.
+No lavd → no learning,
+but learned biases keep applying and age out gracefully
+([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 
 ## Status
 
 Implemented and benchmarked (2026-10-22): **6.0× cheaper than ananicy-cpp
 under a 2 000 execs/s spawn storm (2.28% vs 13.7% of one core)**, applying
 policies at exec time — the acceptance target of ≤5% is met in both storm
-variants. 77 unit/integration tests. See
+variants. 112 unit/integration tests (2026-10-28). See
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full measurement protocol
 and results.
 
@@ -44,6 +54,7 @@ and results.
 cargo build --release
 sudo ./target/release/aranicy start        # root required
 ./target/release/aranicy dump rules        # unprivileged inspection
+./target/release/aranicy dump bias         # dynamic-nice bias state (superset)
 ```
 
 ## Install

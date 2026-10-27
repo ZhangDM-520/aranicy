@@ -18,3 +18,23 @@
   default set to 0 µs from evidence (30 µs regressed the paced workload 2.6×;
   `ANANICY_RS_BUSY_SPIN_US` opts in). Todos `opt2-batch-drain` and
   `opt3-proc-dirfd` done. No commits; awaiting owner's disposition decision.
+
+## 2026-10-27 (bias-engine owner pass)
+
+- `bias.rs` (estimator + controller + aging) and `bias_state.rs` (serde_json
+  atomic save/load) implemented; `cargo test -p aranicy-daemon` 68/68 green
+  (17 new). Todos `bias-estimator`, `bias-controller`, `bias-state` done.
+  Remaining for the caller: wire engine into daemon.rs/config, debounced
+  persistence, `dump bias`. No commits; awaiting owner's disposition decision.
+
+## 2026-10-28 (dump bias done; live validation in flight)
+
+- `dump bias` shipped + CLI-smoked; clippy --workspace --all-targets clean;
+  workspace tests 112 green. COMPATIBILITY.md gained the dynamic-nice
+  contract (lavd-absent: bias keeps applying, learning stops, aging caps
+  history).
+- Live bias validation RUNNING (background agent): lavd learn/closed-loop,
+  lavd-stop semantics, storm A/B bias-on/off (≤5% gate, sampler ≤1%).
+  Evidence → ~/Workspace/aranicy-bias-val/evidence/. After results:
+  BENCHMARKS.md bias section, packaging + gsa tree, commit disposition ask.
+  No commits so far.

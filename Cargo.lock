@@ -87,6 +87,7 @@ dependencies = [
  "clap",
  "libc",
  "regex",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -111,9 +112,7 @@ version = "0.1.0"
 dependencies = [
  "aranicy-model",
  "regex",
- "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]

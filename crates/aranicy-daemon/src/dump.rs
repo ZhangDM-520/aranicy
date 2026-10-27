@@ -8,6 +8,8 @@ use aranicy_model::{CpuSet, IoClass, Policy, SchedPolicy};
 use aranicy_rules::RuleSet;
 use serde_json::{json, Map, Value};
 
+use crate::bias_state;
+use crate::config::Config;
 use crate::load;
 use crate::paths::Paths;
 use crate::procname;
@@ -174,12 +176,39 @@ pub fn autogroup_json() -> Value {
     Value::Object(map)
 }
 
+/// `{"path", "note", "state"}` over the persisted bias snapshot.
+///
+/// The daemon saves the snapshot debounced (>= 60 s cadence), so on-disk state
+/// can lag the live engine; the emitted `note` says so. Tolerant like
+/// `bias_state::load`: a missing or corrupt file yields `"state": null`, and a
+/// hard IO error (e.g. EACCES unprivileged) is reported in `"error"` instead
+/// of failing the dump.
+pub fn bias_json(paths: &Paths) -> anyhow::Result<Value> {
+    let cfg = Config::load(&paths.config)?;
+    Ok(bias_json_at(std::path::Path::new(&cfg.bias_state_path)))
+}
+
+fn bias_json_at(path: &std::path::Path) -> Value {
+    let (state, error) = match bias_state::load(path) {
+        Ok(state) => (state, Value::Null),
+        Err(e) => (None, json!(e.to_string())),
+    };
+    json!({
+        "path": path.display().to_string(),
+        "note": "on-disk snapshot is debounced; live bias may be up to ~60 s newer",
+        "state": state,
+        "error": error,
+    })
+}
+
 /// `aranicy dump <what>` — JSON to stdout. `rules`/`types`/`cgroups` load the
-/// rule tree (honoring the config gates); `proc`/`autogroup` touch only `/proc`.
+/// rule tree (honoring the config gates); `proc`/`autogroup` touch only
+/// `/proc`; `bias` reads the persisted bias snapshot (config only).
 pub fn run(what: &str, paths: &Paths) -> anyhow::Result<()> {
     let value = match what {
         "proc" => proc_json(),
         "autogroup" => autogroup_json(),
+        "bias" => bias_json(paths)?,
         "rules" | "types" | "cgroups" => {
             let (_cfg, rules) = load::load_all(paths)?;
             match what {
@@ -200,6 +229,16 @@ mod tests {
     use aranicy_model::CgroupDef;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        // Tests must not touch /tmp; use the package-local target/ tree.
+        let dir = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join(format!("dump_test_{}_{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
 
     fn synthetic_ruleset() -> RuleSet {
         let mut rs = RuleSet::empty();
@@ -318,5 +357,40 @@ mod tests {
         let me = arr.iter().find(|o| o["pid"] == json!(self_pid));
         assert!(me.is_some(), "own pid must appear in dump proc");
         assert!(me.unwrap()["name"].as_str().unwrap().len() as i64 > 0);
+    }
+
+    #[test]
+    fn bias_dump_reads_persisted_snapshot() {
+        use crate::bias_state::{BiasSnapshot, EntrySnapshot, BIAS_STATE_VERSION};
+        let dir = scratch_dir("bias_dump");
+        let path = dir.join("bias-state");
+        let snap = BiasSnapshot {
+            version: BIAS_STATE_VERSION,
+            threshold_ema: Some(1234.5),
+            entries: vec![EntrySnapshot {
+                name: "bulk".into(),
+                bias: 3,
+                confidence: 0.25,
+                ..EntrySnapshot::default()
+            }],
+        };
+        bias_state::save(&snap, &path).expect("save");
+        let v = bias_json_at(&path);
+        assert_eq!(v["path"], json!(path.display().to_string()));
+        assert_eq!(v["error"], Value::Null);
+        assert_eq!(v["state"]["threshold_ema"], json!(1234.5));
+        assert_eq!(v["state"]["entries"][0]["name"], json!("bulk"));
+        assert_eq!(v["state"]["entries"][0]["bias"], json!(3));
+        assert_eq!(v["state"]["entries"][0]["confidence"], json!(0.25));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bias_dump_missing_file_is_null_state() {
+        let dir = scratch_dir("bias_missing");
+        let v = bias_json_at(&dir.join("absent"));
+        assert_eq!(v["state"], Value::Null);
+        assert_eq!(v["error"], Value::Null);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

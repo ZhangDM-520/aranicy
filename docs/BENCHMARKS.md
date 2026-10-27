@@ -168,3 +168,92 @@ Verdicts (deltas called only where they clear noise):
   a cached dentry lookup; skipping it saves less than the profile's 19%
   open-path share suggests (the per-`<pid>` and per-file dentry/inode allocs
   remain). Functional spoofed-argv[0] proof green (nice 7 + best-effort 3).
+
+## Dynamic nice bias — live validation + audit (2026-10-28)
+
+Live protocol on this host against `scx_lavd` (manual start:
+`sudo scx_lavd --autopilot --per-cpu-dsq --enable-cpu-bw`): bulk/wake/inter
+toys with distinct derived names, `dump bias` sampled through the phases,
+`/proc/<pid>/stat` field 19 (= `nice`) cross-checks, lavd stopped/restored
+for the absence phase, storm A/B per the protocol above. Full evidence tree:
+`~/Workspace/aranicy-bias-val/evidence/` (pre-fix) and `…/evidence/postfix/`
+(post-review-fix runs).
+
+Semantics verdicts (post-fix binary = shipped):
+
+| requirement | verdict | evidence summary |
+|---|---|---|
+| learning (classes, bounds, rising confidence) | pass | e.g. `postfix/bias-A-*.json`: hog 0→3, wakefas class `responsive` conf 0.83 |
+| closed loop: nice == `clamp(base+bias, −20, 19)` | pass (substance) | proc nice tracked bias exactly, both directions; pre-fix wedge (stale nice never corrected) is gone |
+| lavd absent ≠ bias 0 | pass | `bias-B-pre.json` == `bias-B-1..9.json` byte-identical learning stats; nice held; stream stopped updating |
+| history capped (aging) | pass (scope) | 30 s half-life: conf 0.918→9.1e−4 over 248 s; stepwise relax captured; zero-confidence flush observed live |
+
+Scope and known limits (by design or measured):
+
+- **Responsive−1 is a starvation-gated rare path**: responsive target is 0
+  unless share-starved, and starved+responsive evidence was unreachable in
+  the tested mixes (contention drops the wake-score below the classification
+  threshold). Bulk→positive is the exercised direction.
+- **History is keyed by kernel comm** (the lavd sample namespace); rules match
+  the argv[0]-derived name. A spoofed `exec -a` name therefore combines its
+  rule base with its *executable's* comm history — inherent to the sample
+  stream, which carries only comm.
+- **Transient freeze on view lag**: lavd's sample `static_prio` can lag our
+  apply by 30–60 s; the closed loop then freezes the entry (no updates) until
+  a matching sample clears it. Conservative and self-healing; real nice was
+  correct throughout (`postfix/bias-A-5.json` frozen → `bias-A-7.json` clear).
+- **Full relax flush needs ~15 min** after evidence stops (`release_step_s`
+  = 300 s; low-confidence entries flush in one step rather than stepping).
+- Bias applies to every sampled comm — including kernel threads (`napi/*`
+  observed being re-niced) and unruled names once bias ≠ 0.
+
+Audit trail: a full code-review pass (8 findings, all verified and fixed
+with mutation-probed red/green tests) preceded the post-fix runs; the
+pre-fix binary showed the review's predicted defects live (per-batch
+freeze/rebaseline churn pinning confidence at 0.25; a renice wedge that only
+manual intervention cleared) and the post-fix binary showed the designed
+behavior. `log_applied_rule = true` (validation-only; shipping default
+`false`) logs one line per applied exec and dominated instruction counts
+under storms — with it on, a self-learned name at 2 000 execs/s produced
+~180 k log lines / 45 s and 79–83 k instructions/event vs ~28–29 k with
+logging off; wall-% cells below carried the same confound.
+
+Storm A/B, logging ON (confounded — shown for the record):
+
+| metric (2 000 execs/s, 3 reps, governor `performance`) | bias on | bias off |
+|---|---|---|
+| unruled wall-%, median [range] | 4.10 [3.97–4.33] / 3.80 [3.58–3.82] | 4.13 [3.90–4.35] / 3.27 [2.98–3.37] |
+| ruled wall-%, median [range] | 7.78 [7.77–8.20] / 6.50 [6.43–6.57] | 7.17 [7.00–7.22] / 6.38 [6.25–6.55] |
+| sampler thread (40 s) | 0.125% / 0.15% of one core | — |
+
+(pre-fix / post-fix pairs). Sampler cost is within its ≤1% budget by ~7×.
+
+### Shipping gate numbers (quiet config, fresh bias state per cell)
+
+`log_applied_rule = false` (the shipped default), post-fix binary, fresh
+`bias-state` before every cell (machinery-only cost), governor `performance`
+pinned, 3 reps per cell, 2 000 execs/s. Evidence: `…/evidence/postfix2/`.
+
+| cell | bias on, median [range] | bias off, median [range] | verdict |
+|---|---|---|---|
+| idle | 0.23% (RSS 12.9 MB) | 0.0% (11.9 MB) | — |
+| unruled | **3.88** [3.58–3.88] | **3.07** [2.97–3.17] | ≤5% **pass** both |
+| ruled | **4.93** [4.88–4.97] | **4.75** [4.75–4.92] | ≤5% **pass** both |
+
+Instructions/event (30 s / 60 000 events, 3 captures per condition, fresh
+state): bias-on 34.71k / 35.35k / 35.19k (median 35.19k) vs bias-off 34.75k /
+34.71k / 35.65k (median 34.75k) — **Δ +1.3%, inside capture noise** (ranges
+overlap). The one-capture "+21%" from the confounded round did not reproduce:
+it was ambient load, not machinery. Populated-state bound: 115 restored
+entries → 35.97k (+2.2%, single capture) — no map-size cliff. Sampler thread
+0.15% of one core (≤1% gate, ~7× margin). Wall-% clock confounder: measured
+0.89–3.43 GHz spread under the `performance` governor; instr/event is the
+invariant. Absolute instr/event is above the 24–25k of the 2026-10-23
+captures because this round ran the live 42 847-line rule corpus plus ambient
+desktop execs, not the 15 832-line corpus.
+
+Cost of the feature when it is *working* (not in the table above): a name
+with learned bias gets its nice applied per exec (one `setpriority`-family
+walk, same as a ruled name) — that is the designed actuation path; the
+confounded round showed the pathological extreme is verbose logging, not
+actuation. Bias applies to every sampled comm, kernel threads included.

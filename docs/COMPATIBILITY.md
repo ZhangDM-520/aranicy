@@ -49,19 +49,52 @@ ananicy-cpp's OS order).
 3. Apply order (parity): nice → latency_nice → sched+rtprio → ioclass+ionice →
    oom_score_adj → cgroup → cpuset. Gates from `ananicy.conf` apply.
 
+## Dynamic nice bias (superset)
+
+Optional dynamic nice adjustment driven **solely** by `scx_lavd` scheduler
+samples over its stats socket — no fallback sampler is shipped; without lavd
+the mechanism degrades as described below. Disable with `bias_enable = false`.
+Hot-path cost is one extra O(1) map lookup per event — the bias history is a
+separate table from the rule tables.
+
+- Per-name history keyed by the **kernel comm** (the `scx_lavd` sample
+  namespace; rule matching uses the separate argv[0]-derived name): class
+  (`bulk`/`responsive`/`unknown`), integer `bias`, evidence `confidence` 0..1.
+- Applied nice = `clamp(rule_nice + bias, -20, 19)`; unruled names synthesize a
+  policy when bias ≠ 0. Live check: `/proc/<pid>/stat` field 19 (`nice`) must
+  equal that value (field 18 is `nice + 20`).
+- Closed loop: applied values are re-checked against the nice observed in the
+  lavd sample stream (`static_prio` there = nice + 20), against the value this
+  daemon actually applied — never against re-derived rules. A mismatch freezes
+  the entry (no updates) until a matching sample re-baselines it; entries the
+  daemon never adjusted are not verified.
+- **lavd absent ≠ bias 0**: history entries keep their bias and continue to
+  apply; learning stops updating. Wall-time aging (half-life) decays
+  `confidence` and relaxes bias toward 0 stepwise, so old learnings can never
+  pin a bias permanently.
+- Persistence: `bias_state_path` (default `/var/lib/aranicy/bias-state`),
+  versioned JSON, atomic write, debounced ≥ 60 s. `dump bias` reads it
+  unprivileged (on-disk state may lag live bias by up to ~60 s).
+
+Config keys (all `bias_*`): `bias_enable`, `bias_min`, `bias_max`,
+`bias_window_s`, `bias_deadband_pct`, `bias_min_samples`, `bias_cadence_ms`,
+`bias_max_entries`, `bias_half_life_s`, `bias_state_path`.
+
 ## Config keys (superset)
 
 `check_freq`, `apply_nice`, `apply_latnice`, `apply_ionice`, `apply_ioclass`,
 `apply_sched`, `apply_oom_score_adj`, `apply_cgroup`, `apply_cpuset`,
 `apply_autogroup` (superset), `cgroup_load`, `type_load`, `rule_load`,
 `loglevel`, `log_applied_rule`, `cgroup_realtime_workaround`, `x3d_mode`
-(accepted; cpuset alias input only).
+(accepted; cpuset alias input only). Superset-only `bias_*` keys are listed
+under *Dynamic nice bias*.
 
 ## CLI and service
 
 - `aranicy start` (root; eBPF-only: hard failure with a clear message when
   BTF/tracepoint support is missing — no silent fallback),
-- `aranicy dump {rules,types,cgroups,proc,autogroup}` (unprivileged),
+- `aranicy dump {rules,types,cgroups,proc,autogroup,bias}` (unprivileged;
+  `bias` shows the persisted bias snapshot),
 - `aranicy lint`, `aranicy match-test <name>` (dry-run, superset),
 - `--reload` reloads config **and rules** (superset: ananicy-cpp reloads
   config only), `--config`, `--config-dir`.

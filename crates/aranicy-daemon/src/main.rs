@@ -1,12 +1,14 @@
 //! aranicy daemon + CLI.
 //!
 //! CLI surface is a superset of ananicy-cpp's (docs/COMPATIBILITY.md):
-//! `start`, `dump {rules,types,cgroups,proc,autogroup}`, `--reload`, plus
+//! `start`, `dump {rules,types,cgroups,proc,autogroup,bias}`, `--reload`, plus
 //! `lint` and `match-test` (dry-run) which ananicy-cpp lacks.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod bias;
+mod bias_state;
 mod config;
 mod daemon;
 mod dump;
@@ -14,6 +16,7 @@ mod load;
 mod paths;
 mod pidfile;
 mod procname;
+mod sampler;
 mod sdnotify;
 
 use aranicy_rules::MatchKind;
@@ -40,7 +43,7 @@ enum Action {
     Start,
     /// Print loaded state as JSON (works unprivileged).
     Dump {
-        #[arg(value_parser = ["rules", "types", "cgroups", "proc", "autogroup"])]
+        #[arg(value_parser = ["rules", "types", "cgroups", "proc", "autogroup", "bias"])]
         what: String,
     },
     /// Validate rules and report problems without running (exit 1 on errors).

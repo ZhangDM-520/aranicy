@@ -48,3 +48,41 @@
 - `strace` prints fds as bare numbers unless `-y`: dirfd usage shows as
   `openat(12, "NNN/cmdline", ...)` — do not grep for `</proc>` annotations
   when proving `openat`-on-dirfd behavior.
+
+## lavd stats protocol pitfalls (learned 2026-10-27, sampler.rs)
+
+- scx_lavd 1.1.4 `stats_meta` reports `SchedSample.fields` as a name ->
+  {datum, desc} MAP, not the array of names its docs suggest. Any consumer
+  must accept both shapes (map keys / array strings / objects with "name").
+- `sched_samples` batches are capped at ~60 samples by the 16 KB ringbuf no
+  matter the `nr_samples` budget; drops are silent (mseq contiguous) and the
+  batch is hot-task biased — never infer anything from absence of a task.
+- `CARGO_TARGET_TMPDIR` is set only when building integration tests, not for
+  `#[cfg(test)]` unit tests inside src — and this host forbids /tmp writes
+  outright. Test socket/file fixtures need a fallback under the crate's
+  `target/` dir (mind the 108-byte AF_UNIX path limit).
+- A scripted fake-socket server's reply queue must use one cursor across
+  connections; resetting per connection silently replays the first (often the
+  failure) entry and wedges reconnect tests in confusing ways.
+
+## Bias-engine control-law lessons (reviewed 2026-10-27)
+
+- "No faster than N steps × interval" rate limits must gate the FIRST step on
+  want-onset + interval too; gating only last-step + interval lets a ramp of
+  N steps finish in N−1 intervals.
+- A shared global step budget needs FIFO-by-want-onset scheduling (winner
+  re-arms its want = goes to the back). Lexicographic first-eligible hands
+  every slot to the alphabetically first name and starves the rest — a test
+  caught it, not review.
+- A threshold that is the mean of the same population being classified
+  deadbands whenever one name dominates the population; fixtures need a
+  stable background population or T drifts to the target's own mean.
+- Restart-safe confidence aging anchors decay to max(last state change,
+  last_seen) and applies per-call deltas; recomputing "since last_seen" per
+  call compounds and over-decays.
+- "cargo test green" is not a crate-done gate: the rewrite crates shipped
+  clippy-clean-looking tests that `clippy --all-targets` rejects (deny-by-default
+  lints only surface there), and manifest-level unused-dependency warnings
+  (cargo::unused_dependencies) plus stale workspace deps (declare-only, e.g.
+  notify after SIGHUP-only reload) show up nowhere else. Run
+  `cargo clippy --workspace --all-targets` before calling a crate done.

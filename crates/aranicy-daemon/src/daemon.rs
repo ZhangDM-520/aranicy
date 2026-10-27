@@ -28,6 +28,8 @@ use crate::load;
 use crate::paths::{self, Paths};
 use crate::pidfile::{self, PidFile};
 use crate::procname::{self, ProcResolver, NAME_CAP, STAT_CAP};
+use crate::bias::BiasEngine;
+use crate::{bias_state, sampler};
 use crate::sdnotify;
 
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
@@ -119,6 +121,9 @@ struct Shared {
     /// Startup-owned `/proc` dirfd resolver (openat hot path; closed on drop).
     proc: ProcResolver,
     counters: Mutex<Counters>,
+    /// Dynamic nice bias engine (plan.md §4.2); lookups use the sample `comm`
+    /// namespace, rule bases use the argv[0]-derived match name.
+    bias: Mutex<BiasEngine>,
     shutdown: AtomicBool,
     drift_cv: Condvar,
     drift_m: Mutex<()>,
@@ -192,6 +197,21 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     let source = BpfExecSource::new().map_err(|e| anyhow::anyhow!("{e}"))?;
     let source = Arc::new(source);
 
+    // Bias engine (plan.md §4.2-4.3): restore learned history, then run the
+    // sampler + bias threads alongside the worker.
+    let bias_enable = cfg.bias_enable;
+    let bias_state_path = cfg.bias_state_path.clone();
+    let bias_cadence = std::time::Duration::from_millis(cfg.bias_cadence_ms.clamp(50, 60_000));
+    let mut bias_engine = BiasEngine::new(cfg.bias_config());
+    match bias_state::load(std::path::Path::new(&bias_state_path)) {
+        Ok(Some(snap)) => {
+            tracing::info!(entries = snap.entries.len(), "bias: restored history");
+            bias_engine.restore(snap);
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("bias: cannot load {}: {e}", bias_state_path),
+    }
+
     let shared = Arc::new(Shared {
         rules: RwLock::new(Arc::new(rules)),
         config: RwLock::new(Arc::new(cfg)),
@@ -199,6 +219,7 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
         caps,
         proc: ProcResolver::open(),
         counters: Mutex::new(Counters::default()),
+        bias: Mutex::new(bias_engine),
         shutdown: AtomicBool::new(false),
         drift_cv: Condvar::new(),
         drift_m: Mutex::new(()),
@@ -221,6 +242,17 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || drift_loop(&shared))
     };
+    let bias_threads = if bias_enable {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = sampler::spawn(&sampler::default_socket_paths(), bias_cadence, tx);
+        let bias_thread = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || bias_loop(&shared, rx))
+        };
+        Some((handle, bias_thread))
+    } else {
+        None
+    };
 
     let socket = sdnotify::socket_from_env();
     sdnotify::notify(socket.as_deref(), "READY=1");
@@ -238,10 +270,66 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
             libc::kill(libc::getpid(), libc::SIGTERM);
         }
     }
+    if let Some((handle, bias_thread)) = bias_threads {
+        handle.shutdown();
+        let _ = handle.join();
+        let _ = bias_thread.join(); // channel closes with the sampler thread
+        let snap = shared.bias.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
+        if let Err(e) = bias_state::save(&snap, std::path::Path::new(&bias_state_path)) {
+            tracing::warn!("bias: cannot save state: {e}");
+        }
+    }
     let _ = drift_thread.join();
     let _ = signal_thread.join();
     sdnotify::notify(socket.as_deref(), "STOPPING=1");
     Ok(())
+}
+
+/// Bias thread: consumes sampler batches, updates the engine, verifies our own
+/// applied nice against lavd's `static_prio` view, ages history, debounces
+/// state writes. Aging continues on `Timeout` so a dead stream relaxes bias
+/// instead of freezing it (owner rule).
+fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let state_path = shared.config().bias_state_path.clone();
+    let mut last_save = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(batch) => {
+                let now = std::time::SystemTime::now();
+                let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
+                for s in &batch {
+                    // Closed loop verifies ONLY against the nice this daemon
+                    // applied for the comm — never re-derived from rules
+                    // (comm and the rule-name namespace differ) and skipped
+                    // for comms we never touched.
+                    engine.verify_applied(&s.comm, s.static_prio);
+                }
+                engine.record_batch(&batch, now);
+                engine.age(now);
+                for (name, bias) in engine.take_changed_recently() {
+                    tracing::info!(name, bias, "bias changed");
+                }
+                drop(engine);
+                if last_save.elapsed() >= std::time::Duration::from_secs(60) {
+                    let snap =
+                        shared.bias.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
+                    if let Err(e) = bias_state::save(&snap, std::path::Path::new(&state_path)) {
+                        tracing::warn!("bias: cannot save state: {e}");
+                    }
+                    last_save = std::time::Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                shared
+                    .bias
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .age(std::time::SystemTime::now());
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +510,19 @@ struct SummaryState {
     dropped: u64,
 }
 
+/// When to claim nice for a process: the rule dictates a nice (always
+/// managed, drift re-asserts it), a bias is active (target ≠ 0), or we
+/// previously claimed this name and the target moved (relaxation back to
+/// base must reach running processes). A matched rule with no `nice` and no
+/// bias is left untouched — ambient nice is not ours to overwrite.
+fn eff_nice_for(rule_nice: Option<i8>, target: i8, applied: Option<i8>) -> Option<i8> {
+    if rule_nice.is_some() || target != 0 || applied.is_some_and(|a| a != target) {
+        Some(target)
+    } else {
+        None
+    }
+}
+
 fn handle_event(shared: &Shared, ev: &ExecEvent) {
     let mut buf = [0u8; NAME_CAP];
     let len = shared.proc.derive_name(ev.pid, ev.comm_bytes(), &mut buf);
@@ -444,13 +545,45 @@ fn handle_event(shared: &Shared, ev: &ExecEvent) {
     };
 
     let rules = shared.rules();
-    let Some((policy, _kind)) = rules.lookup(name) else {
-        shared
-            .counters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .unmatched += 1;
-        return;
+    let matched = rules.lookup(name);
+    let cfg = shared.config();
+    let base = matched.as_ref().map(|(p, _)| p.nice.unwrap_or(0)).unwrap_or(0);
+    // Bias history is keyed by the kernel comm (sample namespace); rules match
+    // on the argv[0]-derived name (plan.md §4.2).
+    let comm_str = std::str::from_utf8(ev.comm_bytes()).unwrap_or(name);
+    let (target, applied) = if cfg.bias_enable {
+        let engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
+        (engine.target_nice(comm_str, base), engine.applied_nice(comm_str))
+    } else {
+        (base, None)
+    };
+    let eff_nice = eff_nice_for(matched.as_ref().and_then(|(p, _)| p.nice), target, applied);
+
+    let owned: aranicy_model::Policy;
+    let policy: &aranicy_model::Policy = match matched {
+        Some((p, _)) if eff_nice == p.nice => p,
+        Some((p, _)) => {
+            owned = aranicy_model::Policy {
+                nice: eff_nice,
+                ..(**p).clone()
+            };
+            &owned
+        }
+        None if eff_nice.is_some() => {
+            owned = aranicy_model::Policy {
+                nice: eff_nice,
+                ..Default::default()
+            };
+            &owned
+        }
+        None => {
+            shared
+                .counters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unmatched += 1;
+            return;
+        }
     };
     shared
         .counters
@@ -458,7 +591,6 @@ fn handle_event(shared: &Shared, ev: &ExecEvent) {
         .unwrap_or_else(PoisonError::into_inner)
         .matched += 1;
 
-    let cfg = shared.config();
     let report = apply_policy(
         ev.pid,
         policy,
@@ -475,8 +607,17 @@ fn handle_event(shared: &Shared, ev: &ExecEvent) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .tally(&report);
+    if cfg.bias_enable {
+        // Remember what we applied so the closed loop verifies against it
+        // (and releases the claim when the apply did not take).
+        shared
+            .bias
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .note_applied(comm_str, (report.nice == ActionOutcome::Applied).then_some(target));
+    }
     if cfg.log_applied_rule && applied_any {
-        tracing::info!(rule = name, pid = ev.pid, "applied rule");
+        tracing::info!(rule = name, pid = ev.pid, bias = target - base, "applied rule");
     }
 }
 
@@ -571,10 +712,19 @@ fn drift_scan(shared: &Shared) {
             continue;
         };
         let rules = shared.rules();
-        let Some((policy, _kind)) = rules.lookup(name) else {
-            continue;
+        let matched = rules.lookup(name);
+        let cfg = shared.config();
+        let base = matched.as_ref().map(|(p, _)| p.nice.unwrap_or(0)).unwrap_or(0);
+        let comm_str = std::str::from_utf8(comm).unwrap_or(name);
+        let (bias_target, applied) = if cfg.bias_enable {
+            let engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
+            (engine.target_nice(comm_str, base), engine.applied_nice(comm_str))
+        } else {
+            (base, None)
         };
-        let Some(target) = policy.nice else {
+        let eff_nice =
+            eff_nice_for(matched.as_ref().and_then(|(p, _)| p.nice), bias_target, applied);
+        let Some(target) = eff_nice else {
             continue;
         };
         if current_nice == target {
@@ -587,7 +737,24 @@ fn drift_scan(shared: &Shared) {
             target,
             "drift mismatch"
         );
-        let cfg = shared.config();
+        let owned: aranicy_model::Policy;
+        let policy: &aranicy_model::Policy = match matched {
+            Some((p, _)) if eff_nice == p.nice => p,
+            Some((p, _)) => {
+                owned = aranicy_model::Policy {
+                    nice: eff_nice,
+                    ..(**p).clone()
+                };
+                &owned
+            }
+            None => {
+                owned = aranicy_model::Policy {
+                    nice: eff_nice,
+                    ..Default::default()
+                };
+                &owned
+            }
+        };
         let report = apply_policy(
             pid,
             policy,
@@ -600,6 +767,13 @@ fn drift_scan(shared: &Shared) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .tally(&report);
+        if cfg.bias_enable {
+            shared
+                .bias
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .note_applied(comm_str, (report.nice == ActionOutcome::Applied).then_some(target));
+        }
         if cfg.log_applied_rule {
             tracing::info!(rule = name, pid, "applied rule (drift)");
         }
@@ -609,6 +783,22 @@ fn drift_scan(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eff_nice_never_touches_nice_less_rules_at_zero_bias() {
+        // Regression: a matched rule without `nice` must not be force-reniced
+        // to 0 (ambient nice is preserved).
+        assert_eq!(eff_nice_for(None, 0, None), None);
+        // bias active → synthesized claim
+        assert_eq!(eff_nice_for(None, 3, None), Some(3));
+        // relaxation: previously claimed, target moved back to base → apply 0
+        assert_eq!(eff_nice_for(None, 0, Some(3)), Some(0));
+        // at rest after relaxation → untouched again
+        assert_eq!(eff_nice_for(None, 0, Some(0)), None);
+        // rule dictates nice → always managed (drift re-asserts)
+        assert_eq!(eff_nice_for(Some(5), 5, None), Some(5));
+        assert_eq!(eff_nice_for(Some(5), 8, Some(8)), Some(8));
+    }
 
     #[test]
     fn config_to_apply_options_mapping() {
