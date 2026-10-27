@@ -50,3 +50,10 @@
   packages/stable/aranicy in the gsa tree; live cutover already done
   (ananicy-cpp retired 2026-10-24) but the running service is v0.1.0-1 —
   rebuild/install to pick this up.
+
+## 2026-10-28 (release wave closed)
+
+- v0.2.0 tagged + pushed; gsa recipe bumped + built + installed on the host
+  (aranicy 0.2.0-1, service verified live with lavd sampler connected).
+- Upstream TODO (v0.2.1): build.rs clang_args --remap/-ffile-prefix-map for
+  the BPF object so makepkg's srcdir-reference lint goes quiet.

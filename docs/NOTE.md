@@ -231,3 +231,25 @@
   aranicy.service active/enabled, scx_lavd original args, governors
   restored, toys/kthread residue cleaned. Not done (not requested): tag /
   gsa recipe bump to a post-bias release.
+
+## 2026-10-28 (release wave: v0.2.0 + gsa bump + install)
+
+- v0.2.0 released: version bump commit 6a3e662, annotated tag v0.2.0 pushed
+  (no GitHub Release — v0.1.0 precedent). Tarball sha256
+  b3fd679594ba73504a76e0f3f4dbc6b008ea6fffa3fe311973850ff589972854;
+  contrib/PKGBUILD pinned post-tag (same pattern as v0.1.0).
+- gsa tree: packages/stable/aranicy bumped (d964e75 recipe + .SRCINFO;
+  3830547 build-side rustc srcdir remap). Validated bash -n, gsa -Sl
+  ("285. aranicy"), gsa -S --dry-run aranicy. Built via leaf makepkg,
+  pacman -U -> aranicy 0.2.0-1 installed, service restarted and verified
+  live (eBPF handle_exec loaded; "lavd sampler live"; dump bias answers).
+- Residual (cosmetic, since v0.1.0): makepkg srcdir-reference lint warning
+  remains — the embedded eBPF object carries clang compile paths; full fix
+  is an upstream build.rs clang_args prefix-map (v0.2.1 TODO).
+- Multi-writer worktree lesson (gsa tree): `git commit` without pathspec
+  swallowed another session's STAGED deletions, and a pathspec commit of a
+  shared journal file swept their UNSTAGED interleaved lines. Fix attempted
+  index-only (base+mine blob) but their edits were interleaved mid-file, so
+  the sweep stands (content preserved, nothing lost). Rule: in a shared
+  worktree show FULL untruncated git status first, and commit with pathspec
+  while never committing shared journal files you did not author end-to-end.

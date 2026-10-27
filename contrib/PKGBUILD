@@ -4,7 +4,7 @@
 # (both own the auto-nice role and /etc/ananicy.d).
 
 pkgname=aranicy
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Auto-nice daemon in Rust (eBPF exec events, ananicy-compatible rules)"
 arch=('x86_64')
@@ -16,7 +16,7 @@ provides=('ananicy-cpp')
 conflicts=('ananicy-cpp')
 backup=('etc/ananicy.d/ananicy.conf')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('89e9dfad141c9159a5493ddec5b1d217dba6cb2e4f351e76f2d4c1663b253ebc')
+sha256sums=('b3fd679594ba73504a76e0f3f4dbc6b008ea6fffa3fe311973850ff589972854')
 
 prepare() {
     cd "$pkgname-$pkgver"
