@@ -62,10 +62,18 @@ pub struct BiasSnapshot {
     pub entries: Vec<EntrySnapshot>,
 }
 
-/// Atomically persist `state` (write tmp file + rename).
+/// Atomically persist `state` (write tmp file + rename). Missing parent
+/// directories are created: the state path lives under `/var/lib/aranicy/`
+/// which a non-systemd start may not have (ENOENT there once made every
+/// save fail and `dump bias` blind).
 pub fn save(state: &BiasSnapshot, path: &Path) -> io::Result<()> {
     let bytes = serde_json::to_vec(state)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir)?;
+        }
+    }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -147,6 +155,15 @@ mod tests {
         // Save again over an existing file (tmp + rename must clobber cleanly).
         save(&snap, &path).expect("resave");
         assert_eq!(load(&path).expect("load").expect("present"), snap);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs() {
+        let dir = scratch_dir("mkdirs");
+        let path = dir.join("nested").join("deeper").join("state.json");
+        save(&sample_snapshot(), &path).expect("save must create parents");
+        assert_eq!(load(&path).expect("load").expect("present"), sample_snapshot());
         fs::remove_dir_all(&dir).ok();
     }
 

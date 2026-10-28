@@ -18,12 +18,9 @@ aranicy-apply.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+# `bias.rs` compiles `bias_group.*` regexes into `BiasGroup` at startup.
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-# Tests build synthetic `RuleSet`s; populating the public `regexes` field needs
-# the `regex` type directly (already in the workspace dependency set).
-regex.workspace = true

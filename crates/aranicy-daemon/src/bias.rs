@@ -15,12 +15,21 @@
 //!   under T for 2 consecutive classifying windows, RESPONSIVE above for 2,
 //!   deadband holds the class. Windows are `window_s` and need `min_samples`
 //!   scored samples; absence is never evidence (streaks/untouched confidence).
+//!   Decisive evidence (beyond 2× the deadband — past the actuator-swing
+//!   envelope the deadband was sized for) classifies on ONE window at
+//!   `min_samples / 4` (≥ 4) samples, so short-lived phases (builds) are not
+//!   starved by the two-window confirmation.
 //! * **Controller:** BULK → `max_bias`, RESPONSIVE + share-starved →
 //!   `min_bias`, RESPONSIVE → 0, deadband/unknown → hold then relax toward 0
 //!   at the release rate. Attack (away from 0 toward target) ≤ 1 step /
 //!   `attack_step_s` from want-onset; release (toward 0) ≤ 1 step /
 //!   `release_step_s`; one bias step globally per `global_step_s` (shared
 //!   budget, deterministic BTreeMap order).
+//! * **History keys (fuzzy):** a `bias_group.<tag> = <regex>` family pools
+//!   every matching comm into one entry named `<tag>` (a build's
+//!   cc1plus→as→ld→lto1 handoff learns as one `build` stream); otherwise
+//!   [`normalize_name`] collapses per-instance (`name:7`) and version
+//!   (`clang-19`) suffixes. Semantic families are never guessed.
 //! * **History never permanently fixes bias:** confidence decays with
 //!   wall-time since last activity (half-life `half_life_s`) and each
 //!   `RELAX_STEP` of decay releases one step toward 0; zero confidence forces
@@ -68,6 +77,54 @@ pub fn sample_score(s: &SchedSample) -> Option<u64> {
     Some(s0 * s0)
 }
 
+/// A declared fuzzy family: every matching comm shares one learned entry.
+pub type BiasGroup = (String, regex::Regex);
+
+/// Collapse suffix families onto one history key: everything after the last
+/// `:`/`#` is a per-instance suffix (`kworker/u97:10`, `ghostty:gdrv0`,
+/// `WRRende~ckend#0`) and one trailing separator+digits run is a version
+/// (`clang-19`, `python3.12`). Deliberately conservative: `cc1plus`, `lto1`
+/// and `x265` are NOT folded — semantic families belong in `bias_group`.
+pub fn normalize_name(comm: &str) -> std::borrow::Cow<'_, str> {
+    let mut s: &str = comm;
+    if let Some(i) = s.rfind([':', '#']) {
+        if i > 0 {
+            s = &s[..i];
+        }
+    }
+    let b = s.as_bytes();
+    let mut end = b.len();
+    while end > 0 && b[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    if end > 0 && end < b.len() && matches!(b[end - 1], b'-' | b'_' | b'.') {
+        end -= 1;
+        s = &s[..end];
+    } else {
+        s = &s[..b.len()]; // no separator+digits: keep whole
+    }
+    if s.is_empty() {
+        s = comm;
+    }
+    if s.len() == comm.len() {
+        std::borrow::Cow::Borrowed(comm)
+    } else {
+        std::borrow::Cow::Owned(s.to_string())
+    }
+}
+
+/// History key for a sampled comm: a declared `bias_group` pattern wins
+/// (fuzzy family pooling), else the normalized name. Borrowed when nothing
+/// changes — the exec path stays allocation-free.
+fn entry_key<'a>(comm: &'a str, groups: &'a [BiasGroup]) -> std::borrow::Cow<'a, str> {
+    for (tag, re) in groups {
+        if re.is_match(comm) {
+            return std::borrow::Cow::Borrowed(tag.as_str());
+        }
+    }
+    normalize_name(comm)
+}
+
 /// Engine knobs (plan.md config keys: `bias_*`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BiasConfig {
@@ -107,7 +164,9 @@ impl Default for BiasConfig {
             max_entries: 4096,
             min_bias: -1,
             max_bias: 3,
-            attack_step_s: 60,
+            // Responsive ramp: a 60 s step outlives short build phases
+            // (measured: cc1plus reached +3 only after the compile ended).
+            attack_step_s: 30,
             release_step_s: 300,
             global_step_s: 5,
             starved_ratio: 0.5,
@@ -297,17 +356,30 @@ impl Entry {
             None
         };
 
-        if self.win_score_n >= cfg.min_samples {
-            if let (Some(mean), Some(th)) = (score_mean, threshold) {
-                let low = th * ((100.0 - cfg.deadband_pct as f64) / 100.0);
-                let high = th * ((100.0 + cfg.deadband_pct as f64) / 100.0);
-                let cand = if mean < low {
-                    Some(BiasClass::Bulk)
-                } else if mean > high {
-                    Some(BiasClass::Responsive)
-                } else {
-                    None
-                };
+        if let (Some(mean), Some(th)) = (score_mean, threshold) {
+            let d = cfg.deadband_pct as f64 / 100.0;
+            let low = th * (1.0 - d);
+            let high = th * (1.0 + d);
+            let cand = if mean < low {
+                Some(BiasClass::Bulk)
+            } else if mean > high {
+                Some(BiasClass::Responsive)
+            } else {
+                None
+            };
+            // Decisive evidence sits outside the actuator-swing envelope
+            // (2x the deadband, well past the ~11% self-induced swing the
+            // deadband was sized for): classify on ONE window and a quarter
+            // of the samples, so short-lived bursts (build phases) are not
+            // starved by the two-window confirmation.
+            let decisive = mean < th * (1.0 - 2.0 * d) || mean > th * (1.0 + 2.0 * d);
+            let need = if decisive {
+                (cfg.min_samples / 4).max(4)
+            } else {
+                cfg.min_samples
+            };
+            let need_streak = if decisive { 1 } else { 2 };
+            if self.win_score_n >= need {
                 match cand {
                     Some(c) => {
                         if self.pending == Some(c) {
@@ -316,7 +388,7 @@ impl Entry {
                             self.pending = Some(c);
                             self.streak = 1;
                         }
-                        if self.streak >= 2 {
+                        if self.streak >= need_streak {
                             self.class = c;
                             self.pending = None;
                             self.streak = 0;
@@ -336,10 +408,16 @@ impl Entry {
                 } else {
                     0
                 };
+            } else {
+                // Observed but too sparse to classify: hold the class, shed
+                // confidence (magnitude unspecified in the brief: halve).
+                self.confidence *= 0.5;
+                self.pending = None;
+                self.streak = 0;
             }
-        } else {
-            // Observed but too sparse to classify: hold the class, shed
-            // confidence (magnitude unspecified in the brief: halve).
+        } else if self.win_score_n < cfg.min_samples {
+            // Observed but unscored (or no population threshold yet): same
+            // sparse treatment as above.
             self.confidence *= 0.5;
             self.pending = None;
             self.streak = 0;
@@ -370,6 +448,8 @@ impl Entry {
 #[derive(Debug)]
 pub struct BiasEngine {
     cfg: BiasConfig,
+    /// Fuzzy families (matched first; members pool into one entry).
+    groups: Vec<BiasGroup>,
     entries: BTreeMap<String, Entry>,
     /// Population threshold T_us (EWMA of mean score), if known.
     threshold: Option<f64>,
@@ -383,7 +463,13 @@ pub struct BiasEngine {
 }
 
 impl BiasEngine {
-    pub fn new(mut cfg: BiasConfig) -> Self {
+    pub fn new(cfg: BiasConfig) -> Self {
+        Self::new_with_groups(cfg, Vec::new())
+    }
+
+    /// `groups` are fuzzy families (see [`entry_key`]): their members pool
+    /// samples into one entry and share its learned bias.
+    pub fn new_with_groups(mut cfg: BiasConfig, groups: Vec<BiasGroup>) -> Self {
         // Library-level invariant: i8::clamp panics on an inverted range.
         // Config::parse already warns and resets; normalize here too so any
         // other caller is safe.
@@ -392,6 +478,7 @@ impl BiasEngine {
         }
         BiasEngine {
             cfg,
+            groups,
             entries: BTreeMap::new(),
             threshold: None,
             window_end: None,
@@ -418,10 +505,10 @@ impl BiasEngine {
         self.window_end = Some(end);
 
         for s in batch {
-            let e = self
-                .entries
-                .entry(s.comm.clone())
-                .or_insert_with(|| Entry::new(t));
+            // Fuzzy family key: suffix families pool (kworker/u97:*), and
+            // declared bias_group patterns pool semantic families (cc1*/lto1).
+            let key = entry_key(&s.comm, &self.groups).into_owned();
+            let e = self.entries.entry(key).or_insert_with(|| Entry::new(t));
             // Frozen by closed-loop mismatch: no evidence updates until a
             // matching sample un-freezes (verify_applied); aging still
             // relaxes the stored bias toward 0 meanwhile.
@@ -481,7 +568,8 @@ impl BiasEngine {
     /// Applied nice = `clamp(base_nice + bias, -20, 19)`, recomputed from the
     /// base every call (idempotent — never increments on itself).
     pub fn target_nice(&self, name: &str, base_nice: i8) -> i8 {
-        let bias = self.entries.get(name).map_or(0, |e| e.bias);
+        let key = entry_key(name, &self.groups);
+        let bias = self.entries.get(key.as_ref()).map_or(0, |e| e.bias);
         (i16::from(base_nice) + i16::from(bias)).clamp(-20, 19) as i8
     }
 
@@ -499,7 +587,14 @@ impl BiasEngine {
         if observed_static_prio == 0 {
             return;
         }
-        let Some(e) = self.entries.get_mut(name) else {
+        let Self {
+            entries,
+            groups,
+            last_now,
+            ..
+        } = self;
+        let key = entry_key(name, groups);
+        let Some(e) = entries.get_mut(key.as_ref()) else {
             return;
         };
         let Some(expected_nice) = e.applied_nice else {
@@ -508,7 +603,7 @@ impl BiasEngine {
         let observed_nice = observed_static_prio as i64 - 20;
         if observed_nice == i64::from(expected_nice) {
             if e.frozen {
-                e.rebaseline(self.last_now);
+                e.rebaseline(*last_now);
             }
         } else if !e.frozen {
             e.frozen = true;
@@ -518,14 +613,19 @@ impl BiasEngine {
     /// Record the nice this daemon applied for `name` (`None` when the apply
     /// did not take, e.g. Denied/Failed — then verification is skipped).
     pub fn note_applied(&mut self, name: &str, nice: Option<i8>) {
-        if let Some(e) = self.entries.get_mut(name) {
+        let Self {
+            entries, groups, ..
+        } = self;
+        let key = entry_key(name, groups);
+        if let Some(e) = entries.get_mut(key.as_ref()) {
             e.applied_nice = nice;
         }
     }
 
     /// The nice this daemon last applied for `name`, if any.
     pub fn applied_nice(&self, name: &str) -> Option<i8> {
-        self.entries.get(name).and_then(|e| e.applied_nice)
+        let key = entry_key(name, &self.groups);
+        self.entries.get(key.as_ref()).and_then(|e| e.applied_nice)
     }
 
     /// Serializable state for persistence (see `bias_state::save`).
@@ -721,10 +821,18 @@ mod tests {
         }
     }
 
-    // Hand-computed score fixtures (see score_fixtures_and_skip):
-    //   400 = 20²  : ilog2(1024·1024) = 20, runtime_ft = 1
-    //   100 = 10²  : ilog2(32·32) = 10, runtime_ft = 1
-    //   784 = 28²  : 20 + ilog2(256) = 28
+    // Hand-computed score fixtures (see score_fixtures_and_skip). The
+    // classification envelope around the 400-score population mean T is
+    //   0.85..1.15 × T  deadband — holds the class
+    //   beyond 0.70..1.30 × T     — decisive: one window, min_samples/4 (≥ 4)
+    // so the bulk/resp fixtures sit deliberately INSIDE the 1×..2× deadband
+    // band (non-decisive: the two-window confirmation path is what they
+    // exercise) while the `decisive_*` fixtures sit far outside it:
+    //   400 = 20²  : ilog2(1024·1024) = 20, runtime_ft = 1   (the population)
+    //   289 = 17²  : 10 + ilog2(200) = 17                    (bulk, ~0.80 × T)
+    //   576 = 24²  : 20 + ilog2(25) = 24                     (resp, ~1.25 × T)
+    //   100 = 10²  : ilog2(32·32) = 10, runtime_ft = 1       (decisive bulk)
+    //   784 = 28²  : 20 + ilog2(256) = 28                    (decisive resp)
     fn noise_batch(n: usize) -> Batch {
         (0..n)
             .map(|_| sample("noise", 1023, 1023, 1_000_000_000, 500, 500))
@@ -732,12 +840,17 @@ mod tests {
     }
     fn bulk_batch(name: &str, n: usize) -> Batch {
         (0..n)
-            .map(|_| sample(name, 31, 31, 1_000_000_000, 500, 500))
+            .map(|_| sample(name, 31, 31, 5_000_000, 500, 500))
             .collect()
     }
     fn resp_batch(name: &str, n: usize) -> Batch {
         (0..n)
-            .map(|_| sample(name, 1023, 1023, 3_906_250, 500, 500))
+            .map(|_| sample(name, 1023, 1023, 40_000_000, 500, 500))
+            .collect()
+    }
+    fn decisive_bulk_batch(name: &str, n: usize) -> Batch {
+        (0..n)
+            .map(|_| sample(name, 31, 31, 1_000_000_000, 500, 500))
             .collect()
     }
     fn starved_batch(name: &str, n: usize) -> Batch {
@@ -899,7 +1012,13 @@ mod tests {
 
     #[test]
     fn slew_attack_and_release() {
-        let mut eng = BiasEngine::new(BiasConfig::default());
+        // Step spacing pinned explicitly: the tick arithmetic below is
+        // 60-based. The production default is pinned separately in
+        // `attack_step_default_is_thirty_seconds`.
+        let mut eng = BiasEngine::new(BiasConfig {
+            attack_step_s: 60,
+            ..BiasConfig::default()
+        });
         drive_bulk(&mut eng, &["app"]); // class Bulk at t=121, wants armed
 
         // attack: at most 1 step / 60 s, first step 60 s after want-onset
@@ -1175,6 +1294,120 @@ mod tests {
         eng.age(ts(241 + 10 * 60)); // far beyond window_s
         assert_eq!(eng.take_changed_recently(), vec![("app".to_string(), 2)]);
         assert!(eng.take_changed_recently().is_empty());
+    }
+
+    #[test]
+    fn normalize_name_collapses_instance_and_version_suffixes_only() {
+        use std::borrow::Cow;
+        // per-instance suffix after the last ':'/'#'
+        assert_eq!(normalize_name("kworker/u97:10"), "kworker/u97");
+        assert_eq!(normalize_name("ghostty:gdrv0"), "ghostty");
+        assert_eq!(normalize_name("WRRende~ckend#0"), "WRRende~ckend");
+        // one trailing separator+digits run is a version
+        assert_eq!(normalize_name("clang-19"), "clang");
+        assert_eq!(normalize_name("python3.12"), "python3");
+        assert_eq!(normalize_name("python3.12.3"), "python3.12"); // one run only
+        assert_eq!(normalize_name("v1.2"), "v1");
+        // semantic families are deliberately NOT folded here (bias_group's job)
+        for keep in ["cc1plus", "lto1", "x265", "sleep", "python3"] {
+            assert_eq!(normalize_name(keep), keep);
+            assert!(matches!(normalize_name(keep), Cow::Borrowed(_)));
+        }
+        // changed names are Owned, unchanged ones Borrowed (the exec path
+        // stays allocation-free)
+        assert!(matches!(normalize_name("kworker/u97:10"), Cow::Owned(_)));
+        // stripping must never produce an empty key
+        assert_eq!(normalize_name("-1"), "-1");
+    }
+
+    #[test]
+    fn bias_group_pools_members_into_one_entry() {
+        let re = regex::Regex::new("^(cc1.*|lto1|collect2|as|ld.*)$").unwrap();
+        let mut eng =
+            BiasEngine::new_with_groups(BiasConfig::default(), vec![("build".to_string(), re)]);
+        // 4 samples per phase name: alone each is under the decisive floor
+        // (7), pooled the family classifies on the first window — the exact
+        // cc1plus→as→ld→lto1 handoff pattern a build produces.
+        let mut w1 = noise_batch(60);
+        w1.extend(decisive_bulk_batch("cc1plus", 4));
+        w1.extend(decisive_bulk_batch("lto1", 4));
+        eng.record_batch(&w1, ts(1));
+        eng.record_batch(&[], ts(61)); // closes w1
+
+        let snap = eng.snapshot();
+        let names: Vec<&str> = snap.entries.iter().map(|e| e.name.as_str()).collect();
+        // cc1plus/lto1 pooled into "build"; only the noise population beside it
+        assert_eq!(names, vec!["build", "noise"]);
+        assert_eq!(
+            snap.entries.iter().find(|e| e.name == "build").unwrap().class,
+            BiasClass::Bulk
+        );
+
+        // ramp the pooled bias; every member name sees it
+        tick(&mut eng, 91);
+        tick(&mut eng, 121);
+        tick(&mut eng, 151);
+        assert_eq!(eng.target_nice("lto1", 0), 3);
+        assert_eq!(eng.target_nice("cc1plus", 0), 3);
+
+        // actuation + closed-loop verification also key through members
+        eng.note_applied("lto1", Some(3));
+        assert_eq!(eng.applied_nice("cc1plus"), Some(3));
+        eng.verify_applied("ld", 20); // observed nice 0 ≠ 3 → freeze the entry
+        assert!(snap_entry(&eng, "build").frozen);
+
+        // non-members keep their own entries
+        eng.record_batch(&decisive_bulk_batch("x265", 4), ts(200));
+        assert!(eng.snapshot().entries.iter().any(|e| e.name == "x265"));
+    }
+
+    #[test]
+    fn decisive_evidence_classifies_on_one_window() {
+        // Default min_samples = 30 → decisive floor = max(30 / 4, 4) = 7.
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let mut w1 = noise_batch(60);
+        w1.extend(decisive_bulk_batch("app", 7));
+        eng.record_batch(&w1, ts(1));
+        eng.record_batch(&[], ts(61)); // ONE window suffices
+        assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
+
+        // one sample short of the floor: still just sparse evidence
+        let mut eng2 = BiasEngine::new(BiasConfig::default());
+        let mut w = noise_batch(60);
+        w.extend(decisive_bulk_batch("app", 6));
+        eng2.record_batch(&w, ts(1));
+        eng2.record_batch(&[], ts(61));
+        assert_eq!(snap_entry(&eng2, "app").class, BiasClass::Unknown);
+    }
+
+    #[test]
+    fn non_decisive_needs_two_windows_and_min_samples() {
+        // non-decisive evidence is still bound by min_samples: 29 < 30 keeps
+        // the class Unknown no matter how many windows accumulate
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let mut w1 = noise_batch(60);
+        w1.extend(bulk_batch("app", 29));
+        let mut w2 = noise_batch(60);
+        w2.extend(bulk_batch("app", 29));
+        eng.record_batch(&w1, ts(1));
+        eng.record_batch(&w2, ts(61));
+        eng.record_batch(&[], ts(121));
+        assert_eq!(snap_entry(&eng, "app").class, BiasClass::Unknown);
+
+        // …and one full window never suffices for non-decisive evidence
+        let mut eng2 = BiasEngine::new(BiasConfig::default());
+        let mut w = noise_batch(60);
+        w.extend(bulk_batch("app", 32));
+        eng2.record_batch(&w, ts(1));
+        eng2.record_batch(&[], ts(61));
+        assert_eq!(snap_entry(&eng2, "app").class, BiasClass::Unknown);
+    }
+
+    #[test]
+    fn attack_step_default_is_thirty_seconds() {
+        // Locked default: a build-phase ramp must reach target in 3×30 s —
+        // the old 60 s step outlived short compile phases entirely.
+        assert_eq!(BiasConfig::default().attack_step_s, 30);
     }
 
     #[test]

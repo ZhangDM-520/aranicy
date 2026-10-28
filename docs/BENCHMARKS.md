@@ -228,6 +228,50 @@ Storm A/B, logging ON (confounded — shown for the record):
 
 (pre-fix / post-fix pairs). Sampler cost is within its ≤1% budget by ~7×.
 
+### Fuzzy keying + sensitivity wave — live revalidation (2026-10-28)
+
+Owner-reported defect: a build's tools (cc1plus→as→ld→lto1) hand off within
+seconds, so per-name learning never accumulates samples under any single
+comm and "the learning does not take it up at all"; the ramp reached +3 only
+after the compile had ended. Fix wave: fuzzy history keys (`bias_group`
+regex families pooling a build into one `build` entry, `normalize_name`
+suffix collapse for `kworker/u97:10`-style comms), decisive-evidence fast
+path (classify on ONE window at `min_samples/4` ≥ 4 samples when the mean is
+beyond 2× the deadband), `attack_step_s` 60→30.
+
+Live protocol: 6 serial `g++ -O2 -flto` iterations (heavy TUs; ~65 s each:
+cc1plus×6 ≈ 1.8 s → collect2 → lto1-ltrans×6 → ld) with 1 Hz `ps` nice
+sampling and `dump bias` every 30 s
+(`~/Workspace/aranicy-build-val/evidence/`). Verdicts:
+
+| requirement | verdict | evidence |
+|---|---|---|
+| pooled family entry | pass | `bias-*.json`: single `build` entry (cc1plus+as+collect2+ld pooled; ambient noise entries beside it) |
+| ramp reaches target DURING the compile | pass | journal: `build` bias 0→1 (12:00:31) → 2 (12:02:06) → 3 (12:03:41, iteration 4 of 6 still running) — vs the pre-fix "+3 only after the compile ended" |
+| bias applied at exec | pass | `ps-nice.log`: collect2/ld nice track the learned bias exactly (81 obs at +1, 63 at +2, 98 at +3); bias 0 → untouched (inherited nice kept) |
+| persistence fix | pass | `/var/lib/aranicy/bias-state` (36 KB) created and updated; unprivileged `aranicy dump bias` reads it (pre-fix wave: no state dir at all) |
+
+Residual findings (measured, not yet fixed):
+
+- **Confidence halves per window under continuous churn**: the pooled entry
+  sees only ~3–7 scored samples per 60 s window (lavd reports short-lived
+  tasks sparsely), so every window takes the "observed but too sparse" arm
+  and confidence decays 0.488 → 0.007 over the 6-minute build even while
+  the classification is correct and applied. Observable damage: one relax
+  dip (bias 3→2 at 12:05:46, re-attack →3 at 12:06:16); on very long builds
+  the decay would zero-flush the bias (~25 min at halving/window) and
+  sawtooth. Follow-up: confidence semantics for active-but-sparse entries.
+- **GCC LTRANS workers are `lto1-ltrans`**, not `lto1` — the shipped
+  `bias_group.build` alternative was widened to `lto1.*` and the keying
+  re-verified (`lto1-ltrans` last_seen freezes while `build`'s advances on a
+  relink; the workers inherit the pooled bias at exec).
+- **`bias_*` knobs and `bias_group` compile at startup**; `--reload` swaps
+  rules/config only — a restart is required for bias keying changes (bias
+  history itself survives restart via `bias-state`).
+- Ambient noise caveat: with the desktop active, most persistent comms
+  classify `bulk` and ramp to +3 too (they genuinely idle at low score) —
+  the population threshold self-calibrates to whatever lavd sees.
+
 ### Shipping gate numbers (quiet config, fresh bias state per cell)
 
 `log_applied_rule = false` (the shipped default), post-fix binary, fresh

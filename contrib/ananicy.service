@@ -10,6 +10,8 @@ StartLimitBurst=5
 Type=notify
 ExecStart=/usr/bin/aranicy start
 ExecReload=/usr/bin/aranicy --reload
+# Persistent bias history lives in /var/lib/aranicy (bias_state_path).
+StateDirectory=aranicy
 Nice=-5
 OOMScoreAdjust=-999
 Restart=always

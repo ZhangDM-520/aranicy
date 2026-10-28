@@ -57,8 +57,12 @@ the mechanism degrades as described below. Disable with `bias_enable = false`.
 Hot-path cost is one extra O(1) map lookup per event — the bias history is a
 separate table from the rule tables.
 
-- Per-name history keyed by the **kernel comm** (the `scx_lavd` sample
-  namespace; rule matching uses the separate argv[0]-derived name): class
+- History keyed by the **kernel comm** (the `scx_lavd` sample namespace; rule
+  matching uses the separate argv[0]-derived name), with fuzzy keying: a
+  `bias_group.<tag> = <regex>` family pools every matching comm into one entry
+  named `<tag>` (a build's cc1plus→as→ld→lto1 handoff learns as one stream),
+  otherwise per-instance suffixes (`kworker/u97:10` → `kworker/u97`) and one
+  trailing version run (`clang-19` → `clang`) collapse. Entries hold class
   (`bulk`/`responsive`/`unknown`), integer `bias`, evidence `confidence` 0..1.
 - Applied nice = `clamp(rule_nice + bias, -20, 19)`; unruled names synthesize a
   policy when bias ≠ 0. Live check: `/proc/<pid>/stat` field 19 (`nice`) must
@@ -68,6 +72,14 @@ separate table from the rule tables.
   daemon actually applied — never against re-derived rules. A mismatch freezes
   the entry (no updates) until a matching sample re-baselines it; entries the
   daemon never adjusted are not verified.
+- Classification: per-sample score from weight-free sched stats against a
+  population threshold (EWMA of the population mean score). BULK below and
+  RESPONSIVE above the `bias_deadband_pct` band for 2 consecutive
+  `bias_window_s` windows of `bias_min_samples` scored samples each; the
+  deadband holds the class. Decisive evidence (beyond 2× the deadband — past
+  the actuator-swing envelope) classifies on ONE window at
+  `bias_min_samples / 4` (≥ 4) samples, so short-lived phases are learned
+  before they end.
 - **lavd absent ≠ bias 0**: history entries keep their bias and continue to
   apply; learning stops updating. Wall-time aging (half-life) decays
   `confidence` and relaxes bias toward 0 stepwise, so old learnings can never
@@ -78,7 +90,9 @@ separate table from the rule tables.
 
 Config keys (all `bias_*`): `bias_enable`, `bias_min`, `bias_max`,
 `bias_window_s`, `bias_deadband_pct`, `bias_min_samples`, `bias_cadence_ms`,
-`bias_max_entries`, `bias_half_life_s`, `bias_state_path`.
+`bias_max_entries`, `bias_half_life_s`, `bias_state_path`, plus repeatable
+`bias_group.<tag> = <regex>` family declarations (first definition wins; bad
+tags/regexes warn and skip).
 
 ## Config keys (superset)
 
@@ -86,8 +100,8 @@ Config keys (all `bias_*`): `bias_enable`, `bias_min`, `bias_max`,
 `apply_sched`, `apply_oom_score_adj`, `apply_cgroup`, `apply_cpuset`,
 `apply_autogroup` (superset), `cgroup_load`, `type_load`, `rule_load`,
 `loglevel`, `log_applied_rule`, `cgroup_realtime_workaround`, `x3d_mode`
-(accepted; cpuset alias input only). Superset-only `bias_*` keys are listed
-under *Dynamic nice bias*.
+(accepted; cpuset alias input only). Superset-only `bias_*` keys and
+`bias_group.<tag>` are listed under *Dynamic nice bias*.
 
 ## CLI and service
 

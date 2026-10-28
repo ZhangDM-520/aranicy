@@ -35,6 +35,10 @@ pub struct Config {
     pub bias_max_entries: usize,
     pub bias_half_life_s: u64,
     pub bias_state_path: String,
+    /// `bias_group.<tag> = <regex>` entries: comms matching the regex learn as
+    /// one pooled entry named `<tag>`. Raw (tag, regex-source) pairs; compiled
+    /// once at startup (invalid regexes are warned and skipped there).
+    pub bias_groups: Vec<(String, String)>,
     pub warnings: Vec<String>,
 }
 
@@ -67,6 +71,7 @@ impl Default for Config {
             bias_max_entries: 4096,
             bias_half_life_s: 1800,
             bias_state_path: "/var/lib/aranicy/bias-state".into(),
+            bias_groups: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -165,6 +170,24 @@ impl Config {
                     Err(_) => bad(&mut cfg, "bias_half_life_s (u64)"),
                 },
                 "bias_state_path" => cfg.bias_state_path = value.to_string(),
+                k if k.starts_with("bias_group.") => {
+                    let tag = k["bias_group.".len()..].trim();
+                    if tag.is_empty() {
+                        cfg.warnings.push(format!("line {}: empty bias_group tag", idx + 1));
+                    } else if value.is_empty() {
+                        cfg.warnings.push(format!(
+                            "line {}: empty regex for bias_group.{tag}",
+                            idx + 1
+                        ));
+                    } else if cfg.bias_groups.iter().any(|(t, _)| t == tag) {
+                        cfg.warnings.push(format!(
+                            "line {}: duplicate bias_group.{tag}; keeping first",
+                            idx + 1
+                        ));
+                    } else {
+                        cfg.bias_groups.push((tag.to_string(), value.to_string()));
+                    }
+                }
                 other => cfg.warnings.push(format!("line {}: unknown key {other:?}", idx + 1)),
             }
         }
@@ -295,5 +318,21 @@ mod tests {
         assert_eq!(cfg.bias_min, d.bias_min);
         assert_eq!(cfg.bias_max, d.bias_max);
         assert!(cfg.warnings.iter().any(|w| w.contains("bias_min")));
+    }
+
+    #[test]
+    fn bias_group_entries_parse_and_bad_ones_warn() {
+        let cfg = Config::parse(
+            "bias_group.build = ^(cc1.*|lto1)$\n\
+             bias_group.build = ^dup$\n\
+             bias_group. = ^x$\n\
+             bias_group.empty =\n",
+        );
+        // first definition wins; the three bad lines each warn and skip
+        assert_eq!(
+            cfg.bias_groups,
+            vec![("build".to_string(), "^(cc1.*|lto1)$".to_string())]
+        );
+        assert_eq!(cfg.warnings.len(), 3);
     }
 }

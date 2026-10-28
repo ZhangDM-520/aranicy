@@ -202,7 +202,20 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     let bias_enable = cfg.bias_enable;
     let bias_state_path = cfg.bias_state_path.clone();
     let bias_cadence = std::time::Duration::from_millis(cfg.bias_cadence_ms.clamp(50, 60_000));
-    let mut bias_engine = BiasEngine::new(cfg.bias_config());
+    // Compile `bias_group.*` regexes once; invalid patterns are warned and
+    // skipped so a typo cannot take the daemon down (warn-and-fallback).
+    let bias_groups: Vec<crate::bias::BiasGroup> = cfg
+        .bias_groups
+        .iter()
+        .filter_map(|(tag, src)| match regex::Regex::new(src) {
+            Ok(re) => Some((tag.clone(), re)),
+            Err(e) => {
+                tracing::warn!("bias: skipping bias_group.{tag}: invalid regex {src:?}: {e}");
+                None
+            }
+        })
+        .collect();
+    let mut bias_engine = BiasEngine::new_with_groups(cfg.bias_config(), bias_groups);
     match bias_state::load(std::path::Path::new(&bias_state_path)) {
         Ok(Some(snap)) => {
             tracing::info!(entries = snap.entries.len(), "bias: restored history");
