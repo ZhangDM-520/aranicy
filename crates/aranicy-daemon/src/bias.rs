@@ -14,7 +14,9 @@
 //! * **Classification:** hysteresis per `comm`: BULK below `deadband_pct`
 //!   under T for 2 consecutive classifying windows, RESPONSIVE above for 2,
 //!   deadband holds the class. Windows are `window_s` and need `min_samples`
-//!   scored samples; absence is never evidence (streaks/untouched confidence).
+//!   scored samples; absence is never evidence (streaks/untouched confidence)
+//!   and presence is never counter-evidence (sparse-but-active windows hold
+//!   the confidence; only absence decays it — see the history bullet).
 //!   Decisive evidence (beyond 2× the deadband — past the actuator-swing
 //!   envelope the deadband was sized for) classifies on ONE window at
 //!   `min_samples / 4` (≥ 4) samples, so short-lived phases (builds) are not
@@ -409,16 +411,20 @@ impl Entry {
                     0
                 };
             } else {
-                // Observed but too sparse to classify: hold the class, shed
-                // confidence (magnitude unspecified in the brief: halve).
-                self.confidence *= 0.5;
+                // Observed but too sparse to classify (samples present, too
+                // few scored): presence is never counter-evidence — hold the
+                // class AND the confidence. Only absence decays confidence
+                // (wall-time aging below). Churny comms (a build's
+                // cc1plus→lto1 handoff) never accumulate a full window and
+                // used to spiral confidence to zero mid-activity, flushing a
+                // correct bias (measured: 0.488 → 0.007 over 6 min of
+                // active building).
                 self.pending = None;
                 self.streak = 0;
             }
         } else if self.win_score_n < cfg.min_samples {
-            // Observed but unscored (or no population threshold yet): same
-            // sparse treatment as above.
-            self.confidence *= 0.5;
+            // Observed but unscored (or no population threshold yet):
+            // presence, not evidence against — hold as above.
             self.pending = None;
             self.streak = 0;
         }
@@ -1408,6 +1414,56 @@ mod tests {
         // Locked default: a build-phase ramp must reach target in 3×30 s —
         // the old 60 s step outlived short compile phases entirely.
         assert_eq!(BiasConfig::default().attack_step_s, 30);
+    }
+
+    /// Sparse-but-active windows must hold the confidence: churn comms never
+    /// accumulate a full window and used to halve it into the ground
+    /// mid-activity (0.488 → 0.007 over 6 min of live building), letting the
+    /// relax rule dip and eventually flush a correct bias.
+    #[test]
+    fn sparse_active_windows_hold_confidence() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]); // class Bulk, confidence 0.75
+        assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
+        let conf = snap_entry(&eng, "app").confidence;
+        assert!((conf - 0.75).abs() < 1e-12);
+
+        // two windows of 5 scored samples each (below min_samples = 30)
+        for (open, close) in [(181, 241), (241, 301)] {
+            eng.record_batch(&bulk_batch("app", 5), ts(open));
+            eng.record_batch(&[], ts(close));
+            let e = snap_entry(&eng, "app");
+            assert!(
+                (e.confidence - conf).abs() < 1e-12,
+                "sparse window moved confidence: {} -> {}",
+                conf,
+                e.confidence
+            );
+            assert_eq!(e.class, BiasClass::Bulk);
+        }
+    }
+
+    /// Present but entirely unscored samples (zero freq/runtime fields) are
+    /// still presence: the class and confidence hold.
+    #[test]
+    fn unscored_active_windows_hold_confidence() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]); // class Bulk, confidence 0.75
+        let conf = snap_entry(&eng, "app").confidence;
+
+        let unscored: Batch = (0..10)
+            .map(|_| sample("app", 0, 31, 1_000_000_000, 500, 500))
+            .collect();
+        eng.record_batch(&unscored, ts(181));
+        eng.record_batch(&[], ts(241));
+        let e = snap_entry(&eng, "app");
+        assert_eq!(e.class, BiasClass::Bulk);
+        assert!(
+            (e.confidence - conf).abs() < 1e-12,
+            "unscored window moved confidence: {} -> {}",
+            conf,
+            e.confidence
+        );
     }
 
     #[test]

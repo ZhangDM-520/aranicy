@@ -251,16 +251,19 @@ sampling and `dump bias` every 30 s
 | bias applied at exec | pass | `ps-nice.log`: collect2/ld nice track the learned bias exactly (81 obs at +1, 63 at +2, 98 at +3); bias 0 → untouched (inherited nice kept) |
 | persistence fix | pass | `/var/lib/aranicy/bias-state` (36 KB) created and updated; unprivileged `aranicy dump bias` reads it (pre-fix wave: no state dir at all) |
 
-Residual findings (measured, not yet fixed):
+Residual findings (measured):
 
-- **Confidence halves per window under continuous churn**: the pooled entry
-  sees only ~3–7 scored samples per 60 s window (lavd reports short-lived
-  tasks sparsely), so every window takes the "observed but too sparse" arm
-  and confidence decays 0.488 → 0.007 over the 6-minute build even while
-  the classification is correct and applied. Observable damage: one relax
-  dip (bias 3→2 at 12:05:46, re-attack →3 at 12:06:16); on very long builds
-  the decay would zero-flush the bias (~25 min at halving/window) and
-  sawtooth. Follow-up: confidence semantics for active-but-sparse entries.
+- **Confidence halved per window under continuous churn** (fixed in
+  v0.2.2): the pooled entry sees only ~3–7 scored samples per 60 s window
+  (lavd reports short-lived tasks sparsely), so every window took the
+  "observed but too sparse" arm and confidence decayed 0.488 → 0.007 over
+  the 6-minute build even while the classification was correct and applied
+  — one relax dip observed (bias 3→2 at 12:05:46, re-attack →3 at
+  12:06:16) and a ~25 min zero-flush sawtooth predicted for long builds.
+  Fix semantics: **presence is never counter-evidence** — a window with
+  samples holds class and confidence (sparse-but-active and fully-unscored
+  alike); only absence decays confidence (half-life aging, zero-confidence
+  flush unchanged). Mutation-probed (sparse/unscored/aging branches).
 - **GCC LTRANS workers are `lto1-ltrans`**, not `lto1` — the shipped
   `bias_group.build` alternative was widened to `lto1.*` and the keying
   re-verified (`lto1-ltrans` last_seen freezes while `build`'s advances on a

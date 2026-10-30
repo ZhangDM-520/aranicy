@@ -100,7 +100,9 @@ daemon restart.
 - **lavd absent ≠ bias 0**: history entries keep their bias and continue to
   apply; learning stops updating. Wall-time aging (half-life) decays
   `confidence` and relaxes bias toward 0 stepwise, so old learnings can never
-  pin a bias permanently.
+  pin a bias permanently. Presence is never counter-evidence: windows too
+  sparse to classify (or fully unscored) hold the class and confidence —
+  only absence decays them.
 - Persistence: `bias_state_path` (default `/var/lib/aranicy/bias-state`),
   versioned JSON, atomic write, debounced ≥ 60 s. `dump bias` reads it
   unprivileged (on-disk state may lag live bias by up to ~60 s).
