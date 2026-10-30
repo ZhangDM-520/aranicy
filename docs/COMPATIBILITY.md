@@ -51,11 +51,28 @@ ananicy-cpp's OS order).
 
 ## Dynamic nice bias (superset)
 
-Optional dynamic nice adjustment driven **solely** by `scx_lavd` scheduler
-samples over its stats socket — no fallback sampler is shipped; without lavd
-the mechanism degrades as described below. Disable with `bias_enable = false`.
-Hot-path cost is one extra O(1) map lookup per event — the bias history is a
-separate table from the rule tables.
+Optional dynamic nice adjustment driven by per-task samples from the running
+`sched_ext` scheduler's `scx_stats` socket — no fallback sampler is shipped;
+when the scheduler exposes no per-task stats the mechanism degrades as
+described below. Disable with `bias_enable = false`. Hot-path cost is one
+extra O(1) map lookup per event — the bias history is a separate table from
+the rule tables.
+
+**Scheduler support** (surveyed across scx-scheds 1.1.4; schemas re-detected
+from `stats_meta` on every connect, so schema drift is tolerated):
+
+| scheduler | per-task bias learning | surface |
+|---|---|---|
+| `scx_lavd` | **yes** | `scx_stats` target `sched_samples` (`SchedSample`, 38 fields) |
+| `scx_mavd` | **yes** | same target/schema as lavd (byte-identical `SchedSample`) |
+| `scx_beerland`, `scx_bpfland`, `scx_cake`, `scx_cosmos`, `scx_eevdf`, `scx_flash`, `scx_flow`, `scx_forge`, `scx_mlfq`, `scx_pandemonium`, `scx_rburst`, `scx_reevdf`, `scx_rlocal`, `scx_rvtime`, `scx_tickless` | no | aggregate-only or no `scx_stats`; sampler degrades with reason `no per-task stats` |
+| `scx_p2dq` | no | aggregate-only over `scx_stats`; a pid-keyed `task_llc_pelt` BPF map exposes util alone (insufficient for the weight-free score — needs wait/wake freq + runtime) |
+
+The sampler binds whatever per-task struct/target the server exposes
+(struct: `pid`+`comm`+≥1 signal field; target: probed — names are arbitrary
+server-side strings) and re-globs `/run/scx/*/stats` on every reconnect, so
+switching schedulers (or a mavd `--cgroup` sub-scheduler appearing) needs no
+daemon restart.
 
 - History keyed by the **kernel comm** (the `scx_lavd` sample namespace; rule
   matching uses the separate argv[0]-derived name), with fuzzy keying: a

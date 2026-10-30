@@ -257,7 +257,7 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     };
     let bias_threads = if bias_enable {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = sampler::spawn(&sampler::default_socket_paths(), bias_cadence, tx);
+        let handle = sampler::spawn_auto(bias_cadence, tx);
         let bias_thread = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || bias_loop(&shared, rx))

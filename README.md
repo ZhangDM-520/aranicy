@@ -28,10 +28,12 @@ once per process and issues syscalls only; failures are counted, not logged
 per event.
 
 Optional superset: **dynamic nice bias** — per-name nice deltas learned from
-`sched_ext` `scx_lavd` samples (bulk work nudged nicer, latency-sensitive work
-less nice), applied as `clamp(rule_nice + bias, -20, 19)` with closed-loop
+`sched_ext` per-task scheduler samples (`scx_lavd`/`scx_mavd` today; the
+sampler schema-binds whatever per-task `scx_stats` surface the running
+scheduler exposes) — bulk work nudged nicer, latency-sensitive work less
+nice, applied as `clamp(rule_nice + bias, -20, 19)` with closed-loop
 verification against the observed nice and half-life-capped history.
-No lavd → no learning,
+No per-task stats → no learning,
 but learned biases keep applying and age out gracefully
 ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 
