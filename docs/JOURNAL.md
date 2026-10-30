@@ -1,4 +1,15 @@
 
+# JOURNAL — aranicy historical log
+
+Chronological action journal. New entries are one-line summary pointers to
+`.logs/action-<date>-<name>.md` summaries. Entries below the divider predate the
+2026-10-31 memory-architecture migration (`AGENTS.md` + `docs/JOURNAL.md` +
+`.logs/scratchpad.md`, replacing `docs/MEMORY.md`/`docs/NOTE.md`/`docs/CURRENT.md`)
+and are the verbatim pre-migration record from `docs/NOTE.md` — multi-line detail,
+no action files exist for them. Memory architecture: see `AGENTS.md`.
+
+---
+
 ## 2026-10-22 — eBPF event source (task: ebpf-events)
 
 - Implemented `crates/aranicy-events` + `bpf/` (exec.bpf.c, exec_event.h):
@@ -253,3 +264,7 @@
   the sweep stands (content preserved, nothing lost). Rule: in a shared
   worktree show FULL untruncated git status first, and commit with pathspec
   while never committing shared journal files you did not author end-to-end.
+
+## 2026-10-29–30 (gap note) — v0.2.1 + v0.2.2 waves landed without journal entries; see git tags `v0.2.1`/`v0.2.2`, docs/BENCHMARKS.md ("Fuzzy keying + sensitivity wave"), and the v0.2.3 handoff state in `.logs/scratchpad.md`.
+
+## 2026-10-31 — memory architecture migration: old `docs/NOTE.md`/`MEMORY.md`/`CURRENT.md` layout consolidated into `AGENTS.md` (global memory) + `docs/JOURNAL.md` (this log) + `.logs/scratchpad.md` (active buffer, seeded with the in-flight v0.2.3 ramp-fix state). → `.logs/action-2026-10-31-memory-architecture.md`
