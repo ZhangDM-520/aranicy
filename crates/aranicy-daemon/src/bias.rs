@@ -55,6 +55,11 @@ const CONFIDENCE_EPS: f64 = 1e-9;
 /// Each `RELAX_STEP` of confidence decay earns one release step toward 0.
 const RELAX_STEP: f64 = 0.25;
 
+/// Windows of agreeing evidence needed to move the class (hysteresis
+/// confirmation depth). Shared by the classifier's streak rule and the
+/// attack-want grace period, which mirrors it.
+const HYSTERESIS_STREAK: u32 = 2;
+
 /// EWMA time constant (seconds) of the population threshold T_us.
 const THRESHOLD_TC_S: f64 = 60.0;
 
@@ -191,6 +196,11 @@ struct Entry {
     /// Last nice value this daemon actually applied for the name (the
     /// closed-loop expectation; `None` = never actuated by us).
     applied_nice: Option<i8>,
+    /// `note_applied` has been called since creation/restore, so
+    /// `applied_nice` is an authoritative record (even an explicit `None`
+    /// = the apply did not take). Distinguishes a released claim from the
+    /// total absence of a record (a restart) — see `verify_applied`.
+    claim_recorded: bool,
     target: i8,
     /// Timestamp the stored confidence is valid at (aging anchor).
     aged_at: u64,
@@ -209,6 +219,9 @@ struct Entry {
     pending: Option<BiasClass>,
     streak: u32,
     want_since_attack: Option<u64>,
+    /// When the attack want went false (grace timer: a short deadband
+    /// excursion must not clear the attack desire — see `slew_pass`).
+    attack_want_idle_since: Option<u64>,
     want_since_release: Option<u64>,
     last_step_attack: Option<u64>,
     last_step_release: Option<u64>,
@@ -280,11 +293,13 @@ impl Entry {
             pending: None,
             streak: 0,
             want_since_attack: None,
+            attack_want_idle_since: None,
             want_since_release: None,
             last_step_attack: None,
             last_step_release: None,
             bias_changed_at: None,
             applied_nice: None,
+            claim_recorded: false,
         }
     }
 
@@ -299,15 +314,17 @@ impl Entry {
 
     /// Closed-loop re-baseline after a frozen mismatch: unfreeze and drop
     /// confidence to low; the recorded bias and class stay until evidence or
-    /// aging moves them.
+    /// aging moves them. The WANT stamps survive: the controller's desire
+    /// (target vs bias) did not change, and resetting the want onset would
+    /// re-arm the 30 s attack timer and push the entry to the back of the
+    /// global-step FIFO on every re-baseline — under churn comms (a build's
+    /// short-lived cc1plus/ld) that starved the ramp at its first step.
     fn rebaseline(&mut self, now: u64) {
         self.frozen = false;
         self.confidence = LOW_CONFIDENCE;
         self.relax_watermark = LOW_CONFIDENCE;
         self.pending = None;
         self.streak = 0;
-        self.want_since_attack = None;
-        self.want_since_release = None;
         self.reset_window();
         self.aged_at = now;
     }
@@ -380,7 +397,7 @@ impl Entry {
             } else {
                 cfg.min_samples
             };
-            let need_streak = if decisive { 1 } else { 2 };
+            let need_streak = if decisive { 1 } else { HYSTERESIS_STREAK };
             if self.win_score_n >= need {
                 match cand {
                     Some(c) => {
@@ -465,6 +482,9 @@ pub struct BiasEngine {
     /// Names with samples in the current window (fast empty-window close).
     win_names: u64,
     last_global_step: Option<u64>,
+    /// Whether the last global step went to a release (fairness cap: never
+    /// two release wins in a row while an attack waits — see `slew_pass`).
+    last_step_was_release: bool,
     last_now: u64,
 }
 
@@ -492,6 +512,7 @@ impl BiasEngine {
             pop_score_n: 0,
             win_names: 0,
             last_global_step: None,
+            last_step_was_release: false,
             last_now: 0,
         }
     }
@@ -563,6 +584,7 @@ impl BiasEngine {
                 e.bias = 0;
                 e.relax_watermark = 0.0;
                 e.want_since_attack = None;
+                e.attack_want_idle_since = None;
                 e.want_since_release = None;
                 e.bias_changed_at = Some(t);
             }
@@ -604,6 +626,15 @@ impl BiasEngine {
             return;
         };
         let Some(expected_nice) = e.applied_nice else {
+            // No actuation on record at all (a restart: the expectation is
+            // not persisted). No observation can ever "match", so the
+            // freeze has nothing left to protect — a fresh sample
+            // re-baselines the entry instead of bricking it forever. A
+            // RELEASED claim (explicit `None`: the apply did not take) is
+            // an authoritative record and must not unwind the freeze.
+            if e.frozen && !e.claim_recorded {
+                e.rebaseline(*last_now);
+            }
             return;
         };
         let observed_nice = observed_static_prio as i64 - 20;
@@ -625,6 +656,7 @@ impl BiasEngine {
         let key = entry_key(name, groups);
         if let Some(e) = entries.get_mut(key.as_ref()) {
             e.applied_nice = nice;
+            e.claim_recorded = true;
         }
     }
 
@@ -721,10 +753,15 @@ impl BiasEngine {
     }
 
     /// Apply slew limits. `allow_attack = false` (aging) only releases.
-    /// The shared global budget buys at most one step per pass; the winner is
-    /// chosen FIFO by want-onset (release outranks attack, name breaks ties)
-    /// and re-arms its want after stepping, so a tight lexicographic order can
-    /// never starve later names. Deterministic given (samples, timestamps).
+    /// The shared global budget buys at most one step per pass; the winner
+    /// is chosen FIFO by want-onset within each direction (release outranks
+    /// attack, name breaks ties) and re-arms its want after stepping, so a
+    /// tight lexicographic order can never starve later names. Fairness
+    /// cap: never two release wins in a row while an attack waits — the
+    /// restored release cohort (every want stamps at restart and matures
+    /// together at +release_step_s) would otherwise monopolize the single
+    /// global step and starve every ramp. Deterministic given (samples,
+    /// timestamps).
     fn slew_pass(&mut self, now: u64, allow_attack: bool) {
         for e in self.entries.values_mut() {
             if e.bias == 0 && e.relax_watermark - e.confidence >= RELAX_STEP {
@@ -732,7 +769,27 @@ impl BiasEngine {
             }
             let (attack_want, release_want, _) = direction_wants(e);
             e.want_since_release = want_stamp(e.want_since_release, release_want, now);
-            e.want_since_attack = want_stamp(e.want_since_attack, attack_want, now);
+            // The attack desire survives short deadband excursions: a
+            // deadband window flips target to 0 but is not counter-evidence
+            // (hysteresis holds the class), so clearing the want onset on
+            // every flip would re-arm the 30 s attack timer and reset FIFO
+            // priority each window — the measured ramp starvation (bias
+            // frozen at +1 through a whole build). A want that stays false
+            // for a full hysteresis confirmation (2 windows) is abandoned.
+            if attack_want {
+                e.want_since_attack = want_stamp(e.want_since_attack, true, now);
+                e.attack_want_idle_since = None;
+            } else if e.want_since_attack.is_some() {
+                let idle_since = *e.attack_want_idle_since.get_or_insert(now);
+                if now.saturating_sub(idle_since)
+                    >= u64::from(HYSTERESIS_STREAK) * self.cfg.window_s.max(1)
+                {
+                    e.want_since_attack = None;
+                    e.attack_want_idle_since = None;
+                }
+            } else {
+                e.attack_want_idle_since = None;
+            }
         }
 
         let budget_used = self
@@ -742,25 +799,36 @@ impl BiasEngine {
             return;
         }
 
-        // (rank, want-onset, name, is_release): 0 = release, 1 = attack.
-        let mut best: Option<(u8, u64, String, bool)> = None;
+        // (want-onset, name): FIFO within each direction.
+        let mut best_release: Option<(u64, String)> = None;
+        let mut best_attack: Option<(u64, String)> = None;
         for (name, e) in &self.entries {
             let (attack_want, release_want, _) = direction_wants(e);
             if release_want && e.release_ready(&self.cfg, now) {
-                let key = (0, e.want_since_release.unwrap_or(now), name.clone(), true);
-                if best.as_ref().is_none_or(|b| key < *b) {
-                    best = Some(key);
+                let key = (e.want_since_release.unwrap_or(now), name.clone());
+                if best_release.as_ref().is_none_or(|b| key < *b) {
+                    best_release = Some(key);
                 }
             }
             if allow_attack && attack_want && e.attack_ready(&self.cfg, now) {
-                let key = (1, e.want_since_attack.unwrap_or(now), name.clone(), false);
-                if best.as_ref().is_none_or(|b| key < *b) {
-                    best = Some(key);
+                let key = (e.want_since_attack.unwrap_or(now), name.clone());
+                if best_attack.as_ref().is_none_or(|b| key < *b) {
+                    best_attack = Some(key);
                 }
             }
         }
 
-        if let Some((_, _, name, is_release)) = best {
+        let attack_wins =
+            best_attack.is_some() && (best_release.is_none() || self.last_step_was_release);
+        let winner = if attack_wins {
+            best_attack.map(|(_, n)| (n, false))
+        } else {
+            best_release
+                .map(|(_, n)| (n, true))
+                .or_else(|| best_attack.map(|(_, n)| (n, false)))
+        };
+
+        if let Some((name, is_release)) = winner {
             let e = self.entries.get_mut(&name).expect("selected entry exists");
             if is_release {
                 e.bias -= e.bias.signum();
@@ -775,6 +843,7 @@ impl BiasEngine {
             }
             e.bias_changed_at = Some(now);
             self.last_global_step = Some(now);
+            self.last_step_was_release = is_release;
         }
     }
 
@@ -836,6 +905,8 @@ mod tests {
     // exercise) while the `decisive_*` fixtures sit far outside it:
     //   400 = 20²  : ilog2(1024·1024) = 20, runtime_ft = 1   (the population)
     //   289 = 17²  : 10 + ilog2(200) = 17                    (bulk, ~0.80 × T)
+    //   324 = 18²  : 10 + ilog2(500) = 18                    (deadband low
+    //                edge — borderline just INSIDE 0.85 × T, flips cand)
     //   576 = 24²  : 20 + ilog2(25) = 24                     (resp, ~1.25 × T)
     //   100 = 10²  : ilog2(32·32) = 10, runtime_ft = 1       (decisive bulk)
     //   784 = 28²  : 20 + ilog2(256) = 28                    (decisive resp)
@@ -872,6 +943,11 @@ mod tests {
     fn dead_batch(name: &str, n: usize) -> Batch {
         (0..n)
             .map(|_| sample(name, 1023, 1023, 1_000_000_000, 500, 500))
+            .collect()
+    }
+    fn borderline_batch(name: &str, n: usize) -> Batch {
+        (0..n)
+            .map(|_| sample(name, 31, 31, 2_000_000, 500, 500))
             .collect()
     }
 
@@ -1075,6 +1151,56 @@ mod tests {
         assert_eq!(snap_entry(&eng, "aaa").bias, 1);
     }
 
+    /// The restored release cohort must not monopolize the shared global
+    /// step. At restart every persisted entry's want stamps at the first
+    /// slew pass and the whole cohort matures together at
+    /// want+release_step_s; since releases outrank attacks, that flood
+    /// used to budget-starve every attack forever (live: an endless 5 s
+    /// `bias changed … bias=0` rotation while the build ramp never ran).
+    /// Fairness cap: never two release wins in a row while an attack waits.
+    #[test]
+    fn release_flood_cannot_starve_attacks() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let mut entries = vec![EntrySnapshot {
+            name: "app".into(),
+            class: BiasClass::Bulk,
+            confidence: 0.9,
+            ..EntrySnapshot::default()
+        }];
+        for i in 0..100 {
+            entries.push(EntrySnapshot {
+                name: format!("z-flood-{i:03}"),
+                bias: 2,
+                confidence: 0.5,
+                ..EntrySnapshot::default()
+            });
+        }
+        eng.restore(BiasSnapshot {
+            version: BIAS_STATE_VERSION,
+            threshold_ema: None,
+            entries,
+        });
+        tick(&mut eng, 1); // wants stamp here: flood releases mature at 301
+
+        for t in (301..=371).step_by(5) {
+            tick(&mut eng, t);
+        }
+        // the flood drains a little...
+        let drained = eng
+            .snapshot()
+            .entries
+            .iter()
+            .filter(|e| e.name.starts_with("z-flood") && e.bias < 2)
+            .count();
+        assert!(drained >= 3, "flood should drain, got {drained}");
+        // ...and the attack still ramped 0 -> 3 at its own 30 s cadence
+        assert_eq!(
+            snap_entry(&eng, "app").bias,
+            3,
+            "the release flood starved the attack"
+        );
+    }
+
     #[test]
     fn starved_gate_only_low_minus_one() {
         // RESPONSIVE + starved (delivered 100 « 50% of demand 1000) → −1
@@ -1251,6 +1377,56 @@ mod tests {
         assert_eq!(snap_entry(&eng, "app").bias, 0);
     }
 
+    /// The freeze must never outlive its own evidence. After a restart the
+    /// closed-loop expectation (`applied_nice`) is gone — it is not
+    /// persisted — so no observation can ever "match" again and a frozen
+    /// entry used to brick forever (live: `build` stuck frozen after the
+    /// restart, class stale, learning dead — the mid-compile ramp could
+    /// never start). With nothing applied on record the loop can verify
+    /// nothing, so a fresh sample re-baselines the entry.
+    #[test]
+    fn frozen_with_no_actuation_on_record_rebaselines_on_a_fresh_sample() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]);
+        ramp_attack(&mut eng); // bias 3
+        eng.note_applied("app", Some(3));
+        eng.verify_applied("app", 20); // mismatch -> frozen
+
+        // restart: the state round-trips, the actuation on record does not
+        let snap = eng.snapshot();
+        let mut eng2 = BiasEngine::new(BiasConfig::default());
+        eng2.restore(snap);
+        assert!(snap_entry(&eng2, "app").frozen);
+
+        // a fresh sample must re-baseline: bias kept, confidence low
+        eng2.verify_applied("app", 20);
+        let e = snap_entry(&eng2, "app");
+        assert!(!e.frozen);
+        assert_eq!(e.confidence, LOW_CONFIDENCE);
+        assert_eq!(e.bias, 3); // evidence/aging move it from here
+    }
+
+    /// Only the absence of ANY actuation on record (a restart) may unwind
+    /// the freeze. Releasing the claim — `note_applied(name, None)` when an
+    /// apply did not take (Denied/Failed/Gone) — must not: the pinned law
+    /// stands, a mismatch freezes the entry and only a matching sample
+    /// re-baselines it (aging flushing the bias is the documented escape).
+    #[test]
+    fn frozen_entry_with_released_claim_stays_frozen() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]);
+        ramp_attack(&mut eng); // bias 3
+        eng.note_applied("app", Some(3));
+        eng.verify_applied("app", 20); // mismatch -> frozen
+
+        eng.note_applied("app", None); // apply did not take: claim released
+        eng.verify_applied("app", 23); // would "match" — but nothing is claimed
+        assert!(
+            snap_entry(&eng, "app").frozen,
+            "a released claim must not unwind the freeze"
+        );
+    }
+
     #[test]
     fn inverted_clamps_are_normalized_not_panicking() {
         // i8::clamp panics on min > max; BiasEngine::new must not.
@@ -1414,6 +1590,60 @@ mod tests {
         // Locked default: a build-phase ramp must reach target in 3×30 s —
         // the old 60 s step outlived short compile phases entirely.
         assert_eq!(BiasConfig::default().attack_step_s, 30);
+    }
+
+    /// A closed-loop mismatch re-baseline must not stall the ramp: the want
+    /// onset survives the reset, so the attack step still fires at
+    /// want+attack_step_s (and keeps its FIFO priority) even when freeze /
+    /// re-baseline churns around it — the measured build-ramp starvation.
+    #[test]
+    fn rebaseline_preserves_want_onset_for_the_ramp() {
+        let mut eng = BiasEngine::new(BiasConfig::default()); // attack_step 30
+        drive_bulk(&mut eng, &["app"]); // class Bulk at t=121, want armed at 121
+        eng.note_applied("app", Some(3));
+        eng.verify_applied("app", 20); // mismatch -> frozen
+        eng.verify_applied("app", 23); // match -> re-baseline (conf -> LOW)
+        assert_eq!(snap_entry(&eng, "app").confidence, LOW_CONFIDENCE);
+
+        tick(&mut eng, 151); // want(121) + 30 -> the step must still happen
+        assert_eq!(snap_entry(&eng, "app").bias, 1);
+    }
+
+    /// Borderline windows that flip `cand` Bulk↔None every window churn the
+    /// target 3↔0 and must not starve the ramp. The live build hit exactly
+    /// this (window mean 1066 vs deadband low edge 1119): every flip
+    /// re-stamped the want onsets, so neither the 30 s attack nor the 300 s
+    /// release timer ever matured and the bias froze at +1 for the whole
+    /// compile (zero `bias changed name="build"` lines). Sustained
+    /// alternating evidence classifies BULK throughout and must still ramp
+    /// to the target at the attack cadence.
+    #[test]
+    fn borderline_flips_do_not_starve_the_ramp() {
+        let mut eng = BiasEngine::new(BiasConfig::default()); // attack_step 30
+        drive_bulk(&mut eng, &["app"]); // class Bulk at t=121, want armed at 121
+
+        // Take exactly one step — the live run's frozen starting point.
+        eng.record_batch(&borderline_batch("app", 32), ts(151));
+        assert_eq!(snap_entry(&eng, "app").bias, 1);
+
+        // Alternate decisive BULK windows (score 100) with borderline
+        // deadband windows (score 324): `cand` flips Bulk↔None and the
+        // target 3↔0 every window while the class holds BULK — the flip
+        // pattern of the live build. Windows close at 181, 241, …;
+        // each record_batch closes the previous window first, then slew-passes.
+        for i in 0..6u64 {
+            let mut bulk = noise_batch(60);
+            bulk.extend(decisive_bulk_batch("app", 32));
+            let mut dead = noise_batch(60);
+            dead.extend(borderline_batch("app", 32));
+            eng.record_batch(&bulk, ts(181 + 120 * i)); // closes a dead window
+            eng.record_batch(&dead, ts(241 + 120 * i)); // closes a bulk window
+        }
+        tick(&mut eng, 901); // close the trailing dead window
+
+        let e = snap_entry(&eng, "app");
+        assert_eq!(e.class, BiasClass::Bulk, "alternation must hold the class");
+        assert_eq!(e.bias, 3, "borderline cand flips froze the ramp");
     }
 
     /// Sparse-but-active windows must hold the confidence: churn comms never

@@ -88,7 +88,10 @@ daemon restart.
   lavd sample stream (`static_prio` there = nice + 20), against the value this
   daemon actually applied — never against re-derived rules. A mismatch freezes
   the entry (no updates) until a matching sample re-baselines it; entries the
-  daemon never adjusted are not verified.
+  daemon never adjusted are not verified. A frozen entry with no actuation on
+  record at all (after a restart — the expectation is not persisted) re-baselines
+  on a fresh sample; an explicitly released claim (`note_applied(name, None)`:
+  the apply did not take) keeps the freeze.
 - Classification: per-sample score from weight-free sched stats against a
   population threshold (EWMA of the population mean score). BULK below and
   RESPONSIVE above the `bias_deadband_pct` band for 2 consecutive
