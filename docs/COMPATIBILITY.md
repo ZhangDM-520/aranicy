@@ -100,6 +100,15 @@ daemon restart.
   the actuator-swing envelope) classifies on ONE window at
   `bias_min_samples / 4` (≥ 4) samples, so short-lived phases are learned
   before they end.
+- Slew & fairness: attack (away from 0 toward the class target) ≤ 1 step per
+  `attack_step_s` (30 s default) from want-onset; release (toward 0) ≤ 1 step
+  per `release_step_s` (300 s); one bias step globally per 5 s. The attack
+  want survives deadband excursions shorter than a full hysteresis
+  confirmation (2 windows) — borderline windows flipping `cand` must not
+  starve the ramp — while a sustained deadband abandons it and runs the
+  release law. Releases outrank attacks but never win two global steps in a
+  row while an attack waits, so a restarted cohort's releases cannot
+  monopolize the budget.
 - **lavd absent ≠ bias 0**: history entries keep their bias and continue to
   apply; learning stops updating. Wall-time aging (half-life) decays
   `confidence` and relaxes bias toward 0 stepwise, so old learnings can never

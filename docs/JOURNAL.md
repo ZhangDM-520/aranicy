@@ -268,3 +268,5 @@ no action files exist for them. Memory architecture: see `AGENTS.md`.
 ## 2026-10-29–30 (gap note) — v0.2.1 + v0.2.2 waves landed without journal entries; see git tags `v0.2.1`/`v0.2.2`, docs/BENCHMARKS.md ("Fuzzy keying + sensitivity wave"), and the v0.2.3 handoff state in `.logs/scratchpad.md`.
 
 ## 2026-10-31 — memory architecture migration: old `docs/NOTE.md`/`MEMORY.md`/`CURRENT.md` layout consolidated into `AGENTS.md` (global memory) + `docs/JOURNAL.md` (this log) + `.logs/scratchpad.md` (active buffer, seeded with the in-flight v0.2.3 ramp-fix state). → `.logs/action-2026-10-31-memory-architecture.md`
+
+## 2026-10-31 — v0.2.3 wave: bias-ramp starvation fixed (target-flip grace + freeze-brick escape + release-flood fairness cap; code-review gate findings fixed) — clean-gate PASS (0→3 during the run), released v0.2.3 (fffbb54/841942a/aa31b51, tag pushed), gsa recipe bumped (70e6e7e) + landed in the live recipe store. → `.logs/action-2026-10-31-v023-ramp-fix.md`

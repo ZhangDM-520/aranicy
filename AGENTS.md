@@ -131,6 +131,16 @@ protocol notes below are historical; the general test/fixture pitfalls remain li
 - Restart-safe confidence aging anchors decay to max(last state change,
   last_seen) and applies per-call deltas; recomputing "since last_seen" per
   call compounds and over-decays.
+- The restored cohort stamps all wants at restart: the release side is capped
+  (no two release wins in a row while an attack waits) but the cold-start
+  attack queue still delays fresh ramps (measured 2026-10-31: 32–45 wanters →
+  3.5–8 min/turn vs the 30 s law — the global budget 0.2 steps/s under-serves
+  ~1/s aggregate demand; rate laws are hardcoded, no config keys). A
+  fresh-state run shows the intended law (0→3 in ~2.5 min).
+- A frozen entry whose closed-loop expectation is gone (applied_nice not
+  persisted — restart) used to brick forever; it re-baselines on a fresh
+  sample. A RELEASED claim (note_applied(None)) must keep the freeze — only
+  total absence of a record unwinds it (`claim_recorded` flag).
 - "cargo test green" is not a crate-done gate: the rewrite crates shipped
   clippy-clean-looking tests that `clippy --all-targets` rejects (deny-by-default
   lints only surface there), and manifest-level unused-dependency warnings
