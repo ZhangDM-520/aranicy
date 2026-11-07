@@ -4,6 +4,7 @@
 //! `start`, `dump {rules,types,cgroups,proc,autogroup,bias}`, `--reload`, plus
 //! `lint` and `match-test` (dry-run) which ananicy-cpp lacks.
 
+use aranicy_procname as procname;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -12,10 +13,10 @@ mod bias_state;
 mod config;
 mod daemon;
 mod dump;
+mod event_client;
 mod load;
 mod paths;
 mod pidfile;
-mod procname;
 mod sampler;
 mod sdnotify;
 

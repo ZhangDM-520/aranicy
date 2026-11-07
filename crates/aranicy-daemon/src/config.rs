@@ -24,8 +24,18 @@ pub struct Config {
     pub loglevel: String,
     pub log_applied_rule: bool,
     pub x3d_mode: String,
-    // Dynamic nice bias (plan.md §4.3) — driven by scx_lavd samples only.
+    // Dynamic nice bias (plan.md §4.3) — driven by aranicy-collectord.
     pub bias_enable: bool,
+    /// Collector stats socket (`aranicy-collectord`, single fixed source).
+    pub bias_collector_socket: String,
+    /// Collector exec-event socket.
+    pub collector_events_socket: String,
+    /// Startup readiness budget for the collector sockets (ms).
+    pub collector_wait_ms: u64,
+    /// Share-starvation gate: demand floor (0..1024, 1024 == one CPU).
+    pub bias_starved_min_demand: u64,
+    /// Share-starvation gate: starved when delivered < ratio * demand.
+    pub bias_starved_ratio: f64,
     pub bias_min: i8,
     pub bias_max: i8,
     pub bias_window_s: u64,
@@ -62,6 +72,11 @@ impl Default for Config {
             log_applied_rule: false,
             x3d_mode: "auto".into(),
             bias_enable: true,
+            bias_collector_socket: "/run/aranicy/collector-stats.sock".into(),
+            collector_events_socket: "/run/aranicy/collector-events.sock".into(),
+            collector_wait_ms: 5000,
+            bias_starved_min_demand: 64,
+            bias_starved_ratio: 0.5,
             bias_min: -1,
             bias_max: 3,
             bias_window_s: 60,
@@ -169,7 +184,47 @@ impl Config {
                     Ok(v) => cfg.bias_half_life_s = v,
                     Err(_) => bad(&mut cfg, "bias_half_life_s (u64)"),
                 },
-                "bias_state_path" => cfg.bias_state_path = value.to_string(),
+                "bias_state_path" => {
+                    if value.is_empty() {
+                        cfg.warnings
+                            .push(format!("line {}: empty bias_state_path ignored", idx + 1));
+                    } else {
+                        cfg.bias_state_path = value.to_string();
+                    }
+                }
+                "bias_collector_socket" => {
+                    if value.is_empty() {
+                        cfg.warnings
+                            .push(format!("line {}: empty bias_collector_socket ignored", idx + 1));
+                    } else {
+                        cfg.bias_collector_socket = value.to_string();
+                    }
+                }
+                "collector_events_socket" => {
+                    if value.is_empty() {
+                        cfg.warnings.push(format!(
+                            "line {}: empty collector_events_socket ignored",
+                            idx + 1
+                        ));
+                    } else {
+                        cfg.collector_events_socket = value.to_string();
+                    }
+                }
+                "collector_wait_ms" => match value.parse::<u64>() {
+                    Ok(v) => cfg.collector_wait_ms = v,
+                    Err(_) => bad(&mut cfg, "collector_wait_ms (u64)"),
+                },
+                "bias_starved_min_demand" => match value.parse::<u64>() {
+                    // task_util_est is clamped to 1024 (one full CPU), so a
+                    // larger floor disables the starved gate forever.
+                    Ok(v) if v < 1024 => cfg.bias_starved_min_demand = v,
+                    Ok(_) => bad(&mut cfg, "bias_starved_min_demand (< 1024)"),
+                    Err(_) => bad(&mut cfg, "bias_starved_min_demand (u64)"),
+                },
+                "bias_starved_ratio" => match value.parse::<f64>() {
+                    Ok(v) if (0.0..=1.0).contains(&v) => cfg.bias_starved_ratio = v,
+                    _ => bad(&mut cfg, "bias_starved_ratio (0.0..=1.0)"),
+                },
                 k if k.starts_with("bias_group.") => {
                     let tag = k["bias_group.".len()..].trim();
                     if tag.is_empty() {
@@ -228,6 +283,8 @@ impl Config {
             max_entries: self.bias_max_entries,
             min_bias: self.bias_min,
             max_bias: self.bias_max,
+            starved_min_demand: self.bias_starved_min_demand,
+            starved_ratio: self.bias_starved_ratio,
             ..crate::bias::BiasConfig::default()
         }
     }
@@ -264,6 +321,27 @@ fn set_bool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_keys_are_validated() {
+        let cfg = Config::parse(
+            "bias_starved_min_demand = 1024\n\
+             bias_collector_socket =\n\
+             bias_state_path =\n\
+             collector_wait_ms = 250\n",
+        );
+        // A floor at/above MAX_UTIL would disable the starved gate forever,
+        // and an empty path would silently override the default.
+        assert_eq!(cfg.bias_starved_min_demand, 64);
+        assert_eq!(cfg.bias_collector_socket, "/run/aranicy/collector-stats.sock");
+        assert_eq!(cfg.bias_state_path, "/var/lib/aranicy/bias-state");
+        assert_eq!(cfg.collector_wait_ms, 250);
+        assert_eq!(cfg.warnings.len(), 3);
+
+        let ok = Config::parse("bias_starved_min_demand = 1023\n");
+        assert_eq!(ok.bias_starved_min_demand, 1023);
+        assert!(ok.warnings.is_empty());
+    }
 
     #[test]
     fn parses_booleans_and_numbers() {
@@ -334,5 +412,33 @@ mod tests {
             vec![("build".to_string(), "^(cc1.*|lto1)$".to_string())]
         );
         assert_eq!(cfg.warnings.len(), 3);
+    }
+
+    #[test]
+    fn collector_socket_and_starved_gate_keys() {
+        let d = Config::default();
+        assert_eq!(d.bias_collector_socket, "/run/aranicy/collector-stats.sock");
+        assert_eq!(d.bias_starved_min_demand, 64);
+        assert!((d.bias_starved_ratio - 0.5).abs() < f64::EPSILON);
+
+        let cfg = Config::parse(
+            "bias_collector_socket = /run/test/stats.sock\n\
+             bias_starved_min_demand = 128\n\
+             bias_starved_ratio = 0.75\n",
+        );
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.bias_collector_socket, "/run/test/stats.sock");
+        assert_eq!(cfg.bias_starved_min_demand, 128);
+        assert!((cfg.bias_starved_ratio - 0.75).abs() < f64::EPSILON);
+
+        // The gate thresholds must reach the engine, not stay in the parser.
+        let bias = cfg.bias_config();
+        assert_eq!(bias.starved_min_demand, 128);
+        assert!((bias.starved_ratio - 0.75).abs() < f64::EPSILON);
+
+        // Out-of-range ratio is rejected with a warning, default kept.
+        let bad = Config::parse("bias_starved_ratio = 3.0\n");
+        assert!((bad.bias_starved_ratio - 0.5).abs() < f64::EPSILON);
+        assert_eq!(bad.warnings.len(), 1);
     }
 }

@@ -1,7 +1,8 @@
 [Unit]
-Description=aranicy - auto-nice daemon (eBPF exec events)
+Description=aranicy - auto-nice daemon
 Documentation=https://github.com/ZhangDM-520/aranicy
-After=local-fs.target
+After=local-fs.target aranicy-collector.service
+Requires=aranicy-collector.service
 Conflicts=ananicy-cpp.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -27,7 +28,13 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectControlGroups=no
 PrivateUsers=no
-CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_BPF CAP_PERFMON
+# Lifecycle: systemd owns the collector; aranicy summons it via Requires=/
+# After= above and waits (collector_wait_ms) for its sockets at startup.
+# aranicy no longer loads BPF, so the BPF capabilities moved to
+# aranicy-collector.service.
+# CAP_SYS_PTRACE: the exec-name fallback reads /proc/<pid>/exe, which
+# needs ptrace_may_access() for non-dumpable processes.
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_SYS_PTRACE
 
 [Install]
 WantedBy=multi-user.target

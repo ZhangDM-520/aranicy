@@ -1,4 +1,5 @@
 /target
+collector/target
 **/*.rs.bk
 *.swp
 /.idea

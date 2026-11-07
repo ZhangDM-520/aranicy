@@ -148,6 +148,85 @@ protocol notes below are historical; the general test/fixture pitfalls remain li
   notify after SIGHUP-only reload) show up nowhere else. Run
   `cargo clippy --workspace --all-targets` before calling a crate done.
 
+## Scheduler-agnostic collector (2026-11-07) — Last reviewed: 2026-11-07
+
+- Per-task BPF accounting needs THREE hooks, not one: `sched_switch` alone is
+  blind to a task that execs and then runs to completion (a compiler) — it
+  never switches out until exit. Add `sched_stat_runtime` (per-tick runtime for
+  the running task) and seed at `sched_process_exec` (no switch happens at
+  exec). Upstream emits `sched_stat_runtime` from the FAIR class only, so a
+  kernel that does not route it through sched_ext produces no ticks at all —
+  keep a `sched_switch` residual (`last_tick`/`last_run_start`) as the exact
+  fallback rather than assuming the tick exists.
+- `static_prio` must be refreshed on every switch/tick, never only at entry
+  creation or exec: the bias engine's closed-loop check compares the applied
+  nice against the sampled one, so a stale value freezes every entry after its
+  first apply (measured live: 76/400 entries frozen).
+- Never delete the accumulator in `sched_process_exit`: it fires from `do_exit()`
+  BEFORE the final `sched_switch`, so the delete discards the last window and
+  the switch re-creates a zeroed entry (a phantom row that drags demand down).
+  LRU eviction already bounds the table; pid reuse is caught by the comm check.
+- Attribute `wakes_issued` from `sched_waking` (waker's context), not
+  `sched_wakeup` (target CPU, so "current" is the occupant, not the waker).
+- A full `BPF_MAP_TYPE_HASH` silently drops `BPF_NOEXIST` inserts: new tasks
+  get no accounting and vanish from samples (observed at 16384/16384). Use
+  `BPF_MAP_TYPE_LRU_HASH` for per-task tables.
+- `wait_freq == 0` and `wake_freq == 0` are meaningful zeros (never slept /
+  never woke anyone), not absent fields: treating them as "no evidence" blinds
+  the classifier to CPU-bound build tools, which are the canonical BULK case
+  (a compiler forks its children instead of waking them). Only
+  `avg_runtime_wall == 0` is a hard gate.
+- Instantaneous window rates are jumpy (one sleep in one window reads as 1/s,
+  then 0); smooth them with a wall-clock EWMA (~30 s) seeded from the first
+  observation, matching lavd's persistent per-event EWMAs. Decay them for
+  every task still present in the map, not only the ones that moved — an idle
+  task must not report its pre-idle rate when it wakes up.
+- Exec-name resolution must run at CAPTURE time (collector), not in the
+  consumer: by the time an event crosses a socket, a short-lived tool's
+  `/proc/<pid>` may be gone. The wire frame must carry the full 256-byte
+  `NAME_CAP` (and a u16 length): a shorter field truncates names — possibly
+  mid-UTF-8, which the daemon drops as unresolved — so exec matching would
+  disagree with every other path.
+- A blocking read must never hold the mutex that the shutdown path needs:
+  clone the `Arc<UnixStream>` out, drop the guard, then `read_exact`. Holding
+  it deadlocks `wake()` and freezes SIGTERM handling until systemd SIGKILLs.
+- Collector shutdown: block SIGTERM/SIGINT before spawning any thread (threads
+  inherit the mask; otherwise a worker takes the default action and the sockets
+  leak), poll a non-blocking listener so `accept` cannot outlive `stop`, and
+  set a write timeout on the event socket so a stalled client cannot wedge the
+  only pump thread.
+- IRQ-context wakes: `sched_waking` runs on the interrupted task's context when
+  it fires from a timer/device IRQ, so crediting `bpf_get_current_task_btf()`
+  invents wakes for whatever was burning that CPU (measured: a pure spinloop
+  reported 22-45 wakes/s). Gate on `__preempt_count` via
+  `bpf_this_cpu_ptr(&__preempt_count) & 0x00ffff00` (hardirq/softirq/NMI bits).
+- The accumulator must track task IDENTITY, not just the pid: refresh `comm` on
+  every switch/tick (prctl renames), fully reset the counters on exec (a reused
+  pid exec'ing the same name otherwise inherits them and a stale `last_tick`
+  back-dates the slice), and delete the child's pid entry in
+  `sched_process_fork` so a recycled pid starts from zero.
+- `d_run > 0 && d_runs == 0` is the normal shape of a CPU-bound task that never
+  switched out: dividing by `runs` reports runtime 0 and the bias engine then
+  drops exactly the samples it wants. Fall back to `d_run` / the in-flight
+  `now - last_run_start`.
+- A pid absent from the baseline was created after it (its entry starts at
+  zero), so its cumulative counters are the window's activity — skipping the
+  first sighting makes every sub-cadence build helper invisible.
+- `score == 0` is a real observation (never-sleeping, never-waking task): a
+  `score_ema == 0.0` sentinel would re-seed on the next window instead of
+  smoothing. Track `score_init` like `util_init`.
+- Draining a 16k-entry map key-by-key costs two `bpf()` calls per task and is a
+  measurable share of a core every cadence; `MapCore::lookup_batch` cuts it to
+  one call per 1024 entries (fallback kept). Do not busy-poll an event queue
+  either: a condvar costs nothing and a 2 ms loop burned ~4% of a core.
+- Event-socket bind must happen before the serve thread starts, otherwise a
+  bind failure leaves a "healthy" collector with no event stream; and a frame
+  popped before a failed write must be pushed back, or a daemon restart eats it.
+- makepkg's environment fails to link the vendored libbpf for the collector
+  binary (`undefined symbol: bpf_map__*`) although the same build succeeds
+  with plain `cargo build --release`; `--no-as-needed` and dropping `--frozen`
+  did not help. Packaging of the collector is an open item.
+
 ## Bias-engine config defaults — Last reviewed: 2026-10-31 (verify against `crates/aranicy-daemon/src/config.rs`; do not re-derive)
 
 - Window 60 s, deadband 15%, min_samples 30, attack 30 s/step, release 300 s/step,

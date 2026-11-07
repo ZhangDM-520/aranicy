@@ -51,28 +51,58 @@ ananicy-cpp's OS order).
 
 ## Dynamic nice bias (superset)
 
-Optional dynamic nice adjustment driven by per-task samples from the running
-`sched_ext` scheduler's `scx_stats` socket — no fallback sampler is shipped;
-when the scheduler exposes no per-task stats the mechanism degrades as
-described below. Disable with `bias_enable = false`. Hot-path cost is one
+Optional dynamic nice adjustment driven by per-task samples from
+**`aranicy-collectord`** — a standalone, scheduler-agnostic BPF collector
+shipped as its own package (`aranicy-collector`, GPL-2.0-only). aranicy is a
+pure client: it loads no BPF, owns no scheduler dependency, and therefore
+learns on *every* scheduler, including none (plain EEVDF). Disable with
+`bias_enable = false`.
+
+Sockets (`/run/aranicy/`, systemd `RuntimeDirectory`):
+`collector-stats.sock` (scx_stats protocol, target `sched_samples`) and
+`collector-events.sock` (framed exec events). Paths are configurable via
+`bias_collector_socket` / `collector_events_socket`; `collector_wait_ms`
+(default 5000) is the startup readiness budget — a missing collector is a
+loud failure, never silent rule-less operation.
+
+**Sample contract** (the collector's units; lavd-derived names kept so the
+client codec is unchanged):
+
+| field | meaning | scale |
+|---|---|---|
+| `wait_freq` | sleeps per second (EWMA, 30 s) | events/s |
+| `wake_freq` | wakes issued per second (EWMA) | events/s |
+| `avg_runtime_wall` | mean runtime per schedule | ns |
+| `task_util_est` | DEMAND: running + runnable duty | 0..1024 (1024 = 1 CPU) |
+| `cpu_util_wall` | DELIVERED: running duty | 0..1024 (same scale) |
+| `static_prio` | nice + 20 | — |
+
+Both util fields share one scale, so the starved gate
+(`demand > bias_starved_min_demand && delivered < bias_starved_ratio * demand`)
+now compares like with like; lavd emitted demand in 0..1024 and delivered in
+0..100, which made the comparison meaningless. A `wait_freq` of zero is a
+*meaningful* zero (the task never sleeps — the canonical bulk case), not a
+missing field.
+
+PELT is deliberately unused: `se.avg.*` is a FAIR-class path and reads zero
+under sched_ext (measured). The collector accounts runtime from
+`sched_stat_runtime` plus a `sched_switch` residual (upstream emits that
+tracepoint from the fair class only, so a kernel that does not route it
+through the core path yields no ticks — the switch path keeps the figure
+exact either way), and runnable time from `sched_switch`. Hot-path cost is one
 extra O(1) map lookup per event — the bias history is a separate table from
 the rule tables.
 
-**Scheduler support** (surveyed across scx-scheds 1.1.4; schemas re-detected
-from `stats_meta` on every connect, so schema drift is tolerated):
+**Scheduler support**: every scheduler. The collector derives the signals from
+core tracepoints (`sched_switch`, `sched_waking`/`sched_wakeup`,
+`sched_stat_runtime`, `sched_process_exec`), so per-task learning no longer
+depends on what the scheduler exposes — `scx_lavd`/`scx_mavd`, any other
+`sched_ext` scheduler, and plain EEVDF all behave identically.
 
-| scheduler | per-task bias learning | surface |
-|---|---|---|
-| `scx_lavd` | **yes** | `scx_stats` target `sched_samples` (`SchedSample`, 38 fields) |
-| `scx_mavd` | **yes** | same target/schema as lavd (byte-identical `SchedSample`) |
-| `scx_beerland`, `scx_bpfland`, `scx_cake`, `scx_cosmos`, `scx_eevdf`, `scx_flash`, `scx_flow`, `scx_forge`, `scx_mlfq`, `scx_pandemonium`, `scx_rburst`, `scx_reevdf`, `scx_rlocal`, `scx_rvtime`, `scx_tickless` | no | aggregate-only or no `scx_stats`; sampler degrades with reason `no per-task stats` |
-| `scx_p2dq` | no | aggregate-only over `scx_stats`; a pid-keyed `task_llc_pelt` BPF map exposes util alone (insufficient for the weight-free score — needs wait/wake freq + runtime) |
-
-The sampler binds whatever per-task struct/target the server exposes
-(struct: `pid`+`comm`+≥1 signal field; target: probed — names are arbitrary
-server-side strings) and re-globs `/run/scx/*/stats` on every reconnect, so
-switching schedulers (or a mavd `--cgroup` sub-scheduler appearing) needs no
-daemon restart.
+The sampler speaks the `scx_stats` protocol to whatever server is bound at
+`sched_collector_socket` (default the collector's
+`/run/aranicy/collector-stats.sock`) and reconnects with backoff if it goes
+away; no scheduler is probed or named.
 
 - History keyed by the **kernel comm** (the `scx_lavd` sample namespace; rule
   matching uses the separate argv[0]-derived name), with fuzzy keying: a
@@ -121,9 +151,11 @@ daemon restart.
 
 Config keys (all `bias_*`): `bias_enable`, `bias_min`, `bias_max`,
 `bias_window_s`, `bias_deadband_pct`, `bias_min_samples`, `bias_cadence_ms`,
-`bias_max_entries`, `bias_half_life_s`, `bias_state_path`, plus repeatable
-`bias_group.<tag> = <regex>` family declarations (first definition wins; bad
-tags/regexes warn and skip).
+`bias_max_entries`, `bias_half_life_s`, `bias_state_path`,
+`bias_collector_socket`, `bias_starved_min_demand`, `bias_starved_ratio`, plus
+the non-`bias_*` collector keys `collector_events_socket` and
+`collector_wait_ms`, and repeatable `bias_group.<tag> = <regex>` family
+declarations (first definition wins; bad tags/regexes warn and skip).
 
 ## Config keys (superset)
 
@@ -136,8 +168,9 @@ tags/regexes warn and skip).
 
 ## CLI and service
 
-- `aranicy start` (root; eBPF-only: hard failure with a clear message when
-  BTF/tracepoint support is missing — no silent fallback),
+- `aranicy start` (root; no BPF of its own — it requires
+  `aranicy-collector.service` and fails loudly if the collector's sockets do not
+  appear within `collector_wait_ms`),
 - `aranicy dump {rules,types,cgroups,proc,autogroup,bias}` (unprivileged;
   `bias` shows the persisted bias snapshot),
 - `aranicy lint`, `aranicy match-test <name>` (dry-run, superset),

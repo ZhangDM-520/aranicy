@@ -32,11 +32,11 @@
 //!   another sampler" (substring match, weak contract). Reconnecting reclaims
 //!   ownership; an idle connection steals it on its first request.
 //!
-//! Sockets: scx_stats serves `/var/run/scx/<sched-path>/stats` — lavd and
-//! mavd root instances use `root`; mavd `--cgroup` sub-schedulers use their
-//! own sched-paths. [`discover_socket_paths`] globs both runtime spellings
-//! (deduplicated by inode) and [`spawn_auto`] re-globs on every reconnect so
-//! a scheduler switch is picked up without a daemon restart.
+//! Socket: the collector (`aranicy-collectord`, a separate GPL-2.0 package)
+//! serves `/run/aranicy/collector-stats.sock`. There is exactly ONE stats
+//! source now — scheduler discovery was retired: the collector is
+//! scheduler-agnostic, so no glob or scheduler probe is needed. The path is
+//! configurable (`bias_collector_socket`) for tests and relocated installs.
 //!
 //! [`spawn`] runs the single sampler thread: it delivers [`Batch`]es through
 //! an `mpsc::Sender`, logs exactly one line per [`SamplerState`] transition,
@@ -141,76 +141,8 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// thread immediately — it calls `shutdown(2)` on the live socket.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The two well-known spellings of the stats socket (same inode on this host;
-/// both are tried in order — a stale socket after a lavd crash answers
-/// `ECONNREFUSED`, which counts as "absent").
-pub fn default_socket_paths() -> [PathBuf; 2] {
-    [
-        PathBuf::from("/run/scx/root/stats"),
-        PathBuf::from("/var/run/scx/root/stats"),
-    ]
-}
-
-/// Every `stats` socket under the scx runtime dirs
-/// (`{,/var}/run/scx/<sched-path>/stats`), deduplicated by (device, inode) —
-/// `/var/run` is a `/run` symlink on this host, so the same inode is often
-/// reachable via both spellings. Sorted per base for determinism. Falls back
-/// to [`default_socket_paths`] when nothing is found (scheduler not running
-/// yet — the retry loop keeps re-globbing).
-pub fn discover_socket_paths() -> Vec<PathBuf> {
-    let mut out = discover_in(&[PathBuf::from("/run/scx"), PathBuf::from("/var/run/scx")]);
-    if out.is_empty() {
-        out.extend(default_socket_paths());
-    }
-    out
-}
-
-/// Glob `<base>/<entry>/stats` for each base; see [`discover_socket_paths`]
-/// for the dedupe/fallback semantics (no fallback here — callers decide).
-fn discover_in(bases: &[PathBuf]) -> Vec<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for base in bases {
-        let mut paths: Vec<PathBuf> = match std::fs::read_dir(base) {
-            Ok(rd) => rd
-                .flatten()
-                .map(|e| e.path().join("stats"))
-                .filter(|p| p.exists())
-                .collect(),
-            Err(_) => continue,
-        };
-        paths.sort();
-        for p in paths {
-            if let Ok(md) = std::fs::symlink_metadata(&p) {
-                if seen.insert((md.dev(), md.ino())) {
-                    out.push(p);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Where the sampler looks for stats sockets on each (re)connect.
-enum PathSource {
-    /// Explicit list (tests; [`spawn`]).
-    Fixed(Vec<PathBuf>),
-    /// Re-glob the scx runtime dirs every cycle ([`spawn_auto`]), so a
-    /// scheduler switch (or a mavd sub-scheduler appearing) is picked up
-    /// without restarting the daemon.
-    Discover { bases: Vec<PathBuf> },
-}
-
-fn candidate_paths(src: &PathSource) -> Vec<PathBuf> {
-    match src {
-        PathSource::Fixed(paths) => paths.clone(),
-        // No fallback: the glob covers the classic root spelling
-        // (<base>/root/stats) exactly — an empty glob means "no scheduler
-        // running" and correctly degrades to transport-down retry.
-        PathSource::Discover { bases } => discover_in(bases),
-    }
-}
+/// Default collector stats socket (systemd `RuntimeDirectory=aranicy`).
+pub const DEFAULT_COLLECTOR_SOCKET: &str = "/run/aranicy/collector-stats.sock";
 
 /// Sampler state machine, exposed for the daemon/log.
 ///
@@ -338,16 +270,13 @@ impl Drop for SchedSamplerHandle {
 /// stops the thread. Exactly one tracing line is emitted per
 /// [`SamplerState`] transition; batches are never logged. A zero `cadence`
 /// falls back to [`DEFAULT_CADENCE`].
-pub fn spawn(socket_paths: &[PathBuf], cadence: Duration, tx: Sender<Batch>) -> SchedSamplerHandle {
-    spawn_with(PathSource::Fixed(socket_paths.to_vec()), tuning(cadence), tx)
+pub fn spawn(socket: &Path, cadence: Duration, tx: Sender<Batch>) -> SchedSamplerHandle {
+    spawn_with(socket.to_path_buf(), tuning(cadence), tx)
 }
 
-/// Spawn against the live scx runtime: socket paths are re-globbed on every
-/// (re)connect ([`discover_socket_paths`]), so switching schedulers (or a
-/// mavd sub-scheduler appearing) is picked up without a daemon restart.
-pub fn spawn_auto(cadence: Duration, tx: Sender<Batch>) -> SchedSamplerHandle {
-    let bases = vec![PathBuf::from("/run/scx"), PathBuf::from("/var/run/scx")];
-    spawn_with(PathSource::Discover { bases }, tuning(cadence), tx)
+/// Spawn against the collector's fixed socket ([`DEFAULT_COLLECTOR_SOCKET`]).
+pub fn spawn_collector(socket: PathBuf, cadence: Duration, tx: Sender<Batch>) -> SchedSamplerHandle {
+    spawn_with(socket, tuning(cadence), tx)
 }
 
 fn tuning(cadence: Duration) -> Tuning {
@@ -363,7 +292,7 @@ fn tuning(cadence: Duration) -> Tuning {
     }
 }
 
-fn spawn_with(src: PathSource, tuning: Tuning, tx: Sender<Batch>) -> SchedSamplerHandle {
+fn spawn_with(socket: PathBuf, tuning: Tuning, tx: Sender<Batch>) -> SchedSamplerHandle {
     let shared = Arc::new(Mutex::new(Shared {
         state: SamplerState::degraded(REASON_STARTING),
         binding: None,
@@ -376,7 +305,7 @@ fn spawn_with(src: PathSource, tuning: Tuning, tx: Sender<Batch>) -> SchedSample
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
             let slot = Arc::clone(&slot);
-            move || run(src, tuning, tx, shared, stop, slot)
+            move || run(socket, tuning, tx, shared, stop, slot)
         })
         .expect("spawn stats sampler thread");
     SchedSamplerHandle {
@@ -656,7 +585,7 @@ fn bind_handshake(conn: &mut Connection, path: &Path) -> Result<TargetBinding, B
 }
 
 fn run(
-    src: PathSource,
+    socket: PathBuf,
     tuning: Tuning,
     tx: Sender<Batch>,
     shared: Arc<Mutex<Shared>>,
@@ -669,16 +598,15 @@ fn run(
         if stop.requested() {
             break;
         }
-        // Bind: try every candidate socket (paths re-globbed per cycle for
-        // PathSource::Discover) through connect + schema binding. A
-        // preemption on one socket must not starve the remaining candidates
-        // (multi-socket layouts: mavd sub-schedulers) — it is recorded and
-        // the slow retry happens only when the whole scan came up empty.
+        // Bind: exactly one socket (the collector). The loop shape is kept
+        // because the bind outcome handling below still distinguishes
+        // transport failures from preemption and from a server without
+        // per-task rows.
         let mut attempt: Option<(Connection, TargetBinding, PathBuf)> = None;
         let mut saw_no_per_task = false;
         let mut saw_preempted = false;
         let mut detail = String::new();
-        for path in candidate_paths(&src) {
+        for path in std::iter::once(socket.clone()) {
             if stop.requested() {
                 break 'outer;
             }
@@ -1439,7 +1367,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn(&[server.socket()], Duration::from_millis(60), tx);
+        let h = spawn(&server.socket(), Duration::from_millis(60), tx);
 
         let first = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(first.len(), 2);
@@ -1483,7 +1411,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
         let _ = recv_batch(&rx, Duration::from_secs(5));
         wait_for_state(&h, |s| s.is_live(), Duration::from_secs(2));
 
@@ -1511,7 +1439,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
         let _ = recv_batch(&rx, Duration::from_secs(5));
         let fields = h.fields();
         assert_eq!(fields.len(), 38);
@@ -1534,7 +1462,7 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel();
         // Long preempt retry so the Degraded window is easy to observe.
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(500)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(500)), tx);
 
         let degraded = wait_for_state(
             &h,
@@ -1567,7 +1495,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 1);
@@ -1592,7 +1520,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 1);
@@ -1609,7 +1537,7 @@ mod tests {
         let dir = TestDir::new("hang");
         let server = FakeServer::start(dir.path(), vec![Reply::Hang]);
         let (tx, rx) = mpsc::channel();
-        let h = spawn(&[server.socket()], DEFAULT_CADENCE, tx);
+        let h = spawn(&server.socket(), DEFAULT_CADENCE, tx);
         // Let the thread block on the never-answered stats_meta read.
         std::thread::sleep(Duration::from_millis(150));
         let t0 = Instant::now();
@@ -1635,7 +1563,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
 
         assert!(recv_batch(&rx, Duration::from_secs(5)).is_empty());
         assert!(recv_batch(&rx, Duration::from_secs(5)).is_empty());
@@ -1656,7 +1584,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 60); // the ~60-sample ringbuf cap shape
@@ -1683,7 +1611,7 @@ mod tests {
             ],
         );
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(PathSource::Fixed(vec![server.socket()]), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 2); // non-object entry skipped
@@ -1693,31 +1621,6 @@ mod tests {
         assert_eq!(batch[1].pid, 42);
         assert_eq!(batch[1].comm, ""); // wrong-typed -> serde(default)
         assert_eq!(batch[1].wait_freq, 0); // unparseable string -> serde(default)
-
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn first_socket_path_missing_falls_back() {
-        let dir = TestDir::new("fallback");
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![live_sample(55, "fallback")])),
-            ],
-        );
-        let (tx, rx) = mpsc::channel();
-        let missing = dir.path().join("missing-stats");
-        let h = spawn_with(
-            PathSource::Fixed(vec![missing, server.socket()]),
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].pid, 55);
 
         h.shutdown();
         h.join().unwrap();
@@ -1799,7 +1702,7 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel();
         let h = spawn_with(
-            PathSource::Fixed(vec![server.socket()]),
+            server.socket().to_path_buf(),
             fast_tuning(Duration::from_millis(300)),
             tx,
         );
@@ -1832,7 +1735,7 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel();
         let h = spawn_with(
-            PathSource::Fixed(vec![server.socket()]),
+            server.socket().to_path_buf(),
             fast_tuning(Duration::from_millis(300)),
             tx,
         );
@@ -1862,7 +1765,7 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel();
         let h = spawn_with(
-            PathSource::Fixed(vec![server.socket()]),
+            server.socket().to_path_buf(),
             fast_tuning(Duration::from_millis(300)),
             tx,
         );
@@ -1898,7 +1801,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         let h = spawn_with(
-            PathSource::Fixed(vec![server.socket()]),
+            server.socket().to_path_buf(),
             fast_tuning(Duration::from_millis(300)),
             tx,
         );
@@ -1929,7 +1832,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         let h = spawn_with(
-            PathSource::Fixed(vec![server.socket()]),
+            server.socket().to_path_buf(),
             fast_tuning(Duration::from_millis(200)),
             tx,
         );
@@ -2004,142 +1907,6 @@ mod tests {
     }
 
     #[test]
-    fn discovery_globs_bases_and_dedupes_by_inode() {
-        let root = TestDir::new("discover");
-        let base1 = root.path().join("base1");
-        std::fs::create_dir_all(base1.join("root")).unwrap();
-        std::fs::create_dir_all(base1.join("sub")).unwrap();
-        std::fs::write(base1.join("root").join("stats"), b"").unwrap();
-        std::fs::write(base1.join("sub").join("stats"), b"").unwrap();
-        // Same tree through a symlinked base: same inodes, must dedupe.
-        let base2 = root.path().join("base2");
-        std::os::unix::fs::symlink(&base1, &base2).unwrap();
-
-        let found = discover_in(&[base1.clone(), base2]);
-        assert_eq!(
-            found,
-            vec![base1.join("root").join("stats"), base1.join("sub").join("stats")]
-        );
-        assert!(discover_in(&[root.path().join("nonexistent")]).is_empty());
-    }
-
-    #[test]
-    fn discover_source_binds_through_the_loop() {
-        // PathSource::Discover globs <base>/<sched-path>/stats and binds the
-        // schema there — the mavd sub-scheduler layout.
-        let root = TestDir::new("discover-bind");
-        let base = root.path().join("run");
-        let sched_dir = base.join("sub0");
-        std::fs::create_dir_all(&sched_dir).unwrap();
-        let _server = FakeServer::start(
-            &sched_dir,
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![])),
-                Reply::Line(batch_line(vec![live_sample(202, "discovered")])),
-            ],
-        );
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            PathSource::Discover { bases: vec![base] },
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].comm, "discovered");
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn preemption_on_one_socket_falls_through_to_next() {
-        // Preemption is per-(server, target), not global: a competing sampler
-        // on the first socket must not starve the remaining candidates
-        // (multi-socket layout: root + mavd sub-schedulers).
-        let root = TestDir::new("preempt-scan");
-        let preempted_dir = root.path().join("busy");
-        let healthy_dir = root.path().join("free");
-        std::fs::create_dir_all(&preempted_dir).unwrap();
-        std::fs::create_dir_all(&healthy_dir).unwrap();
-        let _busy = FakeServer::start(
-            &preempted_dir,
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(preempt_line()), // probe of the per-task target
-            ],
-        );
-        let healthy = FakeServer::start(
-            &healthy_dir,
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![])),
-                Reply::Line(batch_line(vec![live_sample(321, "second-socket")])),
-            ],
-        );
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            PathSource::Fixed(vec![
-                preempted_dir.join("stats"),
-                healthy.socket(),
-            ]),
-            fast_tuning(Duration::from_millis(10_000)), // slow: falling back must not wait for it
-            tx,
-        );
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].comm, "second-socket");
-        assert!(h.state().is_live());
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn discover_re_globs_when_a_socket_appears() {
-        // spawn_auto's headline behavior: no socket at first (degraded), then
-        // a scheduler starts — the next retry cycle must find it without any
-        // daemon restart, i.e. paths are re-globbed per cycle, not once.
-        let root = TestDir::new("reglob");
-        let base = root.path().join("run");
-        std::fs::create_dir_all(&base).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            PathSource::Discover { bases: vec![base.clone()] },
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-        wait_for_state(
-            &h,
-            |s| matches!(s, SamplerState::Degraded { reason } if reason == "transport down"),
-            Duration::from_secs(5),
-        );
-        // scheduler appears mid-run
-        let sched_dir = base.join("late");
-        std::fs::create_dir_all(&sched_dir).unwrap();
-        let _server = FakeServer::start(
-            &sched_dir,
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![])),
-                Reply::Line(batch_line(vec![live_sample(404, "late-arrival")])),
-            ],
-        );
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].comm, "late-arrival");
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn empty_discovery_yields_no_candidates() {
-        // Nothing globbed = nothing to try (no hidden fallback to the
-        // classic paths — the glob covers that layout already).
-        let root = TestDir::new("discover-empty");
-        let found = candidate_paths(&PathSource::Discover {
-            bases: vec![root.path().join("nonexistent")],
-        });
-        assert!(found.is_empty());
-    }
-
-    #[test]
     fn failed_bind_releases_parked_stream() {
         // A failed handshake must not leave the connection parked in the
         // stream slot: the fd would outlive the attempt and shutdown()
@@ -2162,7 +1929,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         let h = spawn_with(
-            PathSource::Fixed(vec![dir.path().join("stats")]),
+            dir.path().join("stats"),
             fast_tuning(Duration::from_millis(300)),
             tx,
         );

@@ -6,16 +6,18 @@
 
 [workspace]
 resolver = "2"
+exclude = ["collector"]
 members = [
     "crates/aranicy-model",
     "crates/aranicy-rules",
-    "crates/aranicy-events",
+    "crates/aranicy-procname",
+    "crates/aranicy-wire",
     "crates/aranicy-apply",
     "crates/aranicy-daemon",
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ZhangDM-520/aranicy"
@@ -24,12 +26,12 @@ rust-version = "1.85"
 [workspace.dependencies]
 aranicy-model = { path = "crates/aranicy-model" }
 aranicy-rules = { path = "crates/aranicy-rules" }
-aranicy-events = { path = "crates/aranicy-events" }
+aranicy-procname = { path = "crates/aranicy-procname" }
+aranicy-wire = { path = "crates/aranicy-wire" }
 aranicy-apply = { path = "crates/aranicy-apply" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

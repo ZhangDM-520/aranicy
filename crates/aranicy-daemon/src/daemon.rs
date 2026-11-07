@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use aranicy_apply::{
     apply_policy, probe_capabilities, ActionOutcome, ApplyReport, Capabilities, CgroupManager,
 };
-use aranicy_events::{BpfExecSource, ExecEvent, ExecSource};
+use aranicy_wire::ExecFrame;
+
+use crate::event_client::EventClient;
 use aranicy_model::CgroupDef;
 use aranicy_rules::RuleSet;
 
@@ -194,8 +196,13 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
         tracing::warn!("{w}");
     }
 
-    let source = BpfExecSource::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let source = Arc::new(source);
+    // The collector owns every BPF program; aranicy is a pure client and no
+    // longer needs CAP_BPF (see contrib/ananicy.service).
+    let source = EventClient::connect(
+        std::path::PathBuf::from(&cfg.collector_events_socket),
+        std::time::Duration::from_millis(cfg.collector_wait_ms.max(1)),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Bias engine (plan.md §4.2-4.3): restore learned history, then run the
     // sampler + bias threads alongside the worker.
@@ -257,7 +264,11 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     };
     let bias_threads = if bias_enable {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = sampler::spawn_auto(bias_cadence, tx);
+        let handle = sampler::spawn_collector(
+            std::path::PathBuf::from(&shared.config().bias_collector_socket),
+            bias_cadence,
+            tx,
+        );
         let bias_thread = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || bias_loop(&shared, rx))
@@ -445,7 +456,7 @@ fn block_signals() -> std::io::Result<libc::sigset_t> {
     }
 }
 
-fn signal_loop(set: &libc::sigset_t, shared: &Arc<Shared>, source: &Arc<BpfExecSource>, paths: &Paths) {
+fn signal_loop(set: &libc::sigset_t, shared: &Arc<Shared>, source: &Arc<EventClient>, paths: &Paths) {
     loop {
         let mut sig = 0;
         let r = unsafe { libc::sigwait(&raw const *set, &raw mut sig) };
@@ -472,6 +483,9 @@ fn reload(shared: &Arc<Shared>, paths: &Paths) {
             for w in warnings {
                 tracing::warn!("{w}");
             }
+            for w in &cfg.warnings {
+                tracing::warn!("config: {w}");
+            }
             for w in &rules.warnings {
                 tracing::warn!("{}:{}: {}", w.file.display(), w.line, w.message);
             }
@@ -491,7 +505,7 @@ fn reload(shared: &Arc<Shared>, paths: &Paths) {
 // Worker (hot path)
 // ---------------------------------------------------------------------------
 
-fn worker_loop(shared: &Arc<Shared>, source: &Arc<BpfExecSource>) {
+fn worker_loop(shared: &Arc<Shared>, source: &Arc<EventClient>) {
     let mut summary = SummaryState {
         last: Instant::now(),
         dropped: 0,
@@ -536,9 +550,19 @@ fn eff_nice_for(rule_nice: Option<i8>, target: i8, applied: Option<i8>) -> Optio
     }
 }
 
-fn handle_event(shared: &Shared, ev: &ExecEvent) {
+fn handle_event(shared: &Shared, ev: &ExecFrame) {
+    // The collector resolves the match name at capture time (microseconds
+    // after exec), which is strictly better than re-deriving it here: by the
+    // time the event crosses the socket, a short-lived tool may already be
+    // gone. Fall back to the local resolver only when capture failed.
     let mut buf = [0u8; NAME_CAP];
-    let len = shared.proc.derive_name(ev.pid, ev.comm_bytes(), &mut buf);
+    let len = if ev.name.is_empty() {
+        shared.proc.derive_name(ev.pid, ev.comm_bytes(), &mut buf)
+    } else {
+        let n = ev.name.len().min(NAME_CAP);
+        buf[..n].copy_from_slice(&ev.name[..n]);
+        n
+    };
     if len == 0 {
         shared
             .counters
@@ -637,7 +661,7 @@ fn handle_event(shared: &Shared, ev: &ExecEvent) {
 /// One rate-limited aggregate line per ~60 s, and only when something went
 /// off the happy path (Gone/Denied/Failed or newly dropped events). Per-event
 /// logging of Gone is deliberately suppressed (storms).
-fn maybe_summary(shared: &Shared, source: &BpfExecSource, state: &mut SummaryState) {
+fn maybe_summary(shared: &Shared, source: &EventClient, state: &mut SummaryState) {
     if state.last.elapsed() < SUMMARY_INTERVAL {
         return;
     }

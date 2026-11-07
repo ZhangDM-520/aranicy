@@ -1,15 +1,12 @@
 [package]
-name = "aranicy-events"
+name = "aranicy-procname"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lib]
-name = "aranicy_events"
-
+# Shared by the MIT daemon and the GPL-2.0 collector: MIT code is
+# GPL-compatible, so the license boundary rule is "no GPL inside crates/".
 [dependencies]
-thiserror.workspace = true
 libc.workspace = true
-libbpf-rs = "0.27"

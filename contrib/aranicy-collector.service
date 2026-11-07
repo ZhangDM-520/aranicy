@@ -1,0 +1,36 @@
+[Unit]
+Description=aranicy collector - scheduler-agnostic BPF task statistics
+Documentation=https://github.com/ZhangDM-520/aranicy
+After=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aranicy-collectord run
+# Both sockets live in /run/aranicy (RuntimeDirectory).
+RuntimeDirectory=aranicy
+RuntimeDirectoryMode=0700
+# The collector is the only BPF owner: aranicy itself no longer loads programs.
+Nice=-10
+OOMScoreAdjust=-999
+Restart=always
+RestartSec=5
+
+# Hardening (mirrors the daemon unit; BPF needs the listed capabilities)
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateUsers=no
+NoNewPrivileges=yes
+# CAP_SYS_PTRACE: exec-name resolution falls back to /proc/<pid>/exe,
+# which needs ptrace_may_access() for non-dumpable processes.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+
+[Install]
+WantedBy=multi-user.target

@@ -13,7 +13,8 @@ path = "src/main.rs"
 [dependencies]
 aranicy-model.workspace = true
 aranicy-rules.workspace = true
-aranicy-events.workspace = true
+aranicy-procname.workspace = true
+aranicy-wire.workspace = true
 aranicy-apply.workspace = true
 anyhow.workspace = true
 clap.workspace = true

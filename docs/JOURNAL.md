@@ -270,3 +270,9 @@ no action files exist for them. Memory architecture: see `AGENTS.md`.
 ## 2026-10-31 — memory architecture migration: old `docs/NOTE.md`/`MEMORY.md`/`CURRENT.md` layout consolidated into `AGENTS.md` (global memory) + `docs/JOURNAL.md` (this log) + `.logs/scratchpad.md` (active buffer, seeded with the in-flight v0.2.3 ramp-fix state). → `.logs/action-2026-10-31-memory-architecture.md`
 
 ## 2026-10-31 — v0.2.3 wave: bias-ramp starvation fixed (target-flip grace + freeze-brick escape + release-flood fairness cap; code-review gate findings fixed) — clean-gate PASS (0→3 during the run), released v0.2.3 (fffbb54/841942a/aa31b51, tag pushed), gsa recipe bumped (70e6e7e) + landed in the live recipe store. → `.logs/action-2026-10-31-v023-ramp-fix.md`
+
+## 2026-11-07 — scheduler-agnostic BPF collector (v0.3.0): aranicy drops all BPF/scheduler coupling, learns on any scheduler — collector daemon (GPL-2.0 package) owns stats + exec events; gate: `build` bias 0→1→2→3 during a compile. → `.logs/action-2026-11-07-collector.md`
+
+## 2026-11-07 — v0.3.0 internal review wave: 10 findings (EventClient deadlock, fair-only runtime tick, stale static_prio, collector shutdown, exit-delete phantom, wake attribution, 64-byte name truncation, wake gate, EWMA decay, socket hygiene) all fixed and live-validated (daemon stop 31 ms, collector stop 276 ms, frozen 76→13, fresh-name ramp 0→2) — both gates green; external review request filed. → `.logs/action-2026-11-07-collector-review-fixes.md`
+
+## 2026-11-07 — v0.3.0 external review (2 blockers/3 majors/2 minors) fixed: in-flight runtime, pid identity (fork/exec/comm), IRQ wake gate, mid-window pids, event-server bind/requeue/condvar/batch-read, score sentinel, config+caps+docs — both gates green, disposition filed, committed and pushed. → `.logs/action-2026-11-07-collector-review-fixes.md`

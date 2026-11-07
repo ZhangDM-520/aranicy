@@ -59,6 +59,21 @@ sudo ./target/release/aranicy start        # root required
 ./target/release/aranicy dump bias         # dynamic-nice bias state (superset)
 ```
 
+## Packages
+
+Two packages are built from this tree:
+
+| package | license | role |
+|---|---|---|
+| `aranicy` | MIT | the auto-nice daemon (rules, apply, bias engine) |
+| `aranicy-collector` | GPL-2.0-only | `aranicy-collectord`, the scheduler-agnostic BPF statistics collector |
+
+The collector owns every BPF program. `aranicy.service` declares
+`Requires=`/`After=aranicy-collector.service`, so starting aranicy summons the
+collector automatically; aranicy itself then needs only `CAP_SYS_NICE` (no
+`CAP_BPF`). The license boundary is the package boundary: nothing GPL lives
+under `crates/`.
+
 ## Install
 
 Generic installer (binary + systemd unit + config; keeps any existing

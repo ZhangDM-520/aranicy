@@ -70,11 +70,17 @@ fn unix_secs(t: SystemTime) -> u64 {
 
 /// Weight-free per-sample score (the loop breaker): lavd's lat_cri formula
 /// shape with `weight_ft := 1`, so our applied nice can never feed back into
-/// the signal that justifies the bias. `None` when any freq/runtime field is
-/// zero (= absent under lenient parsing): such samples are skipped, never
-/// guessed.
+/// the signal that justifies the bias.
+///
+/// `wait_freq == 0` and `wake_freq == 0` are MEANINGFUL zeros, not missing
+/// fields: a compiler burning a core has no wait events and does not wake
+/// anyone (its children are forked, not woken), and "long runtime, no
+/// sleeps" is the canonical BULK case. Skipping such samples would blind the
+/// classifier to exactly the workloads the bias exists for (measured:
+/// cc1plus never sleeps and wakes nobody while compiling). Only a zero
+/// `avg_runtime_wall` means "no evidence": the task never ran in the window.
 pub fn sample_score(s: &SchedSample) -> Option<u64> {
-    if s.wait_freq == 0 || s.wake_freq == 0 || s.avg_runtime_wall == 0 {
+    if s.avg_runtime_wall == 0 {
         return None;
     }
     let wait_ft = s.wait_freq.min(100_000) + 1;
@@ -209,6 +215,9 @@ struct Entry {
     cpu_util_ewma: f64,
     demand_ewma: f64,
     util_init: bool,
+    /// `score_ema` holds a real observation (a genuine 0.0 score must not be
+    /// re-used as the "uninitialized" sentinel).
+    score_init: bool,
     starved: bool,
     win_score_sum: u64,
     win_score_n: u64,
@@ -283,6 +292,7 @@ impl Entry {
             cpu_util_ewma: 0.0,
             demand_ewma: 0.0,
             util_init: false,
+            score_init: false,
             starved: false,
             win_score_sum: 0,
             win_score_n: 0,
@@ -365,10 +375,11 @@ impl Entry {
         }
         let score_mean = if self.win_score_n > 0 {
             let mean = self.win_score_sum as f64 / self.win_score_n as f64;
-            if self.score_ema == 0.0 {
-                self.score_ema = mean;
-            } else {
+            if self.score_init {
                 self.score_ema += (mean - self.score_ema) * alpha;
+            } else {
+                self.score_ema = mean;
+                self.score_init = true;
             }
             Some(mean)
         } else {
@@ -697,6 +708,9 @@ impl BiasEngine {
             let confidence = es.confidence.clamp(0.0, 1.0);
             let mut e = Entry::new(es.last_seen);
             e.score_ema = es.score_ema;
+            // 0.0 is a real score (a never-sleeping, never-waking task); the
+            // persisted value is always a real observation.
+            e.score_init = true;
             e.sample_count_ewma = es.sample_count_ewma;
             e.class = es.class;
             e.bias = es.bias.clamp(self.cfg.min_bias, self.cfg.max_bias);
@@ -1004,9 +1018,23 @@ mod tests {
             sample_score(&sample("x", 200_000, 200_000, 1_000_000_000, 0, 0)),
             Some(1089)
         );
-        // zero (= absent) freq/runtime fields: skipped, never guessed
-        assert_eq!(sample_score(&sample("x", 0, 100, 1_000_000_000, 0, 0)), None);
-        assert_eq!(sample_score(&sample("x", 100, 0, 1_000_000_000, 0, 0)), None);
+        // A never-sleeping task that wakes nobody is still evidence: both
+        // frequencies are meaningful zeros, so the score is the runtime term
+        // alone. wait_ft = 1, wake_ft = 1, runtime_ft = 1 -> log2 sum 0.
+        assert_eq!(
+            sample_score(&sample("x", 0, 0, 1_000_000_000, 0, 0)),
+            Some(0)
+        );
+        // wait_ft = 1, wake_ft = 101 -> ilog2 = 6, runtime_ft = 1
+        assert_eq!(
+            sample_score(&sample("x", 0, 100, 1_000_000_000, 0, 0)),
+            Some(36)
+        );
+        assert_eq!(
+            sample_score(&sample("x", 100, 0, 1_000_000_000, 0, 0)),
+            Some(36)
+        );
+        // Never running in the window = no evidence at all.
         assert_eq!(sample_score(&sample("x", 100, 100, 0, 0, 0)), None);
     }
 
@@ -1681,8 +1709,10 @@ mod tests {
         drive_bulk(&mut eng, &["app"]); // class Bulk, confidence 0.75
         let conf = snap_entry(&eng, "app").confidence;
 
-        let unscored: Batch = (0..10)
-            .map(|_| sample("app", 0, 31, 1_000_000_000, 500, 500))
+        // >= min_samples so the window reaches the scoring gate rather than
+        // being held as sparse.
+        let unscored: Batch = (0..32)
+            .map(|_| sample("app", 0, 31, 0, 500, 500))
             .collect();
         eng.record_batch(&unscored, ts(181));
         eng.record_batch(&[], ts(241));
@@ -1694,6 +1724,71 @@ mod tests {
             conf,
             e.confidence
         );
+    }
+
+    /// A CPU-bound compiler has `wait_freq == 0` AND `wake_freq == 0`: a
+    /// genuine zero score (not a missing field) must classify BULK, and the
+    /// next non-zero window must EWMA from that real zero instead of treating
+    /// it as the "uninitialized" sentinel.
+    #[test]
+    fn zero_score_compiler_batch_is_bulk() {
+        fn compiler_batch(name: &str, n: usize) -> Batch {
+            (0..n)
+                .map(|_| sample(name, 0, 0, 900_000_000, 1000, 1000))
+                .collect()
+        }
+
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_class(&mut eng, &["cc1plus"], compiler_batch);
+        assert_eq!(snap_entry(&eng, "cc1plus").class, BiasClass::Bulk);
+        assert_eq!(
+            snap_entry(&eng, "cc1plus").score_ema,
+            0.0,
+            "a zero score is a real observation"
+        );
+
+        let mut w = noise_batch(60);
+        w.extend((0..32).map(|_| sample("cc1plus", 31, 31, 1_000_000_000, 500, 500)));
+        eng.record_batch(&w, ts(181));
+        eng.record_batch(&[], ts(241));
+        // The 32 compiler samples score 100; smoothing from the real zero
+        // gives 100 * (1 - e^-1) ~= 63.2, while treating 0.0 as
+        // "uninitialized" would snap the EMA to 100.
+        let e = snap_entry(&eng, "cc1plus");
+        assert!(
+            e.score_ema > 0.0 && e.score_ema < 99.0,
+            "score_ema must smooth from the real zero: {}",
+            e.score_ema
+        );
+    }
+
+    #[test]
+    fn starved_gate_honours_custom_thresholds() {
+        // A floor above any possible demand keeps the gate shut.
+        let cfg = BiasConfig {
+            starved_min_demand: 1500,
+            ..BiasConfig::default()
+        };
+        let mut eng = BiasEngine::new(cfg);
+        drive_class(&mut eng, &["starved"], starved_batch);
+        ramp_attack(&mut eng);
+        tick(&mut eng, 400);
+        assert_eq!(
+            snap_entry(&eng, "starved").bias,
+            0,
+            "demand 1000 < starved_min_demand 1500"
+        );
+
+        // A permissive ratio lets a moderately shared task through.
+        let cfg = BiasConfig {
+            starved_ratio: 0.99,
+            starved_min_demand: 10,
+            ..BiasConfig::default()
+        };
+        let mut eng = BiasEngine::new(cfg);
+        drive_class(&mut eng, &["starved"], starved_batch);
+        ramp_attack(&mut eng);
+        assert_eq!(snap_entry(&eng, "starved").bias, -1);
     }
 
     #[test]
