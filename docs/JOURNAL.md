@@ -278,3 +278,5 @@ no action files exist for them. Memory architecture: see `AGENTS.md`.
 ## 2026-11-07 — v0.3.0 external review (2 blockers/3 majors/2 minors) fixed: in-flight runtime, pid identity (fork/exec/comm), IRQ wake gate, mid-window pids, event-server bind/requeue/condvar/batch-read, score sentinel, config+caps+docs — both gates green, disposition filed, committed and pushed. → `.logs/action-2026-11-07-collector-review-fixes.md`
 
 ## 2026-11-07 — cross-scheduler gate PASSED: lavd (baseline), plain EEVDF, scx_bpfland all feed the collector (8 fields, exec stream unresolved=0, bias changes incl. a fresh-name ramp); collector packaging root cause isolated to makepkg's `-flto=auto` in CFLAGS/LDFLAGS breaking the vendored libbpf archive — options pending owner decision.
+
+## 2026-11-07 — collector packaging decided and implemented: split package (MIT daemon + GPL-2.0 collector, exact pin), distro libbpf (root cause: makepkg `-flto=auto` breaks the vendored archive at ld.lld); `contrib/PKGBUILD` + gsa `packages/stable/aranicy` updated (gsa pinned to commit 922a3ed, commit b1c1124 local). → `.logs/action-2026-11-07-collector-review-fixes.md`
