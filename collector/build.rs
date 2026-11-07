@@ -16,8 +16,18 @@ fn main() {
     let dst = out_dir.join("collector.bpf.o");
     let clang = env::var("CLANG").unwrap_or_else(|_| "clang".to_owned());
 
+    // `-fdebug-compilation-dir=.` keeps the build directory out of the DWARF
+    // (and therefore out of the shipped binary): makepkg's srcdir-reference
+    // lint flagged the embedded BPF object for it.
     let out = Command::new(&clang)
-        .args(["-g", "-O2", "-Wall", "-target", "bpf"])
+        .args([
+            "-g",
+            "-O2",
+            "-Wall",
+            "-target",
+            "bpf",
+            "-fdebug-compilation-dir=.",
+        ])
         .arg(format!(
             "-D__TARGET_ARCH_{}",
             match env::var("CARGO_CFG_TARGET_ARCH")

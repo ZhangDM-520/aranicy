@@ -1,45 +1,87 @@
 # Maintainer: ZhangDM-520
-# Packager note: staging PKGBUILD; validated with bash -n and
-# makepkg --printsrcinfo once the binary ships. Conflicts with ananicy-cpp
-# (both own the auto-nice role and /etc/ananicy.d).
+#
+# Split package: `aranicy` (MIT) + `aranicy-collector` (GPL-2.0-only).
+#
+# The collector is a separate binary package on purpose:
+#   * license boundary — it links GPL-2.0-only scx_stats and ships a GPL-2.0
+#     BPF object, while aranicy itself stays MIT;
+#   * lifecycle — systemd owns it; aranicy summons it via Requires=/After= and
+#     waits for its sockets at startup;
+#   * capability boundary — the collector is the only BPF owner, so aranicy
+#     runs without CAP_BPF/CAP_PERFMON/CAP_SYS_ADMIN.
+#
+# libbpf: the collector links the DISTRO libbpf (`libbpf-rs` is declared with
+# default-features = false). The vendored static archive is built with the
+# ambient CFLAGS, and makepkg's global `lto` option adds `-flto=auto`, which
+# turns it into an LTO archive that the final ld.lld link cannot consume
+# (every bpf_* symbol undefined). Linking libbpf.so also gives security
+# updates through the package manager.
+#
+# Release note: `sha256sums` is pinned by the release wave once `v$pkgver` is
+# tagged (`makepkg` uses the local `$pkgbase-$pkgver.tar.gz` until then).
 
-pkgname=aranicy
-pkgver=0.2.3
+pkgbase=aranicy
+pkgname=('aranicy' 'aranicy-collector')
+pkgver=0.3.0
 pkgrel=1
-pkgdesc="Auto-nice daemon in Rust (eBPF exec events, ananicy-compatible rules)"
+pkgdesc="Auto-nice daemon in Rust (ananicy-compatible rules, learned nice bias)"
 arch=('x86_64')
 url="https://github.com/ZhangDM-520/aranicy"
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'libelf' 'zlib')
-makedepends=('cargo' 'clang' 'llvm')
-provides=('ananicy-cpp')
-conflicts=('ananicy-cpp')
-backup=('etc/ananicy.d/ananicy.conf')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('44e691d533da7d5cf6c83317b85a1a84886fe09a45a4052e7c519777c178816a')
+makedepends=('cargo' 'clang' 'llvm' 'libbpf' 'pkgconf')
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
 
 prepare() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgbase-$pkgver"
     cargo fetch --locked
+    ( cd collector && cargo fetch --locked )
 }
 
 build() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgbase-$pkgver"
+    # Keep the build path out of panic messages (namcap "reference to $srcdir")
+    # and make the binaries independent of where they were compiled.
+    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=$pkgbase-$pkgver"
     cargo build --frozen --release
+    ( cd collector && cargo build --frozen --release )
 }
 
 check() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgbase-$pkgver"
     cargo test --frozen --workspace
+    ( cd collector && cargo test --frozen )
 }
 
-package() {
-    cd "$pkgname-$pkgver"
+package_aranicy() {
+    cd "$pkgbase-$pkgver"
+    depends=('glibc' 'gcc-libs' "aranicy-collector=$pkgver")
+    license=('MIT')
+    provides=('ananicy-cpp')
+    conflicts=('ananicy-cpp')
+    backup=('etc/ananicy.d/ananicy.conf')
+
     install -Dm755 target/release/aranicy "$pkgdir/usr/bin/aranicy"
     install -Dm644 contrib/ananicy.service \
         "$pkgdir/usr/lib/systemd/system/aranicy.service"
     install -Dm644 contrib/ananicy.conf \
         "$pkgdir/etc/ananicy.d/ananicy.conf"
-    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/aranicy/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/aranicy/README.md"
+}
+
+package_aranicy-collector() {
+    cd "$pkgbase-$pkgver"
+    depends=('glibc' 'gcc-libs' 'libbpf')
+    license=('GPL-2.0-only')
+    conflicts=('aranicy<0.3.0')
+
+    install -Dm755 collector/target/release/aranicy-collectord \
+        "$pkgdir/usr/bin/aranicy-collectord"
+    install -Dm644 contrib/aranicy-collector.service \
+        "$pkgdir/usr/lib/systemd/system/aranicy-collector.service"
+    install -Dm644 collector/LICENSE \
+        "$pkgdir/usr/share/licenses/aranicy-collector/LICENSE"
+    install -Dm644 README.md \
+        "$pkgdir/usr/share/doc/aranicy-collector/README.md"
 }

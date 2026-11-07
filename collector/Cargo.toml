@@ -24,7 +24,13 @@ anyhow = "1"
 aranicy-procname = { path = "../crates/aranicy-procname" }
 aranicy-wire = { path = "../crates/aranicy-wire" }
 clap = { version = "4", features = ["derive"] }
-libbpf-rs = "0.27"
+# No default features: that is `libbpf-sys/vendored-libbpf`, which compiles a
+# static libbpf.a with the ambient CFLAGS. Under makepkg those carry
+# `-flto=auto`, and the resulting LTO archive cannot be consumed by the final
+# `ld.lld` link (every bpf_* symbol comes out undefined). Linking the distro
+# `libbpf` avoids that class of failure entirely and gets security updates from
+# the package manager.
+libbpf-rs = { version = "0.27", default-features = false }
 libc = "0.2"
 scx_stats = "1.1.4"
 scx_stats_derive = "1.1.4"

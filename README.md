@@ -74,6 +74,14 @@ collector automatically; aranicy itself then needs only `CAP_SYS_NICE` (no
 `CAP_BPF`). The license boundary is the package boundary: nothing GPL lives
 under `crates/`.
 
+`contrib/PKGBUILD` builds both as one split package: `aranicy` depends on
+`aranicy-collector=$pkgver` (the socket contract is internal, so the pair moves
+in lockstep). The collector links the **distro** `libbpf` rather than a vendored
+static copy: makepkg's global `lto` option adds `-flto=auto` to CFLAGS/LDFLAGS,
+which turns a vendored `libbpf.a` into an LTO archive that the final `ld.lld`
+link cannot consume. `libbpf` is therefore a runtime dependency; `cargo`, `clang`
+and `llvm` are build dependencies for the BPF object.
+
 ## Install
 
 Generic installer (binary + systemd unit + config; keeps any existing

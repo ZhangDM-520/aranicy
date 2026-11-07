@@ -99,6 +99,11 @@ core tracepoints (`sched_switch`, `sched_waking`/`sched_wakeup`,
 depends on what the scheduler exposes — `scx_lavd`/`scx_mavd`, any other
 `sched_ext` scheduler, and plain EEVDF all behave identically.
 
+Runtime dependencies: the daemon needs only glibc/gcc-libs; the collector links
+the distro `libbpf` (plus clang-built BPF objects at build time). It ships
+`libbpf`-version-independent behaviour because every kernel interaction goes
+through libbpf's stable API.
+
 The sampler speaks the `scx_stats` protocol to whatever server is bound at
 `sched_collector_socket` (default the collector's
 `/run/aranicy/collector-stats.sock`) and reconnects with backoff if it goes

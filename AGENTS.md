@@ -222,10 +222,14 @@ protocol notes below are historical; the general test/fixture pitfalls remain li
 - Event-socket bind must happen before the serve thread starts, otherwise a
   bind failure leaves a "healthy" collector with no event stream; and a frame
   popped before a failed write must be pushed back, or a daemon restart eats it.
-- makepkg's environment fails to link the vendored libbpf for the collector
-  binary (`undefined symbol: bpf_map__*`) although the same build succeeds
-  with plain `cargo build --release`; `--no-as-needed` and dropping `--frozen`
-  did not help. Packaging of the collector is an open item.
+- makepkg's global `lto` option injects `-flto=auto` into CFLAGS/CXXFLAGS **and
+  LDFLAGS**. A vendored static libbpf built with those CFLAGS is an LTO archive,
+  and the final Rust link (cc/ccache → `ld.lld`) cannot consume it: every
+  `bpf_*` symbol comes out undefined, while the same tree links fine with plain
+  `cargo build --release`. The collector therefore declares `libbpf-rs` with
+  `default-features = false` and links the distro `libbpf` (one `libbpf`
+  dependency instead of a vendored C build). `--no-as-needed` does not help;
+  only removing `-flto=auto` or dropping the vendored archive does.
 
 ## Bias-engine config defaults — Last reviewed: 2026-10-31 (verify against `crates/aranicy-daemon/src/config.rs`; do not re-derive)
 
