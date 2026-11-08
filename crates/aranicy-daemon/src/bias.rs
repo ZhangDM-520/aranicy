@@ -520,6 +520,14 @@ impl Entry {
     }
 
     fn attack_ready(&self, cfg: &BiasConfig, now: u64) -> bool {
+        // No evidence, no attack. A confidence-0 entry (aged out, or restored
+        // from a zero-confidence state) has nothing backing a ramp, and the
+        // aging pass would flush the step in the same iteration — it only
+        // spends the shared global step and re-arms the FIFO (AGENTS.md, "Open
+        // finding — no-op attack cycle").
+        if self.durable.confidence <= 0.0 {
+            return false;
+        }
         self.live.want_since_attack.is_some_and(|w| {
             now >= w.saturating_add(cfg.attack_step_s)
                 && self.live.last_step_attack.is_none_or(|l| {
@@ -1436,6 +1444,40 @@ mod tests {
         let e = snap_entry(&eng, "app");
         assert_eq!(e.confidence, 0.0);
         assert_eq!(e.bias, 0);
+    }
+
+    #[test]
+    fn zero_confidence_entries_do_not_spend_the_global_step() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let entry = |name: &str, confidence: f64| EntrySnapshot {
+            name: name.into(),
+            durable: Durable {
+                class: BiasClass::Bulk,
+                bias: 0,
+                confidence,
+                last_seen: 1,
+                ..Durable::default()
+            },
+        };
+        eng.restore(BiasSnapshot {
+            version: BIAS_STATE_VERSION,
+            threshold_ema: None,
+            entries: vec![entry("aaa_zombie", 0.0), entry("zzz_live", 0.5)],
+        });
+
+        // The first pass stamps both attack wants; the second is past
+        // attack_step_s, so the FIFO would hand the single global step to
+        // "aaa_zombie" — which has no evidence to back a ramp, and whose step
+        // the aging pass would flush anyway.
+        eng.ingest(&[], ts(0));
+        let changes = eng.ingest(&[], ts(31));
+        assert_eq!(
+            changes,
+            vec![change("zzz_live", 0, 1, BiasClass::Bulk, Cause::Evidence)],
+            "the step must go to the entry with evidence"
+        );
+        assert_eq!(snap_entry(&eng, "aaa_zombie").bias, 0);
+        assert_eq!(snap_entry(&eng, "zzz_live").bias, 1);
     }
 
     #[test]
