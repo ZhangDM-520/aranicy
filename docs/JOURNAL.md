@@ -280,3 +280,7 @@ no action files exist for them. Memory architecture: see `AGENTS.md`.
 ## 2026-11-07 — cross-scheduler gate PASSED: lavd (baseline), plain EEVDF, scx_bpfland all feed the collector (8 fields, exec stream unresolved=0, bias changes incl. a fresh-name ramp); collector packaging root cause isolated to makepkg's `-flto=auto` in CFLAGS/LDFLAGS breaking the vendored libbpf archive — options pending owner decision.
 
 ## 2026-11-07 — collector packaging decided and implemented: split package (MIT daemon + GPL-2.0 collector, exact pin), distro libbpf (root cause: makepkg `-flto=auto` breaks the vendored archive at ld.lld); `contrib/PKGBUILD` + gsa `packages/stable/aranicy` updated (gsa pinned to commit 922a3ed, commit b1c1124 local). → `.logs/action-2026-11-07-collector-review-fixes.md`
+
+## 2026-11-08 — `--reload` liveness: config key liveness table (`CONFIG_KEYS`), `BiasEngine::reconfigure` (clamp + target + group re-key/merge), reload now reports `bias reconfigured` and names restart-only keys; `x3d_mode` warns, `turbo-cores`/`x3d-*` docs match the applier — both gates green. → `.logs/action-2026-11-08-reload-liveness.md`
+
+## 2026-11-08 — architecture wave 1: sample contract owned by `aranicy_wire::Sample`, explicit observation budget (measured 8 192 rows), `decision` module unifies exec+drift (daemon.rs 896→654), reload reconfigures via a liveness table and names restart-only keys; wave-2 design filed (order 6→4→7) — both gates green. → `.logs/action-2026-11-08-arch-wave1.md`

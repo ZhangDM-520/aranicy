@@ -3,6 +3,14 @@
 //! Syntax: `key = value` per line, first `=` splits, both sides trimmed,
 //! `#` comments and blank lines skipped. Unknown keys are reported in
 //! [`Config::warnings`] (superset) but never fatal.
+//!
+//! # Reload liveness
+//!
+//! Every key is classified exactly once in [`CONFIG_KEYS`]: `live` keys are
+//! re-read per event/drift scan (or by the reload's own load pass),
+//! `reconfigurable` keys reach the running [`crate::bias::BiasEngine`] through
+//! `reconfigure`, and `restart-only` keys are captured at startup — the reload
+//! reports those by name instead of pretending it applied them.
 
 use std::path::Path;
 
@@ -50,6 +58,107 @@ pub struct Config {
     /// once at startup (invalid regexes are warned and skipped there).
     pub bias_groups: Vec<(String, String)>,
     pub warnings: Vec<String>,
+}
+
+/// How a config key reacts to `aranicy --reload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// Re-read per event / drift scan, or re-applied by the reload's own
+    /// load pass (the `*_load` gates): the swap alone is enough.
+    Live,
+    /// Applied to the running bias engine by
+    /// [`crate::bias::BiasEngine::reconfigure`].
+    Reconfigurable,
+    /// Captured once at startup (sockets, thread cadence, log filter, engine
+    /// lifetime). A reload names these; it cannot apply them.
+    RestartOnly,
+    /// Accepted for ananicy-cpp compatibility but never read by any code
+    /// path; warned at load so it stops being a silent no-op.
+    AcceptedOnly,
+}
+
+/// One row of the key table (see [`CONFIG_KEYS`]).
+#[derive(Debug, Clone, Copy)]
+pub struct KeySpec {
+    /// Canonical spelling; `bias_group.*` stands for every tag.
+    pub key: &'static str,
+    /// How a reload treats it.
+    pub liveness: Liveness,
+    /// Whether two configs differ for this key.
+    differs: fn(&Config, &Config) -> bool,
+}
+
+impl KeySpec {
+    /// True when `old` and `new` disagree on this key's value.
+    pub fn differs(&self, old: &Config, new: &Config) -> bool {
+        (self.differs)(old, new)
+    }
+}
+
+/// Generates the per-key differ (so the table owns both the name and the
+/// field) plus [`CONFIG_KEYS`]. Adding a config field without a row here is
+/// what the `every_config_field_has_one_row` test catches.
+macro_rules! config_key_table {
+    ($($key:literal => $live:ident . $field:ident;)*) => {
+        mod key_diff {
+            use super::Config;
+            $(
+                pub(super) fn $field(old: &Config, new: &Config) -> bool {
+                    old.$field != new.$field
+                }
+            )*
+        }
+
+        /// Single source of truth for reload liveness: one row per key, no
+        /// second hand-written list. `warnings` is parser output, not a key.
+        pub const CONFIG_KEYS: &[KeySpec] = &[
+            $(KeySpec {
+                key: $key,
+                liveness: Liveness::$live,
+                differs: key_diff::$field,
+            }),*
+        ];
+    };
+}
+
+config_key_table! {
+    // Live: re-read per event / drift scan or by the reload's load pass.
+    "check_freq" => Live . check_freq;
+    "cgroup_load" => Live . cgroup_load;
+    "type_load" => Live . type_load;
+    "rule_load" => Live . rule_load;
+    "apply_nice" => Live . apply_nice;
+    "apply_latnice" => Live . apply_latnice;
+    "apply_ionice" => Live . apply_ionice; // alias: apply_ioclass
+    "apply_sched" => Live . apply_sched;
+    "apply_oom_score_adj" => Live . apply_oom_score_adj;
+    "apply_cgroup" => Live . apply_cgroup;
+    "apply_cpuset" => Live . apply_cpuset;
+    "apply_autogroup" => Live . apply_autogroup;
+    "cgroup_realtime_workaround" => Live . cgroup_realtime_workaround; // apply options
+    "log_applied_rule" => Live . log_applied_rule;
+    // Reconfigurable: BiasEngine::reconfigure (no restart needed).
+    "bias_min" => Reconfigurable . bias_min;
+    "bias_max" => Reconfigurable . bias_max;
+    "bias_window_s" => Reconfigurable . bias_window_s;
+    "bias_deadband_pct" => Reconfigurable . bias_deadband_pct;
+    "bias_min_samples" => Reconfigurable . bias_min_samples;
+    "bias_max_entries" => Reconfigurable . bias_max_entries;
+    "bias_half_life_s" => Reconfigurable . bias_half_life_s;
+    "bias_starved_min_demand" => Reconfigurable . bias_starved_min_demand;
+    "bias_starved_ratio" => Reconfigurable . bias_starved_ratio;
+    // Changing a family re-keys the history (the tag IS the history key).
+    "bias_group.*" => Reconfigurable . bias_groups;
+    // Restart-only: captured at startup, named by the reload.
+    "bias_enable" => RestartOnly . bias_enable;
+    "bias_cadence_ms" => RestartOnly . bias_cadence_ms;
+    "bias_state_path" => RestartOnly . bias_state_path;
+    "bias_collector_socket" => RestartOnly . bias_collector_socket;
+    "collector_events_socket" => RestartOnly . collector_events_socket;
+    "collector_wait_ms" => RestartOnly . collector_wait_ms;
+    "loglevel" => RestartOnly . loglevel;
+    // Accepted for compatibility, applied by nothing (warned at load).
+    "x3d_mode" => AcceptedOnly . x3d_mode;
 }
 
 impl Default for Config {
@@ -147,6 +256,15 @@ impl Config {
                     const MODES: [&str; 3] = ["auto", "cache", "frequency"];
                     if MODES.contains(&value) {
                         cfg.x3d_mode = value.to_string();
+                        // Parsed for ananicy-cpp compatibility, but no code
+                        // path reads it (3D V-Cache mode is host-controlled,
+                        // and `x3d-*` cpuset aliases are runtime-rejected).
+                        // Warn at load so it stops being a silent no-op.
+                        cfg.warnings.push(format!(
+                            "line {}: x3d_mode = {value} accepted for compatibility but not applied \
+                             (3D V-Cache mode is host-controlled)",
+                            idx + 1
+                        ));
                     } else {
                         bad(&mut cfg, "x3d_mode");
                     }
@@ -271,6 +389,30 @@ impl Config {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Every key whose value differs between `self` and `new`, sorted
+    /// (canonical `bias_group.*` spelling for the family list).
+    pub fn changed_keys(&self, new: &Self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = CONFIG_KEYS
+            .iter()
+            .filter(|spec| spec.differs(self, new))
+            .map(|spec| spec.key)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Keys a reload cannot apply (captured at startup), sorted — the names a
+    /// reload reports as deferred so an edit is never silently dropped.
+    pub fn restart_only_changed(&self, new: &Self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = CONFIG_KEYS
+            .iter()
+            .filter(|spec| spec.liveness == Liveness::RestartOnly && spec.differs(self, new))
+            .map(|spec| spec.key)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// Map the `bias_*` config keys onto the bias engine's knobs (plan.md §4.3).
@@ -440,5 +582,98 @@ mod tests {
         let bad = Config::parse("bias_starved_ratio = 3.0\n");
         assert!((bad.bias_starved_ratio - 0.5).abs() < f64::EPSILON);
         assert_eq!(bad.warnings.len(), 1);
+    }
+
+    #[test]
+    fn restart_only_changed_names_exactly_the_deferred_keys() {
+        let old = Config::parse("collector_wait_ms = 5000\nloglevel = info\n");
+        let new = Config::parse("collector_wait_ms = 9000\nloglevel = debug\n");
+        assert_eq!(
+            old.restart_only_changed(&new),
+            vec!["collector_wait_ms", "loglevel"]
+        );
+        // …and nothing else is reported as deferred for the same edit
+        assert_eq!(old.changed_keys(&new), vec!["collector_wait_ms", "loglevel"]);
+
+        // Reconfigurable and live keys are NOT deferred (a reload applies them)
+        let applied = Config::parse("bias_window_s = 5\napply_nice = false\nbias_group.b = ^b$\n");
+        assert!(old.restart_only_changed(&applied).is_empty());
+        assert_eq!(old.changed_keys(&applied), vec!["apply_nice", "bias_group.*", "bias_window_s"]);
+
+        // Identical configs defer nothing
+        assert!(old.restart_only_changed(&old).is_empty());
+    }
+
+    /// Every field must have exactly one row in the liveness table — the table
+    /// is the only place that decides what a reload can apply. A new field
+    /// breaks this literal (compile error) and then this equality (no row).
+    #[test]
+    fn every_config_field_has_one_row() {
+        let sentinel = Config {
+            check_freq: 1,
+            cgroup_load: false,
+            type_load: false,
+            rule_load: false,
+            apply_nice: false,
+            apply_latnice: false,
+            apply_ionice: false,
+            apply_sched: false,
+            apply_oom_score_adj: false,
+            apply_cgroup: false,
+            apply_cpuset: false,
+            apply_autogroup: false,
+            cgroup_realtime_workaround: false,
+            loglevel: "trace".into(),
+            log_applied_rule: true,
+            x3d_mode: "cache".into(),
+            bias_enable: false,
+            bias_collector_socket: "/run/x/stats.sock".into(),
+            collector_events_socket: "/run/x/events.sock".into(),
+            collector_wait_ms: 1,
+            bias_starved_min_demand: 1,
+            bias_starved_ratio: 0.1,
+            bias_min: -10,
+            bias_max: 17,
+            bias_window_s: 1,
+            bias_deadband_pct: 1,
+            bias_min_samples: 1,
+            bias_cadence_ms: 1,
+            bias_max_entries: 1,
+            bias_half_life_s: 1,
+            bias_state_path: "/var/lib/aranicy/other".into(),
+            bias_groups: vec![("g".into(), "^x$".into())],
+            warnings: Vec::new(),
+        };
+        let changed = Config::default().changed_keys(&sentinel);
+        assert_eq!(
+            changed.len(),
+            CONFIG_KEYS.len(),
+            "a config field without a liveness row: {changed:?}"
+        );
+        let mut unique = changed.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), changed.len(), "duplicate key rows");
+
+        let count = |l: Liveness| CONFIG_KEYS.iter().filter(|s| s.liveness == l).count();
+        assert_eq!(count(Liveness::Live), 14);
+        assert_eq!(count(Liveness::Reconfigurable), 10);
+        assert_eq!(count(Liveness::RestartOnly), 7);
+        assert_eq!(count(Liveness::AcceptedOnly), 1);
+    }
+
+    #[test]
+    fn x3d_mode_warns_that_it_is_not_applied() {
+        // Accepted for ananicy-cpp compatibility, read by nothing: the load
+        // must say so instead of silently ignoring the key.
+        let cfg = Config::parse("x3d_mode = cache\n");
+        assert_eq!(cfg.x3d_mode, "cache");
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(
+            cfg.warnings[0].contains("x3d_mode") && cfg.warnings[0].contains("not applied"),
+            "warnings: {:?}",
+            cfg.warnings
+        );
+        // The default (key absent) stays silent.
+        assert!(Config::parse("check_freq = 30\n").warnings.is_empty());
     }
 }

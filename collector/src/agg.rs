@@ -5,34 +5,32 @@
 //! two snapshots, so the arithmetic is deterministic and unit-testable with
 //! an injected clock.
 //!
-//! ## Unit contract (mirrored in docs/COMPATIBILITY.md)
+//! ## Unit contract
 //!
-//! * `wait_freq`, `wake_freq` — events per second over the window.
-//! * `avg_runtime_wall`   — mean nanoseconds per schedule.
-//! * `task_util_est`      — DEMAND: requested duty cycle (running + runnable),
-//!   0..1024 (1024 = one full CPU). Named after the lavd field the bias
-//!   engine reads; lavd itself only accumulates running time, which cannot
-//!   express demand because a task that never sleeps would read as 0 wait.
-//! * `cpu_util_wall`      — DELIVERED: running duty cycle, same 0..1024
-//!   scale. Starvation is `delivered < ratio * demand`, so demand must be the
-//!   requested total, not the unmet part.
-//! * `static_prio`        — nice + 20 (lavd wire convention).
+//! The sample fields, their units and their scales are defined once, on
+//! [`aranicy_wire::Sample`]; this module only produces that type. In short:
+//! `wait_freq`/`wake_freq` are events per second, `avg_runtime_wall` is
+//! nanoseconds per schedule, `task_util_est` is DEMAND (running + runnable
+//! duty) and `cpu_util_wall` is DELIVERED (running duty), both on the same
+//! 0..[`MAX_UTIL`] scale so starvation is `delivered < ratio * demand`, and
+//! `static_prio` is nice + [`NICE_OFFSET`].
 //!
-//! lavd emits demand in 0..1024 and delivered in 0..100 (percent), and the
-//! starved gate compares them raw, which makes the comparison meaningless.
-//! Both are normalized to 0..1024 here so `delivered < ratio * demand` is a
-//! real statement about share starvation.
+//! `task_util_est` is named after the lavd field the bias engine reads; lavd
+//! itself only accumulates running time, which cannot express demand because
+//! a task that never sleeps would read as 0 wait. lavd also emits demand in
+//! 0..1024 and delivered in 0..100 (percent), and the starved gate compares
+//! them raw, which makes the comparison meaningless. Both are normalized to
+//! 0..[`MAX_UTIL`] here so `delivered < ratio * demand` is a real statement
+//! about share starvation.
 //!
 //! PELT is deliberately not used: `se.avg.*` is a FAIR-class path and stays
 //! zero under sched_ext schedulers (measured on the development host).
 
 use std::collections::BTreeMap;
 
-pub const TASK_COMM_LEN: usize = 16;
+pub use aranicy_wire::{MAX_UTIL, Sample};
 
-/// One full CPU in the normalized utilization scale (scx uses the same
-/// constant, `1 << 10`).
-pub const MAX_UTIL: u64 = 1024;
+pub const TASK_COMM_LEN: usize = 16;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -96,20 +94,6 @@ impl RawAcc {
 
 /// pid -> accumulator, as drained from the BPF map.
 pub type Snapshot = BTreeMap<u32, RawAcc>;
-
-/// One row handed to the bias engine (field names follow the lavd wire form
-/// so the existing client binds unchanged).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Sample {
-    pub pid: u32,
-    pub comm: String,
-    pub static_prio: u64,
-    pub wait_freq: u64,
-    pub wake_freq: u64,
-    pub avg_runtime_wall: u64,
-    pub task_util_est: u64,
-    pub cpu_util_wall: u64,
-}
 
 /// Time constant of the rate smoothing. lavd keeps EWMA counts per event, so
 /// a task that slept 2 s ago still reports a small non-zero rate; an
@@ -255,7 +239,7 @@ impl Aggregator {
             }
 
             out.push(Sample {
-                pid: *pid,
+                pid: i64::from(*pid),
                 comm: c.comm_str(),
                 static_prio: u64::from(c.static_prio),
                 wait_freq: e.wait.round().max(0.0) as u64,
@@ -272,17 +256,27 @@ impl Aggregator {
         out
     }
 
-    /// Order rows for delivery: most CPU-delivered first (hot tasks), with
-    /// the comm as a stable tie-break so output is deterministic.
-    pub fn order(rows: &mut Vec<Sample>, cap: usize) {
+    /// Order rows for delivery and cut them to `cap`, returning how many rows
+    /// the cut dropped (the observation budget's cost, reported on the wire).
+    ///
+    /// Sort by DEMAND (`task_util_est`) first: `task_util_est >=
+    /// cpu_util_wall` by construction (running + runnable vs running), so
+    /// demand ordering still puts hot tasks first while retaining a starved
+    /// RESPONSIVE task — high demand, low delivered — that delivered-first
+    /// ordering would cut first. That task is exactly what the starved gate
+    /// exists for, and a name that never appears never learns.
+    /// `cpu_util_wall`, `comm`, `pid` are deterministic tie-breaks.
+    pub fn order(rows: &mut Vec<Sample>, cap: usize) -> u32 {
+        let dropped = rows.len().saturating_sub(cap);
         rows.sort_by(|a, b| {
-            b.cpu_util_wall
-                .cmp(&a.cpu_util_wall)
-                .then_with(|| b.task_util_est.cmp(&a.task_util_est))
+            b.task_util_est
+                .cmp(&a.task_util_est)
+                .then_with(|| b.cpu_util_wall.cmp(&a.cpu_util_wall))
                 .then_with(|| a.comm.cmp(&b.comm))
                 .then_with(|| a.pid.cmp(&b.pid))
         });
         rows.truncate(cap);
+        u32::try_from(dropped).unwrap_or(u32::MAX)
     }
 }
 
@@ -522,9 +516,46 @@ mod tests {
             ..Sample::default()
         };
         let mut rows = vec![mk("cold", 10, 10), mk("hot", 900, 900), mk("warm", 100, 900)];
-        Aggregator::order(&mut rows, 2);
+        let dropped = Aggregator::order(&mut rows, 2);
+        assert_eq!(dropped, 1);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].comm, "hot");
         assert_eq!(rows[1].comm, "warm");
+    }
+
+    /// A starved RESPONSIVE task (high demand, low delivered) must survive a
+    /// cut that delivered-first ordering would have dropped. This is the
+    /// observation-budget contract: a name that never appears never learns.
+    #[test]
+    fn demand_ordering_retains_a_starved_task() {
+        let mk = |comm: &str, cpu, demand| Sample {
+            comm: comm.to_string(),
+            cpu_util_wall: cpu,
+            task_util_est: demand,
+            ..Sample::default()
+        };
+        // Delivered-first would keep `hot` and `steady`, cutting `starved`.
+        let mut rows = vec![
+            mk("hot", 1024, 1024),
+            mk("starved", 120, 950),
+            mk("steady", 800, 800),
+        ];
+        let dropped = Aggregator::order(&mut rows, 2);
+        assert_eq!(dropped, 1);
+        let kept: Vec<&str> = rows.iter().map(|s| s.comm.as_str()).collect();
+        assert_eq!(kept, vec!["hot", "starved"]);
+    }
+
+    #[test]
+    fn order_reports_zero_when_nothing_is_dropped() {
+        let mk = |comm: &str| Sample {
+            comm: comm.to_string(),
+            cpu_util_wall: 10,
+            task_util_est: 10,
+            ..Sample::default()
+        };
+        let mut rows = vec![mk("a"), mk("b")];
+        assert_eq!(Aggregator::order(&mut rows, 2), 0);
+        assert_eq!(Aggregator::order(&mut rows, 1), 1);
     }
 }

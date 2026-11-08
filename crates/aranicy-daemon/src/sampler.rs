@@ -1,12 +1,12 @@
 //! scx_stats per-task sampling client (plan.md §4.1).
 //!
-//! Interface frozen between workstreams: [`SchedSample`] / [`Batch`].
+//! Interface frozen between workstreams: [`Sample`] / [`Batch`].
 //!
 //! Client side of the scx_stats framework protocol: one JSON line in, one
 //! JSON line out over a root-owned UNIX socket (verified live against
 //! scx_lavd 1.1.4 and the byte-identical scx_mavd schema):
 //!
-//! * `{"req":"stats","args":{"target":"<target>","nr_samples":"200"}}`
+//! * `{"req":"stats","args":{"target":"<target>","nr_samples":"512"}}`
 //!   — `nr_samples` is sent as a decimal *string*; the response envelope is
 //!   `{"errno":N,"args":{"resp":{...}}}` (on `errno != 0` the `resp` carries
 //!   a message string). Per-task targets wrap rows as `{"samples":[...]}`;
@@ -23,10 +23,11 @@
 //!   arbitrary strings that cannot be enumerated; unknown targets answer
 //!   `errno != 0`. A reachable server with only aggregate schemas degrades
 //!   with reason [`REASON_NO_PER_TASK`].
-//! * Each request arms a machine-wide budget of `nr_samples` dispatch events,
-//!   then drains a 16 KB ringbuf: at most ~60 samples per batch regardless of
-//!   `nr_samples`, silently lossy (`mseq` contiguous), hot-task biased.
-//!   Sequential round-trips only — pipelining serializes server-side.
+//! * Each request asks for the full observation budget
+//!   ([`aranicy_wire::SAMPLE_CAP`]); the response reports `truncated` — how
+//!   many rows the budget dropped — and the sampler logs that at `warn!`
+//!   (on change, at most once per minute). Sequential round-trips only —
+//!   pipelining serializes server-side.
 //! * Only one client may sample a per-task target at a time; a competing
 //!   client answers `errno != 0` with a message containing "preempted by
 //!   another sampler" (substring match, weak contract). Reconnecting reclaims
@@ -59,38 +60,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-/// One per-task sample from a scheduler's per-task stats target (`scx_stats`
-/// `SchedSample` schema — scx_lavd and scx_mavd serve it byte-identically).
-/// Parsing is lenient: unknown fields ignored, missing fields defaulted —
+/// Parse a per-task row into the shared wire sample. Parsing is lenient:
+/// unknown fields ignored, missing fields defaulted (`serde(default)`) —
 /// schemas drift across versions (`stats_meta` detects availability).
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(default)]
-pub struct SchedSample {
-    pub pid: i64,
-    pub comm: String,
-    /// 4-char flag string, e.g. "LHBG": [0]='L'|'R' latency-critical|regular,
-    /// [1] H/I, [2] B/T, [3]='G' over fair-share.
-    pub stat: String,
-    pub lat_cri: u64,
-    pub avg_lat_cri: u64,
-    pub norm_lat_cri: u64,
-    /// EWMA of sleep-interval inverse (weight-independent).
-    pub wait_freq: u64,
-    /// EWMA of wake rate (weight-independent).
-    pub wake_freq: u64,
-    pub run_freq: u64,
-    /// EWMA per-schedule runtime, nanoseconds (weight-independent).
-    pub avg_runtime_wall: u64,
-    /// Demand estimate.
-    pub task_util_est: u64,
-    /// Delivered CPU, same scale as task_util_est.
-    pub cpu_util_wall: u64,
-    /// nice + 20 (includes our own applied bias — closed-loop check).
-    pub static_prio: u64,
-}
+///
+/// Because of that leniency a *missing* field is indistinguishable from a
+/// meaningful zero (`wait_freq == 0` legitimately means "never slept"). That
+/// is deliberate for now: the collector always emits all fields, and the
+/// leniency is what keeps an older/newer server parseable.
+pub use aranicy_wire::Sample;
 
 /// One batch: at most ~60 samples (16 KB ringbuf cap), lossy, hot-task biased.
-pub type Batch = Vec<SchedSample>;
+pub type Batch = Vec<Sample>;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -98,11 +79,6 @@ pub type Batch = Vec<SchedSample>;
 
 /// Default wall-clock pacing between `sched_samples` requests.
 pub const DEFAULT_CADENCE: Duration = Duration::from_millis(500);
-
-/// Sample budget requested per batch. Sent as a decimal *string* on the wire
-/// (the server parses an integer-from-string); the 16 KB ringbuf caps actual
-/// delivery at ~60 samples per batch regardless.
-pub const NR_SAMPLES: u32 = 200;
 
 const REASON_STARTING: &str = "starting";
 const REASON_TRANSPORT: &str = "transport down";
@@ -137,6 +113,10 @@ const PREEMPT_RETRY: Duration = Duration::from_secs(7);
 /// Exponential reconnect backoff: 1 s doubling to a 30 s cap, ±25% jitter.
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// Minimum spacing of the truncation warning; an unchanged dropped count is
+/// also logged only after this much time (never once per cadence).
+const TRUNC_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Wedged-server guard for response reads. `shutdown()` still unblocks the
 /// thread immediately — it calls `shutdown(2)` on the live socket.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -182,8 +162,8 @@ impl fmt::Display for SamplerState {
     }
 }
 
-/// Field-availability snapshot of `SchedSample`, taken from `stats_meta` on
-/// every (re)connect (feature detection across lavd versions).
+/// Field-availability snapshot of the bound per-task struct, taken from
+/// `stats_meta` on every (re)connect (feature detection across versions).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldSet {
     names: BTreeSet<String>,
@@ -594,6 +574,9 @@ fn run(
 ) {
     let mut backoff = Backoff::new(tuning.backoff_start, tuning.backoff_cap);
     let mut rng = seed_rng();
+    // Observation-budget visibility survives reconnects: warn when the served
+    // window is truncated, at most once per `TRUNC_WARN_INTERVAL`.
+    let mut last_trunc_warn: Option<Instant> = None;
     'outer: loop {
         if stop.requested() {
             break;
@@ -671,11 +654,13 @@ fn run(
             }
             let req = json!({
                 "req": "stats",
-                "args": { "target": binding.target, "nr_samples": NR_SAMPLES.to_string() }
+                // Full observation budget: the collector cuts to the same
+                // number, so asking for less would silently shrink it.
+                "args": { "target": binding.target, "nr_samples": aranicy_wire::SAMPLE_CAP.to_string() }
             });
-            let batch = match conn.round_trip(&req) {
+            let (batch, truncated) = match conn.round_trip(&req) {
                 Ok(resp) => match parse_batch(&resp, &binding.rows_key) {
-                    Ok(batch) => batch,
+                    Ok(parsed) => parsed,
                     Err(detail) => {
                         // Malformed payload: close and resync via reconnect.
                         if stop.requested() {
@@ -713,6 +698,19 @@ fn run(
                     continue 'outer;
                 }
             };
+            // Interval-only: the count moves by a few rows every window, so a
+            // "changed" trigger would fire at the cadence (measured: 26
+            // warnings/min) — a flood, not a diagnostic.
+            if truncated > 0
+                && last_trunc_warn.is_none_or(|t| t.elapsed() >= TRUNC_WARN_INTERVAL)
+            {
+                tracing::warn!(
+                    truncated,
+                    rows = batch.len(),
+                    "observation budget truncated the sample window"
+                );
+                last_trunc_warn = Some(Instant::now());
+            }
             if tx.send(batch).is_err() {
                 break 'outer; // consumer is gone
             }
@@ -908,15 +906,11 @@ fn probe_target(conn: &mut Connection, candidates: &[String]) -> Result<(String,
     )))
 }
 
-/// Numeric fields of [`SchedSample`] (`pid` signed, the rest unsigned); these
-/// are the fields accepted as int-or-string.
+/// Numeric fields of [`Sample`] (`pid` signed, the rest unsigned); these are
+/// the fields accepted as int-or-string.
 const UNSIGNED_FIELDS: &[&str] = &[
-    "lat_cri",
-    "avg_lat_cri",
-    "norm_lat_cri",
     "wait_freq",
     "wake_freq",
-    "run_freq",
     "avg_runtime_wall",
     "task_util_est",
     "cpu_util_wall",
@@ -953,24 +947,23 @@ fn coerce_number(val: &Value, signed: bool) -> Option<Value> {
 }
 
 /// Canonicalisation hook for schema drift: map an on-wire field name onto
-/// [`SchedSample`]'s field names. lavd and mavd are identity (their
-/// `SchedSample` schemas are byte-identical); verified synonyms of a future
-/// schema get an arm here — never speculative guesses.
+/// [`Sample`]'s field names. The collector emits them verbatim; verified
+/// synonyms of a future schema get an arm here — never speculative guesses.
 fn canonical_field(raw: &str) -> &str {
     raw
 }
 
-/// Lenient [`SchedSample`] parse: unknown fields ignored (the schema has 38
-/// fields and drifts), numbers accepted as ints or strings, wrong-typed or
-/// missing fields defaulted via `serde(default)`.
-fn lenient_sample(raw: &Value) -> Option<SchedSample> {
+/// Lenient [`Sample`] parse: unknown fields ignored (the `scx_stats` schema
+/// carries many more fields and drifts), numbers accepted as ints or strings,
+/// wrong-typed or missing fields defaulted via `serde(default)`.
+fn lenient_sample(raw: &Value) -> Option<Sample> {
     let raw = raw.as_object()?;
     let mut norm = serde_json::Map::with_capacity(raw.len());
     for (key, val) in raw {
         let key = canonical_field(key);
         let coerced = match key {
             "pid" => coerce_number(val, true),
-            "comm" | "stat" => val.as_str().map(|_| val.clone()),
+            "comm" => val.as_str().map(|_| val.clone()),
             name if UNSIGNED_FIELDS.contains(&name) => coerce_number(val, false),
             _ => None, // unknown field: serde ignores it anyway
         };
@@ -981,16 +974,21 @@ fn lenient_sample(raw: &Value) -> Option<SchedSample> {
     serde_json::from_value(Value::Object(norm)).ok()
 }
 
-/// `resp` → [`Batch`] via the bound row-container key (see [`rows_key`]).
-/// Unreadable entries are dropped individually (leniency); a payload without
-/// the row array is a transport-level failure.
-fn parse_batch(resp: &Value, rows_key: &str) -> Result<Batch, String> {
+/// `resp` → ([`Batch`], `truncated`) via the bound row-container key (see
+/// [`rows_key`]). Unreadable entries are dropped individually (leniency); a
+/// payload without the row array is a transport-level failure.
+///
+/// `truncated` is the observation budget's report: how many rows the server
+/// dropped on this window (aggregation cut plus the requested `nr_samples`).
+/// An older server does not send it and defaults to zero.
+fn parse_batch(resp: &Value, rows_key: &str) -> Result<(Batch, u32), String> {
     let samples = if rows_key.is_empty() {
         resp.as_array()
     } else {
         resp.get(rows_key).and_then(Value::as_array)
     }
     .ok_or_else(|| format!("response missing {rows_key:?} rows array"))?;
+    let truncated = resp.get("truncated").and_then(Value::as_u64).unwrap_or(0);
     let mut out = Vec::with_capacity(samples.len().min(64));
     for raw in samples {
         match lenient_sample(raw) {
@@ -998,7 +996,7 @@ fn parse_batch(resp: &Value, rows_key: &str) -> Result<Batch, String> {
             None => tracing::trace!("dropping unreadable sched sample"),
         }
     }
-    Ok(out)
+    Ok((out, u32::try_from(truncated).unwrap_or(u32::MAX)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1059,7 @@ mod tests {
 
     /// Template mirrors a live sample captured on this host (values from a
     /// real `kworker` sample). `cpu_heat`/`warm_cpu_id`/… are unknown to
-    /// `SchedSample` — their presence proves leniency in every test.
+    /// [`Sample`] — their presence proves leniency in every test.
     fn live_sample(pid: i64, comm: &str) -> Value {
         json!({
             "avg_lat_cri": 1789,
@@ -1373,13 +1371,8 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].pid, 1557);
         assert_eq!(first[0].comm, "kworker/u99:1");
-        assert_eq!(first[0].stat, "LIBG");
-        assert_eq!(first[0].lat_cri, 2304);
-        assert_eq!(first[0].avg_lat_cri, 1789);
-        assert_eq!(first[0].norm_lat_cri, 790);
         assert_eq!(first[0].wait_freq, 2876);
         assert_eq!(first[0].wake_freq, 3);
-        assert_eq!(first[0].run_freq, 2133);
         assert_eq!(first[0].avg_runtime_wall, 19644);
         assert_eq!(first[0].task_util_est, 7);
         assert_eq!(first[0].cpu_util_wall, 3);
@@ -1418,7 +1411,7 @@ mod tests {
         let fields = h.fields();
         assert_eq!(fields.len(), 38);
         assert!(fields.has("norm_lat_cri"));
-        assert!(fields.has("cpu_heat")); // known to lavd, unknown to SchedSample
+        assert!(fields.has("cpu_heat")); // known to lavd, unknown to Sample
         assert!(fields.has("warm_cpu_id"));
         assert!(fields.has("static_prio"));
         assert!(!fields.has("definitely_not_a_field"));
@@ -1599,7 +1592,7 @@ mod tests {
     fn lenient_samples_string_numbers_unknowns_defaults() {
         let dir = TestDir::new("lenient");
         let mut a = live_sample(7, "a");
-        a["lat_cri"] = json!(" 999 "); // trimmed string number
+        a["task_util_est"] = json!(" 999 "); // trimmed string number
         a["static_prio"] = json!("120");
         let garbage = json!(["not", "a", "sample"]);
         let c = json!({ "pid": 42, "comm": 7, "wait_freq": "oops" });
@@ -1615,15 +1608,31 @@ mod tests {
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 2); // non-object entry skipped
-        assert_eq!(batch[0].lat_cri, 999);
+        assert_eq!(batch[0].task_util_est, 999);
         assert_eq!(batch[0].static_prio, 120);
-        assert_eq!(batch[0].norm_lat_cri, 790); // unknown sibling fields ignored
+        assert_eq!(batch[0].cpu_util_wall, 3); // unknown sibling fields ignored
         assert_eq!(batch[1].pid, 42);
         assert_eq!(batch[1].comm, ""); // wrong-typed -> serde(default)
         assert_eq!(batch[1].wait_freq, 0); // unparseable string -> serde(default)
 
         h.shutdown();
         h.join().unwrap();
+    }
+
+    #[test]
+    fn truncated_is_read_from_the_envelope() {
+        let with = json!({
+            "samples": [live_sample(1, "a")],
+            "truncated": 3,
+        });
+        let (batch, truncated) = parse_batch(&with, "samples").expect("parses");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(truncated, 3);
+
+        let without = json!({ "samples": [] });
+        let (batch, truncated) = parse_batch(&without, "samples").expect("parses");
+        assert!(batch.is_empty());
+        assert_eq!(truncated, 0, "an older server sends no truncation count");
     }
 
     // -----------------------------------------------------------------------

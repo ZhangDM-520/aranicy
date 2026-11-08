@@ -5,6 +5,12 @@
 //! `Err` so the caller can log it and start fresh). The caller debounces
 //! writes (>= 60 s). `last_seen` is unix seconds so confidence aging works
 //! across restarts.
+//!
+//! Version gate: the wire format is lenient (unknown fields ignored, missing
+//! fields defaulted), so a *newer* file would otherwise load and then be
+//! rewritten without its new fields — a silent downgrade. `load` therefore
+//! refuses anything above [`BIAS_STATE_VERSION`]; the caller logs it and
+//! starts with empty history.
 
 #![allow(dead_code)] // save/load are wired into daemon.rs by the caller
 
@@ -14,7 +20,8 @@ use std::io;
 use std::path::Path;
 
 /// Snapshot schema version. Unknown JSON fields are ignored and missing
-/// fields default, so older/newer files still load best-effort.
+/// fields default, so an *older* file still loads best-effort; [`load`]
+/// refuses a newer one (see the module docs).
 pub const BIAS_STATE_VERSION: u32 = 1;
 
 fn default_version() -> u32 {
@@ -95,9 +102,18 @@ pub fn load(path: &Path) -> io::Result<Option<BiasSnapshot>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let snap: BiasSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if snap.version > BIAS_STATE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "bias state version {} is newer than the supported {} (refusing to downgrade)",
+                snap.version, BIAS_STATE_VERSION
+            ),
+        ));
+    }
+    Ok(Some(snap))
 }
 
 #[cfg(test)]
@@ -179,6 +195,23 @@ mod tests {
 
         fs::write(&path, b"").expect("write empty");
         assert!(load(&path).expect_err("empty is corrupt too").kind() == std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_refuses_a_newer_version() {
+        let dir = scratch_dir("newer");
+        let path = dir.join("state.json");
+        fs::write(&path, br#"{"version": 2, "entries": [{"name": "a", "bias": 1}]}"#)
+            .expect("write");
+        let err = load(&path).expect_err("a newer schema must not load");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("newer"), "message must say why: {err}");
+
+        // The current version still loads.
+        fs::write(&path, br#"{"version": 1, "entries": [{"name": "a", "bias": 1}]}"#)
+            .expect("write");
+        assert_eq!(load(&path).expect("load").expect("present").entries.len(), 1);
         fs::remove_dir_all(&dir).ok();
     }
 

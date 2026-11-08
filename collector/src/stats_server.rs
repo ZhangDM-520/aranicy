@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::agg::Sample;
 
-/// One per-task row. Field names are the lavd wire names so the existing
-/// aranicy client binds without changes; unused lavd fields are omitted.
+/// One per-task row on the `scx_stats` wire. A thin adapter: the sample
+/// contract (fields, units, scales) is [`aranicy_wire::Sample`], and this
+/// struct exists only because the `Stats` derive must live in the GPL crate.
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 pub struct SchedSample {
@@ -28,40 +29,55 @@ pub struct SchedSample {
     pub pid: i64,
     #[stat(desc = "Task name (kernel comm)")]
     pub comm: String,
-    #[stat(desc = "Static priority (20 == nice 0)")]
+    #[stat(desc = "Static priority: nice + 20")]
     pub static_prio: u64,
-    #[stat(desc = "How frequently this task waits for other tasks (per second)")]
+    #[stat(desc = "Sleeps per second (EWMA; 0 is a real zero)")]
     pub wait_freq: u64,
-    #[stat(desc = "How frequently this task wakes other tasks (per second)")]
+    #[stat(desc = "Wakes issued per second (EWMA; 0 is a real zero)")]
     pub wake_freq: u64,
-    #[stat(desc = "Average runtime per schedule (ns)")]
+    #[stat(desc = "Mean nanoseconds per schedule")]
     pub avg_runtime_wall: u64,
-    #[stat(desc = "Task demand: runnable duty cycle, 0..1024 (1024 == one CPU)")]
+    #[stat(desc = "Demand: running + runnable duty, 0..1024 (1024 == one CPU)")]
     pub task_util_est: u64,
-    #[stat(desc = "Delivered CPU: running duty cycle, 0..1024 (1024 == one CPU)")]
+    #[stat(desc = "Delivered: running duty, same 0..1024 scale")]
     pub cpu_util_wall: u64,
+}
+
+impl From<Sample> for SchedSample {
+    fn from(s: Sample) -> Self {
+        Self {
+            pid: s.pid,
+            comm: s.comm,
+            static_prio: s.static_prio,
+            wait_freq: s.wait_freq,
+            wake_freq: s.wake_freq,
+            avg_runtime_wall: s.avg_runtime_wall,
+            task_util_est: s.task_util_est,
+            cpu_util_wall: s.cpu_util_wall,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 pub struct SchedSamples {
     pub samples: Vec<SchedSample>,
+    /// Rows the observation budget dropped (aggregation cut + this request's
+    /// `nr_samples`). Additive and defaulted so an old client still parses.
+    #[serde(default)]
+    pub truncated: u32,
 }
 
-fn to_wire(s: &Sample) -> SchedSample {
-    SchedSample {
-        pid: i64::from(s.pid),
-        comm: s.comm.clone(),
-        static_prio: s.static_prio,
-        wait_freq: s.wait_freq,
-        wake_freq: s.wake_freq,
-        avg_runtime_wall: s.avg_runtime_wall,
-        task_util_est: s.task_util_est,
-        cpu_util_wall: s.cpu_util_wall,
-    }
+/// The latest window shared between the drain thread and the stats server.
+#[derive(Clone, Debug, Default)]
+pub struct Window {
+    /// Already ordered and cut to the collector's sample cap.
+    pub rows: Vec<Sample>,
+    /// Rows `Aggregator::order` dropped while producing `rows`.
+    pub truncated: u32,
 }
 
 /// Shared latest-window rows, refreshed by the drain thread.
-pub type SharedRows = Arc<Mutex<Vec<Sample>>>;
+pub type SharedRows = Arc<Mutex<Window>>;
 
 /// Requested `nr_samples`, clamped to `[1, cap]`; defaults to `cap`.
 fn requested_cap(args: &std::collections::BTreeMap<String, String>, cap: usize) -> usize {
@@ -83,9 +99,21 @@ pub fn serve(path: &Path, rows: SharedRows, cap: usize) -> Result<StatsServer<()
             "sched_samples",
             Box::new(move |args, _chan| {
                 let cap = requested_cap(args, cap);
-                let rows = rows.lock().unwrap_or_else(|e| e.into_inner());
-                let samples: Vec<SchedSample> = rows.iter().take(cap).map(to_wire).collect();
-                SchedSamples { samples }.to_json()
+                let window = rows.lock().unwrap_or_else(|e| e.into_inner());
+                let served = cap.min(window.rows.len());
+                let samples: Vec<SchedSample> = window
+                    .rows
+                    .iter()
+                    .take(served)
+                    .cloned()
+                    .map(SchedSample::from)
+                    .collect();
+                // Both cuts are part of the same budget: rows dropped by the
+                // aggregation step plus rows this request's `nr_samples` cut.
+                let truncated = window
+                    .truncated
+                    .saturating_add(u32::try_from(window.rows.len() - served).unwrap_or(u32::MAX));
+                SchedSamples { samples, truncated }.to_json()
             }),
         );
 
@@ -128,10 +156,24 @@ mod tests {
             task_util_est: 1024,
             cpu_util_wall: 700,
         };
-        let w = to_wire(&s);
+        let w = SchedSample::from(s);
         assert_eq!(w.pid, 42);
         assert_eq!(w.static_prio, 23);
         assert_eq!(w.task_util_est, 1024);
         assert_eq!(w.cpu_util_wall, 700);
+    }
+
+    #[test]
+    fn truncated_field_serializes_and_old_payloads_default_to_zero() {
+        let payload = SchedSamples {
+            samples: Vec::new(),
+            truncated: 7,
+        };
+        let json = payload.to_json().expect("serialize");
+        assert_eq!(json["truncated"], 7);
+
+        let old: SchedSamples =
+            serde_json::from_str(r#"{"samples":[]}"#).expect("old payload still parses");
+        assert_eq!(old.truncated, 0);
     }
 }

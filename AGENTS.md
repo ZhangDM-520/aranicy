@@ -38,7 +38,8 @@ green/clean — the done-gate for any code wave).
 - Falsify new checks (mutation probe / red-first) before trusting a green suite;
   never weaken assertions to pass. Judge runs by target artifacts, not pipe exit codes.
 - Journal telemetry is only `bias changed` lines — freeze/rebaseline/classify
-  events are silent. Bias state comes from `aranicy dump bias` and
+  events are silent. A restart that restores history emits a one-off burst
+  (each restored entry re-stamps wants on the first slew pass). Bias state comes from `aranicy dump bias` and
   `/var/lib/aranicy/bias-state`.
 
 ## Pitfalls & lessons
@@ -230,6 +231,52 @@ protocol notes below are historical; the general test/fixture pitfalls remain li
   `default-features = false` and links the distro `libbpf` (one `libbpf`
   dependency instead of a vendored C build). `--no-as-needed` does not help;
   only removing `-flto=auto` or dropping the vendored archive does.
+
+## Architecture invariants (2026-11-08 audit) — Last reviewed: 2026-11-08
+
+- **One sample contract.** `aranicy_wire::Sample` is the only definition of the
+  8-field sample (plus `MAX_UTIL`, `NICE_OFFSET`, `SAMPLE_CAP`). The collector
+  converts into it; the daemon deserializes it. Never declare a second struct
+  with the same field names — the units drifted twice that way.
+- **The observation budget is one number, and it must exceed the working set.**
+  `SAMPLE_CAP` is used by both sides (the collector cuts, the daemon requests
+  exactly it). Measured on this host: an idle window carries ~260 rows, a full
+  `cargo build` ~5 600 short-lived processes. 512 hid ~91 % of the evidence
+  during builds, 4 096 truncated ~27 %, 8 192 none at ~0.3 % (daemon) / ~0.6 %
+  (collector) of a core. The served payload reports `truncated`; the daemon
+  warns at most once a minute (warning per *change* fires at the cadence —
+  measured 26/min).
+- **Policy synthesis lives in `decision`.** `daemon.rs` resolves bytes and
+  calls `decision::plan_locked` → `decision::execute`; the drift path adds
+  `decision::settle`. Do not re-add rule/bias/eff-nice logic to `daemon.rs` —
+  two copies drifted once (drift stopped counting matched/unmatched).
+- **Config liveness is a table, not a comment.** `config.rs::CONFIG_KEYS`
+  classifies every key as live / reconfigurable / restart-only / accepted-only;
+  a field without a row fails `every_config_field_has_one_row`. Reload calls
+  `BiasEngine::reconfigure` and names the restart-only keys it ignored.
+  `x3d_mode` is accepted and not applied (it warns).
+- `bias_state::load` refuses a file whose `version` is newer than the binary
+  supports: the format is lenient, so loading then saving would silently
+  downgrade it.
+
+## Test runs pollute live history (2026-11-08, measured)
+
+The collector samples every *thread*, and libtest names test threads after the
+test path, so `cargo test` on this host creates bias entries whose comm is a
+truncated test name (`abi::tests:`, `a_populated_non`) — 11-43 samples each,
+classified BULK, applied to nothing. Not a bug, but never read bias history
+immediately after a test run, and do not use entry counts as a regression
+signal while tests are running.
+
+## Open finding — no-op attack cycle (2026-11-08, unfixed)
+
+An entry with `confidence == 0` and `bias == 0` can still be selected for an
+**attack** step (`direction_wants` compares `target` to `bias`): the step sets
+`bias = ±1`, then `age()` in the same `bias_loop` iteration zeroes it because
+confidence is 0. Net effect: the global step budget is spent, the FIFO
+re-arms, and the journal logs `bias changed … bias=0` (a "change" to the same
+value) roughly every 11 minutes per such name. Fix belongs with the wave-2
+classifier work, not as a drive-by change to the control law.
 
 ## Bias-engine config defaults — Last reviewed: 2026-10-31 (verify against `crates/aranicy-daemon/src/config.rs`; do not re-derive)
 

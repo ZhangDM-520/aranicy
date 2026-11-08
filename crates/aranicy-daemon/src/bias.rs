@@ -42,7 +42,8 @@
 #![allow(dead_code)] // public surface is wired into daemon.rs by the caller
 
 use crate::bias_state::{BiasClass, BiasSnapshot, EntrySnapshot, BIAS_STATE_VERSION};
-use crate::sampler::SchedSample;
+use aranicy_wire::Sample;
+use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
@@ -79,7 +80,7 @@ fn unix_secs(t: SystemTime) -> u64 {
 /// classifier to exactly the workloads the bias exists for (measured:
 /// cc1plus never sleeps and wakes nobody while compiling). Only a zero
 /// `avg_runtime_wall` means "no evidence": the task never ran in the window.
-pub fn sample_score(s: &SchedSample) -> Option<u64> {
+pub fn sample_score(s: &Sample) -> Option<u64> {
     if s.avg_runtime_wall == 0 {
         return None;
     }
@@ -248,6 +249,32 @@ fn target_for(cfg: &BiasConfig, class: BiasClass, starved: bool) -> i8 {
             }
         }
         BiasClass::Unknown => 0,
+    }
+}
+
+/// Merge `other` into `dst` when two entries collapse onto one history key
+/// after a `reconfigure` re-key (a new `bias_group` family adopting both, or a
+/// family removed so its tag becomes an ordinary name).
+///
+/// The higher-confidence side survives (its score_ema, class, sample count and
+/// closed-loop claim are the better evidence), but:
+/// * the larger `|bias|` wins, so a merge never weakens an existing actuator
+///   state (the slew law then reconciles bias with the surviving class's
+///   target at the normal rate — merging must not release a learned ramp);
+/// * `last_seen` takes the later stamp so LRU cannot evict a pair that was
+///   live on either side.
+fn merge_entries(dst: &mut Entry, mut other: Entry, now: u64) {
+    if other.confidence > dst.confidence {
+        std::mem::swap(dst, &mut other);
+    }
+    // `dst` now holds the higher-confidence entry; `other` is the loser.
+    let survivor_bias = dst.bias;
+    if other.bias.abs() > dst.bias.abs() {
+        dst.bias = other.bias;
+    }
+    dst.last_seen = dst.last_seen.max(other.last_seen);
+    if dst.bias != survivor_bias {
+        dst.bias_changed_at = Some(now);
     }
 }
 
@@ -529,7 +556,7 @@ impl BiasEngine {
     }
 
     /// Ingest one sampler batch observed at `now`.
-    pub fn record_batch(&mut self, batch: &[SchedSample], now: SystemTime) {
+    pub fn record_batch(&mut self, batch: &[Sample], now: SystemTime) {
         let t = unix_secs(now);
         self.last_now = self.last_now.max(t);
         if self.window_end.is_none() {
@@ -732,6 +759,61 @@ impl BiasEngine {
         self.enforce_cap();
     }
 
+    /// The effective knobs: defaults at construction, then whatever the last
+    /// [`Self::reconfigure`] installed.
+    pub fn config(&self) -> &BiasConfig {
+        &self.cfg
+    }
+
+    /// Adopt new configuration without dropping learned history (`--reload`).
+    ///
+    /// Preserved: `threshold`, every entry's `score_ema`/`sample_count_ewma`/
+    /// class/confidence/frozen/applied claim, the in-flight `window_end` and
+    /// window accumulators, the want stamps, the global-step budget and the
+    /// release/attack rate laws. These are evidence and rate state, not
+    /// configuration; resetting them would replay the restart pathologies the
+    /// slew law was measured against.
+    ///
+    /// Recomputed:
+    /// * `bias` is clamped into the new `[min_bias, max_bias]` (a shrink of
+    ///   `bias_max` must take effect now, not at the next step);
+    /// * `target` is re-derived from the entry's class and its current
+    ///   `starved` flag, so a new clamp range reaches the controller;
+    /// * entries are re-keyed through [`entry_key`] under the new `groups`
+    ///   (a changed `bias_group.<tag>` changes history keys): collisions merge
+    ///   per [`merge_entries`], and the entry cap is re-enforced.
+    pub fn reconfigure(&mut self, mut cfg: BiasConfig, groups: Vec<BiasGroup>) {
+        // Same library-level invariant as `new_with_groups`: i8::clamp panics
+        // on an inverted range, and a reload is not allowed to take the bias
+        // thread down.
+        if cfg.min_bias > cfg.max_bias {
+            std::mem::swap(&mut cfg.min_bias, &mut cfg.max_bias);
+        }
+        let now = self.last_now;
+        self.groups = groups;
+
+        let mut rekeyed: BTreeMap<String, Entry> = BTreeMap::new();
+        for (name, mut e) in std::mem::take(&mut self.entries) {
+            let old_bias = e.bias;
+            e.bias = e.bias.clamp(cfg.min_bias, cfg.max_bias);
+            e.target = target_for(&cfg, e.class, e.starved);
+            if e.bias != old_bias {
+                // Report a clamp through the existing "bias changed" path.
+                e.bias_changed_at = Some(now);
+            }
+            let key = entry_key(&name, &self.groups).into_owned();
+            match rekeyed.entry(key) {
+                MapEntry::Vacant(slot) => {
+                    slot.insert(e);
+                }
+                MapEntry::Occupied(mut slot) => merge_entries(slot.get_mut(), e, now),
+            }
+        }
+        self.entries = rekeyed;
+        self.cfg = cfg;
+        self.enforce_cap();
+    }
+
     /// Names whose bias moved since the last call — each move logs exactly
     /// once (consuming the marks is what rate-limits the summary line, so
     /// marks are never dropped for being stale, e.g. moves that happened
@@ -896,8 +978,8 @@ mod tests {
         eng.record_batch(&[], ts(t));
     }
 
-    fn sample(comm: &str, wait: u64, wake: u64, rt: u64, util: u64, cpu: u64) -> SchedSample {
-        SchedSample {
+    fn sample(comm: &str, wait: u64, wake: u64, rt: u64, util: u64, cpu: u64) -> Sample {
+        Sample {
             pid: 1,
             comm: comm.to_string(),
             wait_freq: wait,
@@ -906,7 +988,6 @@ mod tests {
             task_util_est: util,
             cpu_util_wall: cpu,
             static_prio: 20,
-            ..Default::default()
         }
     }
 
@@ -1041,16 +1122,12 @@ mod tests {
     #[test]
     fn actuator_independence() {
         // Same behavior at nice 0 and nice +3 must score identically: the
-        // score ignores static_prio and the lavd lat_cri fields entirely, so
-        // our own bias cannot feed the signal that justifies the bias.
+        // score ignores static_prio, so our own bias cannot feed the signal
+        // that justifies the bias.
         let mut at_base = sample("x", 1023, 1023, 3_906_250, 500, 500);
         at_base.static_prio = 20; // nice 0
-        at_base.lat_cri = 1_000;
-        at_base.avg_lat_cri = 500;
         let mut at_plus3 = at_base.clone();
         at_plus3.static_prio = 23; // nice +3
-        at_plus3.lat_cri = 90_000;
-        at_plus3.avg_lat_cri = 77_000; // lavd-side signal moved with weight
         assert_eq!(sample_score(&at_base), sample_score(&at_plus3));
         assert_eq!(sample_score(&at_base), Some(784));
 
@@ -1808,5 +1885,145 @@ mod tests {
         eng2.age(ts(61 + 1800));
         let after = snap_entry(&eng2, "app").confidence;
         assert!((after - before * 0.5).abs() < 1e-12);
+    }
+
+    /// A reload that changes `bias_window_s` must change when windows close —
+    /// the next windows are `window_s` wide, not the startup width.
+    #[test]
+    fn reconfigure_applies_window_width_to_later_windows() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        eng.reconfigure(
+            BiasConfig {
+                window_s: 10,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(eng.config().window_s, 10);
+
+        let mut w = noise_batch(60);
+        w.extend(decisive_bulk_batch("app", 7));
+        eng.record_batch(&w, ts(1)); // window 1..11
+        eng.record_batch(&[], ts(11)); // closes it: 10 s, not 60 s
+        assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
+
+        // Control: the same fixture under the default 60 s window is still
+        // open at t = 11, so this assertion is about the new width.
+        let mut wide = BiasEngine::new(BiasConfig::default());
+        wide.record_batch(&w, ts(1));
+        wide.record_batch(&[], ts(11));
+        assert_eq!(snap_entry(&wide, "app").class, BiasClass::Unknown);
+    }
+
+    /// `bias_deadband_pct` is a live knob too: a sample 7.8 % above T is
+    /// inside the default 15 % deadband and outside a reconfigured 3 % one.
+    #[test]
+    fn reconfigure_applies_deadband_to_later_windows() {
+        // score 441 = 21² (wait 1023/wake 1023 → 20, runtime 400 ms → +1);
+        // 441 = 1.10 × the 400-score population.
+        let near = |name: &str, n: usize| -> Batch {
+            (0..n)
+                .map(|_| sample(name, 1023, 1023, 400_000_000, 500, 500))
+                .collect()
+        };
+        assert_eq!(sample_score(&sample("x", 1023, 1023, 400_000_000, 500, 500)), Some(441));
+
+        let mut narrow = BiasEngine::new(BiasConfig::default());
+        narrow.record_batch(&noise_batch(60), ts(1));
+        narrow.record_batch(&[], ts(61)); // population only: T = 400
+        narrow.reconfigure(
+            BiasConfig {
+                deadband_pct: 3,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+        let mut w = noise_batch(60);
+        w.extend(near("app", 32));
+        narrow.record_batch(&w, ts(120));
+        narrow.record_batch(&[], ts(181));
+        assert_eq!(snap_entry(&narrow, "app").class, BiasClass::Responsive);
+
+        // Control: identical evidence under the default 15 % deadband holds
+        // the class (no reconfigure ⇒ the key would have been ignored).
+        let mut wide = BiasEngine::new(BiasConfig::default());
+        wide.record_batch(&noise_batch(60), ts(1));
+        wide.record_batch(&[], ts(61));
+        wide.record_batch(&w, ts(120));
+        wide.record_batch(&[], ts(181));
+        assert_eq!(snap_entry(&wide, "app").class, BiasClass::Unknown);
+    }
+
+    /// Shrinking `bias_max` must take effect on the spot (not at the next
+    /// slew step) and pull the target along with it.
+    #[test]
+    fn reconfigure_clamps_bias_and_rederives_the_target() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]);
+        ramp_attack(&mut eng);
+        let before = snap_entry(&eng, "app");
+        assert_eq!((before.bias, eng.entries["app"].target), (3, 3));
+        let threshold_before = eng.snapshot().threshold_ema;
+
+        eng.reconfigure(
+            BiasConfig {
+                max_bias: 1,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+
+        let after = snap_entry(&eng, "app");
+        assert_eq!(after.bias, 1, "clamped immediately");
+        assert_eq!(eng.entries["app"].target, 1, "target follows the class and the new clamp");
+        assert_eq!(eng.target_nice("app", 0), 1);
+        // Historical evidence is not configuration: it must survive.
+        assert_eq!(after.score_ema, before.score_ema);
+        assert_eq!(after.confidence, before.confidence);
+        assert_eq!(after.class, before.class);
+        assert_eq!(eng.snapshot().threshold_ema, threshold_before);
+        // The clamp surfaces on the normal "bias changed" log path.
+        assert_eq!(eng.take_changed_recently(), vec![("app".to_string(), 1)]);
+    }
+
+    /// Changing `bias_group.<tag>` changes history keys: the members are
+    /// re-keyed, merging on collision without losing confidence or bias.
+    #[test]
+    fn reconfigure_rekeys_groups_without_losing_confidence() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["cc1plus"]);
+        ramp_attack(&mut eng);
+        let strong = snap_entry(&eng, "cc1plus");
+        assert_eq!((strong.bias, strong.class), (3, BiasClass::Bulk));
+
+        // A second family member with weaker evidence (one decisive window).
+        let mut w = noise_batch(60);
+        w.extend(decisive_bulk_batch("lto1", 8));
+        eng.record_batch(&w, ts(361));
+        eng.record_batch(&[], ts(421)); // closes lto1's window
+        let weak = snap_entry(&eng, "lto1");
+        assert_eq!(weak.class, BiasClass::Bulk);
+        assert!(weak.confidence < strong.confidence, "{weak:?} vs {strong:?}");
+
+        let re = regex::Regex::new("^(cc1plus|lto1)$").unwrap();
+        eng.reconfigure(BiasConfig::default(), vec![("build".to_string(), re)]);
+
+        let names: Vec<String> = eng.snapshot().entries.into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"build".to_string()), "names: {names:?}");
+        assert!(!names.contains(&"cc1plus".to_string()));
+        assert!(!names.contains(&"lto1".to_string()));
+
+        let merged = snap_entry(&eng, "build");
+        assert_eq!(merged.confidence, strong.confidence, "higher-confidence side survives");
+        assert_eq!(merged.class, BiasClass::Bulk);
+        assert_eq!(merged.bias, 3, "the larger |bias| must never be lost in a merge");
+        assert_eq!(eng.target_nice("cc1plus", 0), 3, "members resolve to the pooled entry");
+
+        // Dropping the family again gives the pooled tag back its own entry
+        // (the members' original keys are not recoverable — documented).
+        eng.reconfigure(BiasConfig::default(), Vec::new());
+        assert!(eng.snapshot().entries.iter().any(|e| e.name == "build"));
+        assert_eq!(eng.target_nice("build", 0), 3);
+        assert!(eng.snapshot().entries.iter().all(|e| e.name != "cc1plus"));
     }
 }

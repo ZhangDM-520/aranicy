@@ -25,7 +25,8 @@ use events::{EventQueue, bind as bind_events, serve as serve_events};
 /// Default socket location, matching the systemd unit's RuntimeDirectory.
 pub const DEFAULT_SOCKET: &str = "/run/aranicy/collector-stats.sock";
 pub const DEFAULT_CADENCE_MS: u64 = 500;
-pub const DEFAULT_SAMPLE_CAP: usize = 512;
+/// One observation budget for both sides: the wire crate owns the number.
+pub const DEFAULT_SAMPLE_CAP: usize = aranicy_wire::SAMPLE_CAP;
 /// Exec-event socket, next to the stats socket in the runtime dir.
 pub const DEFAULT_EVENTS_SOCKET: &str = "/run/aranicy/collector-events.sock";
 
@@ -116,7 +117,7 @@ fn run(
     let queue = EventQueue::new();
     let collector =
         StatsCollector::attach(queue.clone()).context("attaching collector BPF programs")?;
-    let rows = Arc::new(Mutex::new(Vec::new()));
+    let rows = Arc::new(Mutex::new(stats_server::Window::default()));
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -144,8 +145,11 @@ fn run(
                     }
                 };
                 let mut window = agg.ingest(snap, now_ns());
-                Aggregator::order(&mut window, sample_cap);
-                *rows.lock().unwrap_or_else(|e| e.into_inner()) = window;
+                let truncated = Aggregator::order(&mut window, sample_cap);
+                *rows.lock().unwrap_or_else(|e| e.into_inner()) = stats_server::Window {
+                    rows: window,
+                    truncated,
+                };
             }
         })
     };
@@ -185,7 +189,7 @@ fn probe(interval_ms: u64, iterations: u64, limit: usize) -> Result<()> {
         std::thread::sleep(Duration::from_millis(interval_ms));
         let snap = collector.snapshot()?;
         let mut window = agg.ingest(snap, now_ns());
-        Aggregator::order(&mut window, limit);
+        let _dropped = Aggregator::order(&mut window, limit);
         println!("--- {} rows", window.len());
         for s in &window {
             println!(

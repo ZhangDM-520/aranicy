@@ -12,6 +12,7 @@ mod bias;
 mod bias_state;
 mod config;
 mod daemon;
+mod decision;
 mod dump;
 mod event_client;
 mod load;

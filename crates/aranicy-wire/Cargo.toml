@@ -6,5 +6,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Collector <-> daemon exec-event frames. MIT: consumed by both the MIT
-# daemon and the GPL-2.0 collector (MIT is GPL-compatible).
+# Collector <-> daemon wire types. MIT: consumed by both the MIT daemon and
+# the GPL-2.0 collector (MIT is GPL-compatible).
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+# Test-only: the round-trip proof needs a concrete format.
+serde_json.workspace = true

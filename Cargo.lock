@@ -117,6 +117,10 @@ dependencies = [
 [[package]]
 name = "aranicy-wire"
 version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cfg-if"

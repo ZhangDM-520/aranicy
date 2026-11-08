@@ -95,6 +95,9 @@ dependencies = [
 [[package]]
 name = "aranicy-wire"
 version = "0.3.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bitflags"

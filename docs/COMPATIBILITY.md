@@ -34,7 +34,7 @@ ananicy-cpp parity); CRLF tolerated. Bad lines warn and are skipped.
 | `ionice` | 0…7 | level for best-effort/realtime |
 | `oom_score_adj` | −1000…1000 | `/proc/<pid>/oom_score_adj` |
 | `cgroup` | string | move into named cgroup (created from `*.cgroups`) |
-| `cpuset` | string | `0-3,8-11` or aliases `big-cores`, `little-cores`, `turbo-cores`, `performance-cores`, `efficiency-cores`, `all-cores`, `llc-N`, `node-N` |
+| `cpuset` | string | `0-3,8-11` or aliases `big-cores`, `little-cores`, `performance-cores`, `efficiency-cores`, `all-cores`, `llc-N`, `node-N`. `turbo-cores` and `x3d-cache`/`x3d-frequency` **parse** (lint parity) but are **rejected at apply time**: no kernel exposes a turbo-core marker, and 3D V-Cache mode is host-controlled |
 | `autogroup` | int | **superset**: writes the process autogroup nice (ananicy-cpp only reports) |
 
 Cgroup definitions: `{"cgroup": name, "CPUQuota": N}` — N = percent of *all*
@@ -65,24 +65,32 @@ Sockets (`/run/aranicy/`, systemd `RuntimeDirectory`):
 (default 5000) is the startup readiness budget — a missing collector is a
 loud failure, never silent rule-less operation.
 
-**Sample contract** (the collector's units; lavd-derived names kept so the
-client codec is unchanged):
-
-| field | meaning | scale |
-|---|---|---|
-| `wait_freq` | sleeps per second (EWMA, 30 s) | events/s |
-| `wake_freq` | wakes issued per second (EWMA) | events/s |
-| `avg_runtime_wall` | mean runtime per schedule | ns |
-| `task_util_est` | DEMAND: running + runnable duty | 0..1024 (1024 = 1 CPU) |
-| `cpu_util_wall` | DELIVERED: running duty | 0..1024 (same scale) |
-| `static_prio` | nice + 20 | — |
-
-Both util fields share one scale, so the starved gate
+**Sample contract** — defined once, as the Rust type
+`aranicy_wire::Sample` (`crates/aranicy-wire/src/lib.rs`) and its doc
+comments; the wire names are unchanged (`pid`, `comm`, `static_prio`,
+`wait_freq`, `wake_freq`, `avg_runtime_wall`, `task_util_est`,
+`cpu_util_wall`). Both util fields share the `aranicy_wire::MAX_UTIL` scale,
+so the starved gate
 (`demand > bias_starved_min_demand && delivered < bias_starved_ratio * demand`)
-now compares like with like; lavd emitted demand in 0..1024 and delivered in
+compares like with like; lavd emitted demand in 0..1024 and delivered in
 0..100, which made the comparison meaningless. A `wait_freq` of zero is a
 *meaningful* zero (the task never sleeps — the canonical bulk case), not a
 missing field.
+
+**Observation budget** — `aranicy_wire::SAMPLE_CAP` (8192) bounds the rows one
+window may carry. It is one constant shared by producer and consumer: the
+collector cuts to it and the daemon requests exactly it. Rows are ordered by
+demand (`task_util_est`), then delivered (`cpu_util_wall`), so a starved but
+responsive task survives the cut. The `sched_samples` payload reports
+`truncated` (rows dropped by the budget, `#[serde(default)]`) and the daemon
+logs it at `warn!`, at most once a minute.
+
+The size is measured, not guessed: an idle window carries ~260 rows, while a
+full `cargo build` on a 24-thread host reaches ~5 600 short-lived processes.
+The former 512 budget therefore hid ~91 % of the evidence exactly during the
+bulk workload the bias exists for; 4 096 still truncated ~27 %. Serving 8 192
+rows at 2 Hz costs ~0.3 % (daemon) and ~0.6 % (collector) of a core during a
+full rebuild, with no truncation observed.
 
 PELT is deliberately unused: `se.avg.*` is a FAIR-class path and reads zero
 under sched_ext (measured). The collector accounts runtime from
@@ -168,8 +176,40 @@ declarations (first definition wins; bad tags/regexes warn and skip).
 `apply_sched`, `apply_oom_score_adj`, `apply_cgroup`, `apply_cpuset`,
 `apply_autogroup` (superset), `cgroup_load`, `type_load`, `rule_load`,
 `loglevel`, `log_applied_rule`, `cgroup_realtime_workaround`, `x3d_mode`
-(accepted; cpuset alias input only). Superset-only `bias_*` keys and
+(accepted for ananicy-cpp compatibility, **never applied** — 3D V-Cache mode is
+host-controlled; warned at load). Superset-only `bias_*` keys and
 `bias_group.<tag>` are listed under *Dynamic nice bias*.
+
+### Reload liveness
+
+`--reload` re-reads `ananicy.conf` and the rules tree, and re-applies the bias
+knobs to the running engine. Every key is classified exactly once (the
+`CONFIG_KEYS` table in `crates/aranicy-daemon/src/config.rs` is the single
+source of truth):
+
+- **live** — re-read per event/drift scan, or re-applied by the reload's own
+  load pass: `check_freq`, `cgroup_load`, `type_load`, `rule_load`,
+  `apply_nice`, `apply_latnice`, `apply_ionice`, `apply_sched`,
+  `apply_oom_score_adj`, `apply_cgroup`, `apply_cpuset`, `apply_autogroup`,
+  `cgroup_realtime_workaround`, `log_applied_rule`.
+- **reconfigurable** — reach the running `BiasEngine::reconfigure`:
+  `bias_min`, `bias_max`, `bias_window_s`, `bias_deadband_pct`,
+  `bias_min_samples`, `bias_max_entries`, `bias_half_life_s`,
+  `bias_starved_min_demand`, `bias_starved_ratio`, `bias_group.*`.
+  Reconfiguring keeps the learned history (entries, population threshold T,
+  score/confidence EWMAs, want stamps, the global step budget), clamps each
+  bias into the new `[bias_min, bias_max]`, re-derives each target from its
+  class, and re-keys history through the new `bias_group` families (collisions
+  merge: the higher-confidence entry survives, the larger `|bias|` wins, the
+  later `last_seen` is kept).
+- **restart-only** — captured at startup; a reload logs them by name instead of
+  pretending it applied them: `loglevel`, `bias_enable` (the sampler/bias
+  thread lifetime; the actuation gate itself is read per event),
+  `bias_cadence_ms`, `bias_state_path`, `bias_collector_socket`,
+  `collector_events_socket`, `collector_wait_ms`.
+
+`x3d_mode` is the one *accepted-but-inert* key: parsed, warned at load, read by
+nothing.
 
 ## CLI and service
 
@@ -180,6 +220,10 @@ declarations (first definition wins; bad tags/regexes warn and skip).
   `bias` shows the persisted bias snapshot),
 - `aranicy lint`, `aranicy match-test <name>` (dry-run, superset),
 - `--reload` reloads config **and rules** (superset: ananicy-cpp reloads
-  config only), `--config`, `--config-dir`.
+  config only) and reconfigures the bias engine. It logs
+  `reloaded {n} rules; bias reconfigured`, calls out a changed `bias_group.*`
+  (history keys change) and warns
+  `restart-only keys ignored: <sorted key list>` for any deferred edit,
+  `--config`, `--config-dir`.
 - Unit `aranicy.service`, `ExecReload=/usr/bin/aranicy --reload`,
   `Conflicts=ananicy-cpp.service` for drop-in cutover.
