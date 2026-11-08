@@ -69,7 +69,9 @@ loud failure, never silent rule-less operation.
 `aranicy_wire::Sample` (`crates/aranicy-wire/src/lib.rs`) and its doc
 comments; the wire names are unchanged (`pid`, `comm`, `static_prio`,
 `wait_freq`, `wake_freq`, `avg_runtime_wall`, `task_util_est`,
-`cpu_util_wall`). Both util fields share the `aranicy_wire::MAX_UTIL` scale,
+`cpu_util_wall`, and since the shadow classifier `runs`, `sleeps` — per-window
+counts, not rates, defaulted to 0 so an old producer still parses). Both util
+fields share the `aranicy_wire::MAX_UTIL` scale,
 so the starved gate
 (`demand > bias_starved_min_demand && delivered < bias_starved_ratio * demand`)
 compares like with like; lavd emitted demand in 0..1024 and delivered in
@@ -149,6 +151,17 @@ silently live.
   the actuator-swing envelope) classifies on ONE window at
   `bias_min_samples / 4` (≥ 4) samples, so short-lived phases are learned
   before they end.
+- Shadow classifier (`bias_shadow`, default **off**): an absolute, population-free
+  two-axis `lean` (`log2(burst / 64 µs) − log2(hop / 100 Hz)`, the same
+  deadband in log space) runs alongside classification and is **never
+  actuated**. It logs `bias shadow name=… old=… new=… lean=… burst_ns=…
+  hop_hz=…` once per name per 10 min when the two disagree, plus a
+  `bias shadow summary windows=… disagreements=… unilateral=…` line per
+  10 min. The flip gate is `docs/adr/0001-classifier-boundary.md`: shadow data
+  over ≥ 1000 classified name-windows, disagreements ≤ the current boundary's
+  high-confidence violation rate, and no known-role regression. `bias_shadow`,
+  `bias_lean_stage_min_ns` (default 64 000) and `bias_lean_hop_hz` (default 100)
+  are all **reconfigurable** on reload.
 - Slew & fairness: attack (away from 0 toward the class target) ≤ 1 step per
   `attack_step_s` (30 s default) from want-onset; release (toward 0) ≤ 1 step
   per `release_step_s` (300 s); one bias step globally per 5 s. The attack
@@ -171,7 +184,8 @@ silently live.
 Config keys (all `bias_*`): `bias_enable`, `bias_min`, `bias_max`,
 `bias_window_s`, `bias_deadband_pct`, `bias_min_samples`, `bias_cadence_ms`,
 `bias_max_entries`, `bias_half_life_s`, `bias_state_path`,
-`bias_collector_socket`, `bias_starved_min_demand`, `bias_starved_ratio`, plus
+`bias_collector_socket`, `bias_starved_min_demand`, `bias_starved_ratio`,
+`bias_shadow`, `bias_lean_stage_min_ns`, `bias_lean_hop_hz`, plus
 the non-`bias_*` collector keys `collector_events_socket` and
 `collector_wait_ms`, and repeatable `bias_group.<tag> = <regex>` family
 declarations (first definition wins; bad tags/regexes warn and skip).
@@ -201,7 +215,8 @@ source of truth):
 - **reconfigurable** — reach the running `BiasEngine::reconfigure`:
   `bias_min`, `bias_max`, `bias_window_s`, `bias_deadband_pct`,
   `bias_min_samples`, `bias_max_entries`, `bias_half_life_s`,
-  `bias_starved_min_demand`, `bias_starved_ratio`, `bias_group.*`.
+  `bias_starved_min_demand`, `bias_starved_ratio`, `bias_shadow`,
+  `bias_lean_stage_min_ns`, `bias_lean_hop_hz`, `bias_group.*`.
   Reconfiguring keeps the learned history (entries, population threshold T,
   score/confidence EWMAs, want stamps, the global step budget), clamps each
   bias into the new `[bias_min, bias_max]`, re-derives each target from its

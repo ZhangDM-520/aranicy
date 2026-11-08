@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 mod bias;
 mod bias_state;
+mod classify;
 mod config;
 mod daemon;
 mod decision;

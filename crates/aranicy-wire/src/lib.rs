@@ -65,6 +65,18 @@ pub struct Sample {
     pub task_util_est: u64,
     /// DELIVERED: running duty cycle on the same 0..=[`MAX_UTIL`] scale.
     pub cpu_util_wall: u64,
+    /// Schedules taken in this window — a COUNT, not a rate.
+    ///
+    /// Counts (not the smoothed `wait_freq`/`avg_runtime_wall`) are what an
+    /// offline analysis needs to reconstruct the window exactly; the live
+    /// classifier keeps using the per-sample means because that is what a
+    /// single-row contract can carry. A missing field means 0, i.e. "no
+    /// evidence" — for the lean axis only, never for the score axis.
+    pub runs: u32,
+    /// Sleeps entered in this window — a COUNT, not a rate. `0` alongside
+    /// `runs > 0` is a real observation (a task that never slept), not a
+    /// missing field.
+    pub sleeps: u32,
 }
 
 pub const COMM_LEN: usize = 16;
@@ -167,11 +179,15 @@ mod tests {
             avg_runtime_wall: 3_906_250,
             task_util_est: 900,
             cpu_util_wall: 700,
+            runs: 118,
+            sleeps: 0,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         let back: Sample = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, s);
         assert_eq!(back.wait_freq, 0, "a meaningful zero survives the wire");
+        assert_eq!(back.runs, 118, "per-window counts survive the wire");
+        assert_eq!(back.sleeps, 0, "a count of zero is a real observation");
     }
 
     #[test]
@@ -181,5 +197,9 @@ mod tests {
         assert_eq!(back.pid, 7);
         assert_eq!(back.comm, "x");
         assert_eq!(back.task_util_est, 0, "missing fields default");
+        // Additive since v0.3.0: an old producer without the counts still
+        // parses, and 0 reads as "no evidence" on that axis only.
+        assert_eq!(back.runs, 0);
+        assert_eq!(back.sleeps, 0);
     }
 }

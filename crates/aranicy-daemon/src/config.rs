@@ -44,6 +44,13 @@ pub struct Config {
     pub bias_starved_min_demand: u64,
     /// Share-starvation gate: starved when delivered < ratio * demand.
     pub bias_starved_ratio: f64,
+    /// Shadow mode: run the absolute lean classifier alongside the actuated
+    /// one, log disagreements only. Default off (observation, never actuation).
+    pub bias_shadow: bool,
+    /// Lean axis "long burst" threshold, nanoseconds.
+    pub bias_lean_stage_min_ns: u64,
+    /// Lean axis hop floor, Hz.
+    pub bias_lean_hop_hz: u64,
     pub bias_min: i8,
     pub bias_max: i8,
     pub bias_window_s: u64,
@@ -147,6 +154,11 @@ config_key_table! {
     "bias_half_life_s" => Reconfigurable . bias_half_life_s;
     "bias_starved_min_demand" => Reconfigurable . bias_starved_min_demand;
     "bias_starved_ratio" => Reconfigurable . bias_starved_ratio;
+    // Shadow mode and its two axes are observation knobs: the flip may be
+    // toggled and the boundary tuned on a reload, without touching history.
+    "bias_shadow" => Reconfigurable . bias_shadow;
+    "bias_lean_stage_min_ns" => Reconfigurable . bias_lean_stage_min_ns;
+    "bias_lean_hop_hz" => Reconfigurable . bias_lean_hop_hz;
     // Changing a family re-keys the history (the tag IS the history key).
     "bias_group.*" => Reconfigurable . bias_groups;
     // Restart-only: captured at startup, named by the reload.
@@ -186,6 +198,9 @@ impl Default for Config {
             collector_wait_ms: 5000,
             bias_starved_min_demand: 64,
             bias_starved_ratio: 0.5,
+            bias_shadow: false,
+            bias_lean_stage_min_ns: crate::classify::STAGE_MIN_NS,
+            bias_lean_hop_hz: crate::classify::HOP_MIN_HZ,
             bias_min: -1,
             bias_max: 3,
             bias_window_s: 60,
@@ -343,6 +358,19 @@ impl Config {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.bias_starved_ratio = v,
                     _ => bad(&mut cfg, "bias_starved_ratio (0.0..=1.0)"),
                 },
+                "bias_shadow" => set_bool(value, &mut cfg.bias_shadow, idx, &mut cfg.warnings),
+                // 0 would divide by zero in log space; refuse it (warn and
+                // keep the default) instead of letting the axis go infinite.
+                "bias_lean_stage_min_ns" => match value.parse::<u64>() {
+                    Ok(v) if v > 0 => cfg.bias_lean_stage_min_ns = v,
+                    Ok(_) => bad(&mut cfg, "bias_lean_stage_min_ns (> 0)"),
+                    Err(_) => bad(&mut cfg, "bias_lean_stage_min_ns (u64)"),
+                },
+                "bias_lean_hop_hz" => match value.parse::<u64>() {
+                    Ok(v) if v > 0 => cfg.bias_lean_hop_hz = v,
+                    Ok(_) => bad(&mut cfg, "bias_lean_hop_hz (> 0)"),
+                    Err(_) => bad(&mut cfg, "bias_lean_hop_hz (u64)"),
+                },
                 k if k.starts_with("bias_group.") => {
                     let tag = k["bias_group.".len()..].trim();
                     if tag.is_empty() {
@@ -427,6 +455,9 @@ impl Config {
             max_bias: self.bias_max,
             starved_min_demand: self.bias_starved_min_demand,
             starved_ratio: self.bias_starved_ratio,
+            shadow: self.bias_shadow,
+            lean_stage_min_ns: self.bias_lean_stage_min_ns,
+            lean_hop_hz: self.bias_lean_hop_hz,
             ..crate::bias::BiasConfig::default()
         }
     }
@@ -585,6 +616,50 @@ mod tests {
     }
 
     #[test]
+    fn shadow_and_lean_axes_parse_and_reach_the_engine() {
+        // Default off, cake's constants: the flip is an explicit decision.
+        let d = Config::default();
+        assert!(!d.bias_shadow);
+        assert_eq!(d.bias_lean_stage_min_ns, crate::classify::STAGE_MIN_NS);
+        assert_eq!(d.bias_lean_hop_hz, crate::classify::HOP_MIN_HZ);
+        assert!(!d.bias_config().shadow);
+
+        let cfg = Config::parse(
+            "bias_shadow = true\n\
+             bias_lean_stage_min_ns = 128000\n\
+             bias_lean_hop_hz = 250\n",
+        );
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert!(cfg.bias_shadow);
+        assert_eq!(cfg.bias_lean_stage_min_ns, 128_000);
+        assert_eq!(cfg.bias_lean_hop_hz, 250);
+
+        // The knobs must reach the engine, not stay in the parser.
+        let bias = cfg.bias_config();
+        assert!(bias.shadow);
+        assert_eq!(bias.lean_stage_min_ns, 128_000);
+        assert_eq!(bias.lean_hop_hz, 250);
+
+        // 0 would divide by zero in log space: warn and keep the default.
+        let bad = Config::parse("bias_lean_stage_min_ns = 0\nbias_lean_hop_hz = 0\n");
+        assert_eq!(bad.bias_lean_stage_min_ns, crate::classify::STAGE_MIN_NS);
+        assert_eq!(bad.bias_lean_hop_hz, crate::classify::HOP_MIN_HZ);
+        assert_eq!(bad.warnings.len(), 2);
+
+        // Live on reload (Reconfigurable): applied, never reported deferred.
+        let old = Config::default();
+        assert!(old.restart_only_changed(&cfg).is_empty());
+        assert_eq!(
+            old.changed_keys(&cfg),
+            vec![
+                "bias_lean_hop_hz",
+                "bias_lean_stage_min_ns",
+                "bias_shadow"
+            ]
+        );
+    }
+
+    #[test]
     fn restart_only_changed_names_exactly_the_deferred_keys() {
         let old = Config::parse("collector_wait_ms = 5000\nloglevel = info\n");
         let new = Config::parse("collector_wait_ms = 9000\nloglevel = debug\n");
@@ -632,6 +707,9 @@ mod tests {
             collector_wait_ms: 1,
             bias_starved_min_demand: 1,
             bias_starved_ratio: 0.1,
+            bias_shadow: true,
+            bias_lean_stage_min_ns: 2,
+            bias_lean_hop_hz: 3,
             bias_min: -10,
             bias_max: 17,
             bias_window_s: 1,
@@ -656,7 +734,7 @@ mod tests {
 
         let count = |l: Liveness| CONFIG_KEYS.iter().filter(|s| s.liveness == l).count();
         assert_eq!(count(Liveness::Live), 14);
-        assert_eq!(count(Liveness::Reconfigurable), 10);
+        assert_eq!(count(Liveness::Reconfigurable), 13);
         assert_eq!(count(Liveness::RestartOnly), 7);
         assert_eq!(count(Liveness::AcceptedOnly), 1);
     }

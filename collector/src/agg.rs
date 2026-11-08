@@ -15,6 +15,11 @@
 //! 0..[`MAX_UTIL`] scale so starvation is `delivered < ratio * demand`, and
 //! `static_prio` is nice + [`NICE_OFFSET`].
 //!
+//! `runs`/`sleeps` are the raw deltas of the same counters the rates are
+//! smoothed from: per-window COUNTS (`u32`, saturating), so a consumer can
+//! tell "never slept" (`sleeps == 0` with `runs > 0`) from "not measured"
+//! (a payload without the fields, which defaults to 0).
+//!
 //! `task_util_est` is named after the lavd field the bias engine reads; lavd
 //! itself only accumulates running time, which cannot express demand because
 //! a task that never sleeps would read as 0 wait. lavd also emits demand in
@@ -247,6 +252,11 @@ impl Aggregator {
                 avg_runtime_wall: e.runtime.round().max(0.0) as u64,
                 task_util_est: util(d_run.saturating_add(d_runnable)),
                 cpu_util_wall: util(d_run),
+                // Raw per-window counts: the exact evidence the smoothed
+                // means lose (a window with runs but no sleeps is a real
+                // "never slept", not a missing measurement).
+                runs: u32::try_from(d_runs).unwrap_or(u32::MAX),
+                sleeps: u32::try_from(d_sleeps).unwrap_or(u32::MAX),
             });
         }
 
@@ -335,6 +345,8 @@ mod tests {
         assert_eq!(s.task_util_est, 768, "running + runnable = 75% of 1024");
         assert_eq!(s.cpu_util_wall, 512, "50% of 1024");
         assert_eq!(s.static_prio, 20);
+        assert_eq!(s.runs, 100, "per-window schedule count, not a rate");
+        assert_eq!(s.sleeps, 50, "per-window sleep count, not a rate");
     }
 
     /// A task that runs through the whole window without switching out has
@@ -374,6 +386,8 @@ mod tests {
         assert_eq!(rows[0].pid, 9);
         assert_eq!(rows[0].cpu_util_wall, 256);
         assert_eq!(rows[0].avg_runtime_wall, 250_000_000);
+        assert_eq!(rows[0].runs, 1, "cumulative counters ARE the window");
+        assert_eq!(rows[0].sleeps, 0, "never slept: a real zero, not absent");
     }
 
     #[test]

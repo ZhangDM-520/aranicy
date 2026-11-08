@@ -292,16 +292,53 @@ classified BULK, applied to nothing. Not a bug, but never read bias history
 immediately after a test run, and do not use entry counts as a regression
 signal while tests are running.
 
-## Open finding — no-op attack cycle (2026-11-08, unfixed)
+## Fixed — no-op attack cycle (2026-11-08 finding, fixed 2026-11-09)
 
-An entry with `confidence == 0` and `bias == 0` can still be selected for an
-**attack** step (`direction_wants` compares `target` to `bias`): the step sets
-`bias = ±1`, then the aging pass in the same loop iteration zeroes it because
-confidence is 0. Net effect: the global step budget is spent and the FIFO
-re-arms. The split verbs make the waste visible: `ingest` reports
-`prev=0 bias=1 cause=Evidence`, `tick` then reports
-`prev=1 bias=0 cause=Flush` for the same name. Fix belongs with the wave-2
-classifier work, not as a drive-by change to the control law.
+An entry with `confidence == 0` and `bias == 0` could still be selected for an
+**attack** step (`direction_wants` compares `target` to `bias`): the step set
+`bias = ±1`, then the aging pass zeroed it because confidence was 0. Net effect:
+the global step budget was spent and the FIFO re-armed. `attack_ready` now
+returns false while `confidence <= 0.0`: no evidence, no attack (a release is
+still allowed — the flush does it anyway). Pinned by
+`zero_confidence_entries_do_not_spend_the_global_step`, whose FIFO tie would
+otherwise hand the step to the confidence-0 name.
+
+## Class boundary — do not hardcode a constant (ADR 0001, 2026-11-09)
+
+`docs/adr/0001-classifier-boundary.md` records the measurement that killed the
+absolute-anchor proposal: on this host the score is dominated by interaction
+rate, so a compiler (`cargo` 253, `rustc` 277) and an idle latency daemon
+(`wireplumber` 315, `easyeffects` 331) overlap, and the best boundary simply
+tracks the live population `T`. Any boundary change is gated on
+`tools/replay-bias/replay.py` against the live state *and* a quiet-host capture,
+with test-thread names excluded (they are 300+ of 4096 live entries and score
+~200). The next attempt is the two-axis `lean` classifier behind
+`bias_shadow`, never another constant.
+
+## Shadow classifier (`bias_shadow`) — Last reviewed: 2026-11-09
+
+- `classify.rs` owns the whole boundary: `lean = log2(burst/64 µs) −
+  log2(hop/100 Hz)`, deadband `log2(1 + pct/100)`, `Burst 0` = no evidence.
+  It is a free function of numbers so offline replay and the live shadow call
+  one implementation.
+- Shadow never actuates: `close_window` returns a verdict, `bias.rs` compares
+  it against the *pre-hysteresis* `cand`, and only the counters and two log
+  lines change. `shadow_off_changes_nothing` pins identical `Change` vectors
+  and `BiasSnapshot`s for a 10-window run.
+- Counters: `windows` = name-windows with a lean verdict (the flip-gate
+  denominator), `disagreements` = both sides Some and different,
+  `unilateral` = exactly one side Some. Per-name logging is throttled to one
+  line per 10 min, the summary to one per 10 min.
+- First live reading with `bias_shadow = true` (2026-11-09 01:07, one window):
+  `windows=676 disagreements=343 unilateral=104`. Half the windows disagree —
+  mostly `old=Bulk new=Responsive` for browser/IO threads — which is exactly
+  what the ADR's flip gate exists to adjudicate. Do not "fix" the population
+  boundary from this number alone.
+- The config key is reconfigurable on reload; the live host currently has it
+  on, with a pre-image at `/var/lib/aranicy/ananicy.conf.pre-shadow-20261109`.
+- `runs`/`sleeps` (per-window counts, additive on the wire) exist for exact
+  offline replay; the live shadow still uses the per-row means. A missing
+  field is 0 = no evidence on the lean axis only.
 
 ## Bias-engine config defaults — Last reviewed: 2026-10-31 (verify against `crates/aranicy-daemon/src/config.rs`; do not re-derive)
 

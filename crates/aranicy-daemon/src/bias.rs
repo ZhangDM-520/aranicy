@@ -42,6 +42,7 @@
 #![allow(dead_code)] // public surface is wired into daemon.rs by the caller
 
 use crate::bias_state::{BiasClass, BiasSnapshot, Durable, EntrySnapshot, BIAS_STATE_VERSION};
+use crate::classify::{self, Boundary, Lean};
 use aranicy_wire::Sample;
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
@@ -63,6 +64,12 @@ const HYSTERESIS_STREAK: u32 = 2;
 
 /// EWMA time constant (seconds) of the population threshold T_us.
 const THRESHOLD_TC_S: f64 = 60.0;
+
+/// Shadow logging cadence: at most one `bias shadow` line per name and one
+/// `bias shadow summary` line per engine, per interval. Volume is the whole
+/// reason shadow mode is behind a flag; the counters are unbounded, the log
+/// is not.
+const SHADOW_LOG_S: u64 = 600;
 
 fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
@@ -166,6 +173,14 @@ pub struct BiasConfig {
     pub starved_ratio: f64,
     /// Demand noise floor: below this the starved gate stays shut.
     pub starved_min_demand: u64,
+    /// Run the absolute two-axis lean classifier alongside the actuated one
+    /// and log only disagreements (observation only; never actuates).
+    pub shadow: bool,
+    /// Lean axis: the "long burst" threshold in nanoseconds (cake's seat
+    /// threshold). Tunable so the flip gate can move it without a rebuild.
+    pub lean_stage_min_ns: u64,
+    /// Lean axis: the hop floor in Hz; below it the rate axis reads as 0.
+    pub lean_hop_hz: u64,
 }
 
 impl Default for BiasConfig {
@@ -185,6 +200,22 @@ impl Default for BiasConfig {
             global_step_s: 5,
             starved_ratio: 0.5,
             starved_min_demand: 64,
+            shadow: false,
+            lean_stage_min_ns: classify::STAGE_MIN_NS,
+            lean_hop_hz: classify::HOP_MIN_HZ,
+        }
+    }
+}
+
+impl BiasConfig {
+    /// The lean boundary this configuration expresses. One place that maps
+    /// knobs onto [`Boundary`], so the shadow path and any future actuator
+    /// read the same three numbers.
+    fn boundary(&self) -> Boundary {
+        Boundary {
+            stage_min_ns: self.lean_stage_min_ns,
+            hop_min_hz: self.lean_hop_hz,
+            deadband_pct: self.deadband_pct,
         }
     }
 }
@@ -210,6 +241,31 @@ pub enum Cause {
     Relax,
     /// Zero confidence flushed the bias.
     Flush,
+}
+
+/// One shadow comparison of a closed window: what the population boundary
+/// was about to say (`pop`, the candidate before hysteresis) and what the
+/// absolute lean axis says about the same window (`lean`). Observation only —
+/// it is reported and counted, never read by any control law.
+#[derive(Debug, Clone, Copy)]
+struct ShadowVerdict {
+    pop: Option<BiasClass>,
+    lean: Option<Lean>,
+    /// The raw `lean` value behind `lean` (`None` = inside the deadband or no
+    /// evidence); kept for the log line, which wants the number, not the sign.
+    lean_value: Option<f64>,
+    /// Window means the verdict was computed from.
+    burst_ns: u64,
+    hop_hz: u64,
+}
+
+/// The lean class a score class stands for, for comparison purposes only.
+fn class_to_lean(c: BiasClass) -> Option<Lean> {
+    match c {
+        BiasClass::Bulk => Some(Lean::Bulk),
+        BiasClass::Responsive => Some(Lean::Responsive),
+        BiasClass::Unknown => None,
+    }
 }
 
 #[derive(Debug)]
@@ -250,6 +306,16 @@ struct Live {
     win_cpu_sum: u64,
     win_util_sum: u64,
     win_util_n: u64,
+    /// Lean axis (shadow only): summed burst (ns per schedule) and hop rate
+    /// (sleeps/s) over the rows that carry runtime evidence, and how many
+    /// such rows the window had. Transient by construction — the persisted
+    /// entry does not grow (this wave is observation only).
+    win_burst_sum_ns: u64,
+    win_hop_sum: u64,
+    win_lean_n: u64,
+    /// Last time this name's disagreement was logged (`SHADOW_LOG_S`
+    /// throttle). Transient: a restart may log once more, never less.
+    shadow_logged_at: Option<u64>,
     pending: Option<BiasClass>,
     streak: u32,
     want_since_attack: Option<u64>,
@@ -369,6 +435,9 @@ impl Entry {
         self.live.win_cpu_sum = 0;
         self.live.win_util_sum = 0;
         self.live.win_util_n = 0;
+        self.live.win_burst_sum_ns = 0;
+        self.live.win_hop_sum = 0;
+        self.live.win_lean_n = 0;
     }
 
     /// Closed-loop re-baseline after a frozen mismatch: unfreeze and drop
@@ -388,17 +457,23 @@ impl Entry {
         self.live.aged_at = now;
     }
 
+    /// Returns the shadow comparison for this window when shadow mode is on,
+    /// the window carries lean evidence AND the population boundary produced
+    /// a verdict to compare against (no scored rows or no `T` yet ⇒ `None`).
+    /// The caller (which owns the counters, the log throttle and the engine's
+    /// clock) decides what to do with it; nothing here can influence the
+    /// actuated class, target or slew state.
     fn close_window(
         &mut self,
         cfg: &BiasConfig,
         threshold: Option<f64>,
         alpha: f64,
         close_t: u64,
-    ) {
+    ) -> Option<ShadowVerdict> {
         if self.live.win_n == 0 {
             // Absent this window: silence is never evidence. Streaks,
             // confidence and target all hold; wall-time aging handles decay.
-            return;
+            return None;
         }
         self.live.aged_at = close_t;
 
@@ -436,6 +511,17 @@ impl Entry {
             None
         };
 
+        // Shadow mode divides the window's mean burst and mean hop rate
+        // here — only when enabled, so the off path costs the (integer)
+        // accumulation in `absorb` and nothing else.
+        let lean_window = if cfg.shadow && self.live.win_lean_n > 0 {
+            let n = self.live.win_lean_n;
+            Some((self.live.win_burst_sum_ns / n, self.live.win_hop_sum / n))
+        } else {
+            None
+        };
+        let mut shadow = None;
+
         if let (Some(mean), Some(th)) = (score_mean, threshold) {
             let d = cfg.deadband_pct as f64 / 100.0;
             let low = th * (1.0 - d);
@@ -447,6 +533,20 @@ impl Entry {
             } else {
                 None
             };
+            // The comparison is against `cand` — the verdict this window is
+            // handing to the hysteresis rule — not against the class that
+            // survives it: shadow measures the decision, not the streak.
+            if let Some((burst_ns, hop_hz)) = lean_window {
+                let boundary = cfg.boundary();
+                let value = classify::lean(burst_ns, hop_hz, &boundary);
+                shadow = Some(ShadowVerdict {
+                    pop: cand,
+                    lean: classify::classify(burst_ns, hop_hz, &boundary),
+                    lean_value: value,
+                    burst_ns,
+                    hop_hz,
+                });
+            }
             // Decisive evidence sits outside the actuator-swing envelope
             // (2x the deadband, well past the ~11% self-induced swing the
             // deadband was sized for): classify on ONE window and a quarter
@@ -508,6 +608,7 @@ impl Entry {
             self.live.streak = 0;
         }
         self.reset_window();
+        shadow
     }
 
     fn release_ready(&self, cfg: &BiasConfig, now: u64) -> bool {
@@ -556,6 +657,14 @@ pub struct BiasEngine {
     /// two release wins in a row while an attack waits — see `slew_pass`).
     last_step_was_release: bool,
     last_now: u64,
+    /// Shadow-mode counters (cumulative since construction/restore):
+    /// name-windows with a lean verdict, both sides disagreeing, exactly one
+    /// side having a verdict. Never persisted, never read by the controller.
+    shadow_windows: u64,
+    shadow_disagreements: u64,
+    shadow_unilateral: u64,
+    /// When the cumulative summary was last emitted (`SHADOW_LOG_S` throttle).
+    shadow_summary_at: Option<u64>,
 }
 
 impl BiasEngine {
@@ -584,6 +693,10 @@ impl BiasEngine {
             last_global_step: None,
             last_step_was_release: false,
             last_now: 0,
+            shadow_windows: 0,
+            shadow_disagreements: 0,
+            shadow_unilateral: 0,
+            shadow_summary_at: None,
         }
     }
 
@@ -677,6 +790,15 @@ impl BiasEngine {
             e.live.win_cpu_sum = e.live.win_cpu_sum.saturating_add(s.cpu_util_wall);
             e.live.win_util_sum = e.live.win_util_sum.saturating_add(s.task_util_est);
             e.live.win_util_n += 1;
+            // Lean axes: same evidence rule as `sample_score` — a run of zero
+            // length says nothing, so a row that never ran is not a row that
+            // ran for 0 ns.
+            if s.avg_runtime_wall > 0 {
+                e.live.win_burst_sum_ns =
+                    e.live.win_burst_sum_ns.saturating_add(s.avg_runtime_wall);
+                e.live.win_hop_sum = e.live.win_hop_sum.saturating_add(s.wait_freq);
+                e.live.win_lean_n += 1;
+            }
             if let Some(score) = sample_score(s) {
                 e.live.win_score_sum = e.live.win_score_sum.saturating_add(score);
                 e.live.win_score_n += 1;
@@ -875,6 +997,7 @@ impl BiasEngine {
 
     fn close_window(&mut self, close_t: u64) {
         let alpha = 1.0 - (-(self.cfg.window_s.max(1) as f64) / THRESHOLD_TC_S).exp();
+        let (mut windows, mut disagreements, mut unilateral) = (0u64, 0u64, 0u64);
         if self.pop_score_n > 0 || self.win_names > 0 {
             if self.pop_score_n > 0 {
                 let mean = self.pop_score_sum as f64 / self.pop_score_n as f64;
@@ -884,13 +1007,76 @@ impl BiasEngine {
                 });
             }
             let threshold = self.threshold;
-            for e in self.entries.values_mut() {
-                e.close_window(&self.cfg, threshold, alpha, close_t);
+            for (name, e) in self.entries.iter_mut() {
+                let Some(v) = e.close_window(&self.cfg, threshold, alpha, close_t) else {
+                    continue;
+                };
+                // The shadow verdict exists only when `bias_shadow` is on
+                // and the window carries lean evidence, so nothing below
+                // runs (or allocates, or logs) on the default path.
+                let pop = v.pop.and_then(class_to_lean);
+                if v.lean.is_some() {
+                    windows += 1;
+                }
+                let both = pop.zip(v.lean);
+                if both.is_some_and(|(a, b)| a != b) {
+                    disagreements += 1;
+                } else if both.is_none() && (pop.is_some() || v.lean.is_some()) {
+                    unilateral += 1;
+                }
+                if pop == v.lean {
+                    continue;
+                }
+                // One line per name per SHADOW_LOG_S: a disagreement is a
+                // permanent property of a workload on this host, so repeating
+                // it every window would drown the journal.
+                let throttled = e
+                    .live
+                    .shadow_logged_at
+                    .is_some_and(|t| close_t < t.saturating_add(SHADOW_LOG_S));
+                if !throttled {
+                    e.live.shadow_logged_at = Some(close_t);
+                    tracing::info!(
+                        name = %name,
+                        old = ?v.pop,
+                        new = ?v.lean,
+                        lean = ?v.lean_value,
+                        burst_ns = v.burst_ns,
+                        hop_hz = v.hop_hz,
+                        "bias shadow"
+                    );
+                }
             }
         }
         self.pop_score_sum = 0;
         self.pop_score_n = 0;
         self.win_names = 0;
+        self.shadow_windows += windows;
+        self.shadow_disagreements += disagreements;
+        self.shadow_unilateral += unilateral;
+        let summary_due = self
+            .shadow_summary_at
+            .is_none_or(|t| close_t >= t.saturating_add(SHADOW_LOG_S));
+        if self.cfg.shadow && self.shadow_windows > 0 && summary_due {
+            self.shadow_summary_at = Some(close_t);
+            tracing::info!(
+                windows = self.shadow_windows,
+                disagreements = self.shadow_disagreements,
+                unilateral = self.shadow_unilateral,
+                "bias shadow summary"
+            );
+        }
+    }
+
+    /// Cumulative shadow-mode counters: name-windows with a lean verdict,
+    /// both-sides-different verdicts, and exactly-one-side verdicts. All zero
+    /// when shadow mode was never enabled. Observation only.
+    pub fn shadow_stats(&self) -> (u64, u64, u64) {
+        (
+            self.shadow_windows,
+            self.shadow_disagreements,
+            self.shadow_unilateral,
+        )
     }
 
     /// Apply slew limits. `allow_attack = false` (aging) only releases.
@@ -1036,6 +1222,9 @@ mod tests {
             task_util_est: util,
             cpu_util_wall: cpu,
             static_prio: 20,
+            // The score path ignores the raw counts; the shadow path keeps
+            // using the per-sample means (see classify::lean_of_sample).
+            ..Sample::default()
         }
     }
 
@@ -1092,6 +1281,34 @@ mod tests {
         (0..n)
             .map(|_| sample(name, 31, 31, 2_000_000, 500, 500))
             .collect()
+    }
+
+    // --- shadow fixtures ---------------------------------------------------
+    // A stable background is mandatory (AGENTS.md: a threshold that is the
+    // mean of the population being classified deadbands whenever one name
+    // dominates). `shadow_noise_batch` scores 841 = 29² and leans Bulk
+    // (+0.61), and it keeps T at 790 for every window.
+    fn shadow_noise_batch(n: usize) -> Batch {
+        (0..n)
+            .map(|_| sample("noise", 1023, 1023, 1_000_000, 500, 500))
+            .collect()
+    }
+
+    /// Score 484 = 22² — 0.61 × T, so the population boundary calls it BULK
+    /// (decisively), while 100 µs bursts at 1 kHz lean −2.68: RESPONSIVE.
+    fn short_hop_batch(name: &str, n: usize) -> Batch {
+        (0..n)
+            .map(|_| sample(name, 1_000, 0, 100_000, 500, 500))
+            .collect()
+    }
+
+    /// One scripted window: a stable population plus the disagreeing target.
+    /// Population mean = (60·841 + 10·484) / 70 = 790, so T is 790 and the
+    /// background stays inside its deadband (841 < 1.15 × 790 = 908.5).
+    fn shadow_window() -> Batch {
+        let mut w = shadow_noise_batch(60);
+        w.extend(short_hop_batch("app", 10));
+        w
     }
 
     /// The persisted half of one entry (what a restart keeps).
@@ -2233,5 +2450,118 @@ mod tests {
         assert!(eng.snapshot().entries.iter().any(|e| e.name == "build"));
         assert_eq!(eng.target_nice("build", 0), 3);
         assert!(eng.snapshot().entries.iter().all(|e| e.name != "cc1plus"));
+    }
+
+    /// Shadow mode is observation only: the same scripted run must produce
+    /// the same durable state and the same reported moves with the flag off
+    /// and on. Ten windows, so hysteresis, the attacks and the releases all
+    /// happen inside the run.
+    #[test]
+    fn shadow_off_changes_nothing() {
+        fn run(shadow: bool) -> (BiasSnapshot, Vec<Change>) {
+            let mut eng = BiasEngine::new(BiasConfig {
+                shadow,
+                ..BiasConfig::default()
+            });
+            let mut changes = Vec::new();
+            for i in 0..10u64 {
+                let t = i * 60 + 1;
+                changes.extend(eng.ingest(&shadow_window(), ts(t)));
+                changes.extend(eng.tick(ts(t + 30)));
+            }
+            assert!(eng.shadow_stats() == (0, 0, 0) || shadow);
+            (eng.snapshot(), changes)
+        }
+        let (off_snap, off_changes) = run(false);
+        let (on_snap, on_changes) = run(true);
+        assert_eq!(off_changes, on_changes, "shadow must not move any bias");
+        assert_eq!(
+            off_snap, on_snap,
+            "shadow must not reach the persisted (durable) state"
+        );
+        // ...and the off run really did compute nothing.
+        assert_eq!(off_snap.version, BIAS_STATE_VERSION);
+    }
+
+    /// A window the population boundary calls BULK but the lean axis calls
+    /// RESPONSIVE must be counted, and its per-name log stamp must stick for
+    /// `SHADOW_LOG_S` (no per-window spam).
+    #[test]
+    fn shadow_counts_a_disagreement() {
+        let mut eng = BiasEngine::new(BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        });
+        assert_eq!(eng.shadow_stats(), (0, 0, 0));
+
+        eng.ingest(&shadow_window(), ts(1));
+        eng.ingest(&[], ts(61)); // closes window 1
+        // "app" disagrees (pop Bulk, lean Responsive); the background is a
+        // deadband-hold for the population but a lean verdict: unilateral.
+        assert_eq!(eng.shadow_stats(), (2, 1, 1));
+        let app = &eng.entries["app"];
+        assert_eq!(app.durable.class, BiasClass::Bulk, "the actuator still classifies");
+        assert_eq!(app.live.shadow_logged_at, Some(T0 + 61));
+
+        // A second window, well inside the 10-minute throttle: counted, not
+        // re-logged.
+        eng.ingest(&shadow_window(), ts(61));
+        eng.ingest(&[], ts(121));
+        assert_eq!(eng.shadow_stats(), (4, 2, 2));
+        assert_eq!(
+            eng.entries["app"].live.shadow_logged_at,
+            Some(T0 + 61),
+            "the stamp must not move inside SHADOW_LOG_S"
+        );
+    }
+
+    /// The cumulative summary is emitted at most once per `SHADOW_LOG_S`,
+    /// even though windows close every 60 s. `shadow_summary_at` is the
+    /// emission record (the test does not sleep and captures no log).
+    #[test]
+    fn shadow_summary_is_rate_limited() {
+        let mut eng = BiasEngine::new(BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        });
+        eng.ingest(&shadow_window(), ts(1));
+        eng.ingest(&[], ts(61)); // closes window 1 → first (and only) summary
+        assert_eq!(eng.shadow_summary_at, Some(T0 + 61));
+
+        eng.ingest(&shadow_window(), ts(61));
+        eng.ingest(&[], ts(121)); // closes window 2, 60 s later
+        assert_eq!(eng.shadow_stats().0, 4, "the second window WAS counted");
+        assert_eq!(
+            eng.shadow_summary_at,
+            Some(T0 + 61),
+            "exactly one summary inside the interval"
+        );
+
+        // Past the interval a fresh summary is due again — the catch-up
+        // closes on the way to 661 emit it once, and 721 is suppressed again.
+        eng.ingest(&shadow_window(), ts(661));
+        eng.ingest(&[], ts(721));
+        assert_eq!(eng.shadow_summary_at, Some(T0 + 661));
+    }
+
+    /// The flag is reconfigurable: flipping it on a reload starts the shadow
+    /// counters without touching history.
+    #[test]
+    fn reconfigure_picks_up_shadow() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        eng.ingest(&shadow_window(), ts(1));
+        eng.ingest(&[], ts(61));
+        assert_eq!(eng.shadow_stats(), (0, 0, 0), "default is off");
+
+        eng.reconfigure(
+            BiasConfig {
+                shadow: true,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+        eng.ingest(&shadow_window(), ts(61));
+        eng.ingest(&[], ts(121));
+        assert_eq!(eng.shadow_stats(), (2, 1, 1));
     }
 }

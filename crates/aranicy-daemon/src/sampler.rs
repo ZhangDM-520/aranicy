@@ -600,6 +600,8 @@ const UNSIGNED_FIELDS: &[&str] = &[
     "task_util_est",
     "cpu_util_wall",
     "static_prio",
+    "runs",
+    "sleeps",
 ];
 
 /// Coerce an int-or-string field to a JSON number (`pid` accepts i64, the
@@ -726,8 +728,10 @@ mod tests {
             "rerunnable_interval_wall": 29_777_410_989u64,
             "resched_interval_wall": 3_747_689,
             "run_freq": 2133,
+            "runs": 4063,
             "slice_used_wall": 9718,
             "slice_wall": 5_000_000,
+            "sleeps": 121,
             "stat": "LIBG",
             "static_prio": 0,
             "steal_util_invr": 0,
@@ -1227,9 +1231,15 @@ mod tests {
         assert_eq!(batch[0].task_util_est, 999);
         assert_eq!(batch[0].static_prio, 120);
         assert_eq!(batch[0].cpu_util_wall, 3); // unknown sibling fields ignored
+        assert_eq!(batch[0].runs, 4063); // per-window counts parse too
+        assert_eq!(batch[0].sleeps, 121);
         assert_eq!(batch[1].pid, 42);
         assert_eq!(batch[1].comm, ""); // wrong-typed -> serde(default)
         assert_eq!(batch[1].wait_freq, 0); // unparseable string -> serde(default)
+        // An old collector sends no per-window counts: 0 = "no evidence" on
+        // the lean axis only (the score axis has its own gates).
+        assert_eq!(batch[1].runs, 0);
+        assert_eq!(batch[1].sleeps, 0);
 
         h.shutdown();
         h.join().unwrap();

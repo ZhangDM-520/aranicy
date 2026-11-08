@@ -41,6 +41,10 @@ pub struct SchedSample {
     pub task_util_est: u64,
     #[stat(desc = "Delivered: running duty, same 0..1024 scale")]
     pub cpu_util_wall: u64,
+    #[stat(desc = "Schedules taken in this window (a count, not a rate)")]
+    pub runs: u32,
+    #[stat(desc = "Sleeps entered in this window (a count, not a rate)")]
+    pub sleeps: u32,
 }
 
 impl From<Sample> for SchedSample {
@@ -54,6 +58,8 @@ impl From<Sample> for SchedSample {
             avg_runtime_wall: s.avg_runtime_wall,
             task_util_est: s.task_util_est,
             cpu_util_wall: s.cpu_util_wall,
+            runs: s.runs,
+            sleeps: s.sleeps,
         }
     }
 }
@@ -155,12 +161,42 @@ mod tests {
             avg_runtime_wall: 1_000_000,
             task_util_est: 1024,
             cpu_util_wall: 700,
+            runs: 118,
+            sleeps: 4,
         };
         let w = SchedSample::from(s);
         assert_eq!(w.pid, 42);
         assert_eq!(w.static_prio, 23);
         assert_eq!(w.task_util_est, 1024);
         assert_eq!(w.cpu_util_wall, 700);
+        assert_eq!(w.runs, 118, "per-window count reaches the wire");
+        assert_eq!(w.sleeps, 4, "per-window count reaches the wire");
+    }
+
+    #[test]
+    fn meta_describes_the_additive_count_fields() {
+        // The `#[stat(desc = ...)]` attributes are the wire metadata a client
+        // documents itself from: the counts must not appear as bare columns.
+        let meta = SchedSample::meta();
+        for field in ["runs", "sleeps", "wait_freq", "avg_runtime_wall"] {
+            let f = meta
+                .fields
+                .get(field)
+                .unwrap_or_else(|| panic!("{field} missing from stats meta"));
+            assert!(
+                f.attrs.desc.as_deref().is_some_and(|d| !d.is_empty()),
+                "{field} has no description"
+            );
+        }
+        assert!(
+            meta.fields["runs"]
+                .attrs
+                .desc
+                .as_deref()
+                .unwrap()
+                .contains("not a rate"),
+            "a count must say so (it is not a per-second rate)"
+        );
     }
 
     #[test]

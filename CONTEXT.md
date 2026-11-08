@@ -52,9 +52,19 @@ sensitive), `Unknown` until two consecutive classifying windows agree.
 **score** — weight-free per-sample signal derived from wait/wake/runtime, so
 our own applied nice can never feed back into the evidence that justifies it.
 
-**T** — the population EWMA of the mean score. The class boundary is
-`T × (1 ± deadband)`. Population-relative on purpose; its weakness is that one
-dominant name redefines "bulk" for everyone.
+**T** — the population EWMA of the mean score. It is still the *actuated*
+class boundary, `T × (1 ± deadband)`. Population-relative on purpose; its
+weakness is that one dominant name redefines "bulk" for everyone. ADR 0001
+records why an absolute constant was rejected and what replaces it.
+
+**lean** — the absolute, population-free class signal proposed to replace the
+`T` boundary: `log2(burst / 64 µs) − log2(hop / 100 Hz)`, positive = bulk. It
+separates long bursts from short frequent ones without a population statistic,
+which `score` cannot (see ADR 0001). Runs in **shadow** today.
+
+**shadow** — `bias_shadow` (default off): the lean classifier runs beside the
+actuated one, never changes a bias, and logs only disagreements and a 10-minute
+summary. The data that gates the flip.
 
 **window** — the classification interval (default 60 s), closed on wall time.
 A window needs `min_samples` scored samples; decisive evidence (beyond twice
@@ -84,6 +94,7 @@ is unseen. Absence decays; presence never counts as counter-evidence.
 | `cpu_util_wall` | duty cycle, running | 0..1024 = one CPU |
 | `avg_runtime_wall` | nanoseconds per schedule | > 0 means "ran" |
 | `wait_freq`, `wake_freq` | events per second (EWMA) | 0 is a real zero |
+| `runs`, `sleeps` | schedules / sleeps in one window (counts) | 0 is a real zero |
 
 A zero `wait_freq` or `wake_freq` is a **measurement** (a compiler neither
 sleeps nor wakes anyone — it forks). Only `avg_runtime_wall == 0` means "no
