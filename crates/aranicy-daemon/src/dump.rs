@@ -369,9 +369,11 @@ mod tests {
             threshold_ema: Some(1234.5),
             entries: vec![EntrySnapshot {
                 name: "bulk".into(),
-                bias: 3,
-                confidence: 0.25,
-                ..EntrySnapshot::default()
+                durable: crate::bias_state::Durable {
+                    bias: 3,
+                    confidence: 0.25,
+                    ..crate::bias_state::Durable::default()
+                },
             }],
         };
         bias_state::save(&snap, &path).expect("save");

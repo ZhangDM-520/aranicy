@@ -41,7 +41,7 @@
 //! `Instant::now()`), so behavior is deterministic given (samples, timestamps).
 #![allow(dead_code)] // public surface is wired into daemon.rs by the caller
 
-use crate::bias_state::{BiasClass, BiasSnapshot, EntrySnapshot, BIAS_STATE_VERSION};
+use crate::bias_state::{BiasClass, BiasSnapshot, Durable, EntrySnapshot, BIAS_STATE_VERSION};
 use aranicy_wire::Sample;
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
@@ -189,24 +189,48 @@ impl Default for BiasConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+/// One reported bias move, returned as data by [`BiasEngine::ingest`] and
+/// [`BiasEngine::tick`] (there is no drain call).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub name: String,
+    /// Bias before the move.
+    pub prev: i8,
+    pub bias: i8,
+    pub class: BiasClass,
+    pub cause: Cause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// A window closed with classifiable evidence.
+    Evidence,
+    /// A non-evidence move toward the neutral: aging/deadband relax, or a
+    /// reload's clamp/merge.
+    Relax,
+    /// Zero confidence flushed the bias.
+    Flush,
+}
+
+#[derive(Debug)]
 struct Entry {
-    // persisted fields (mirrors EntrySnapshot)
-    score_ema: f64,
-    sample_count_ewma: f64,
-    class: BiasClass,
-    bias: i8,
-    last_seen: u64,
-    confidence: f64,
-    frozen: bool,
-    // internal
+    durable: Durable,
+    live: Live,
+}
+
+/// Everything a restart cannot keep: the closed-loop claim (no actuation
+/// survives a restart, so neither can the expectation), the controller's
+/// target and rate stamps, and the window accumulators. Deliberately has no
+/// `Deserialize` — transient state loaded from disk is a compile error.
+#[derive(Debug, Default)]
+struct Live {
     /// Last nice value this daemon actually applied for the name (the
     /// closed-loop expectation; `None` = never actuated by us).
     applied_nice: Option<i8>,
     /// `note_applied` has been called since creation/restore, so
     /// `applied_nice` is an authoritative record (even an explicit `None`
     /// = the apply did not take). Distinguishes a released claim from the
-    /// total absence of a record (a restart) — see `verify_applied`.
+    /// total absence of a record (a restart) — see `verify_row`.
     claim_recorded: bool,
     target: i8,
     /// Timestamp the stored confidence is valid at (aging anchor).
@@ -235,7 +259,27 @@ struct Entry {
     want_since_release: Option<u64>,
     last_step_attack: Option<u64>,
     last_step_release: Option<u64>,
-    bias_changed_at: Option<u64>,
+    /// Bias before the pending, not-yet-reported move, and what moved it.
+    changed: Option<(i8, Cause)>,
+}
+
+impl Live {
+    fn restore(d: &Durable, cfg: &BiasConfig) -> Self {
+        Live {
+            // The claim is not persisted: a restart cannot verify anything
+            // against it, and a frozen entry must re-baseline on a fresh
+            // sample instead of being pinned by a phantom expectation.
+            applied_nice: None,
+            claim_recorded: false,
+            // Starved status is rebuilt from fresh samples; restored
+            // RESPONSIVE entries target 0 until evidence says otherwise.
+            target: target_for(cfg, d.class, false),
+            aged_at: d.last_seen, // aging resumes from the last sighting
+            relax_watermark: d.confidence,
+            score_init: true, // a persisted score is always real evidence
+            ..Self::default()
+        }
+    }
 }
 
 fn target_for(cfg: &BiasConfig, class: BiasClass, starved: bool) -> i8 {
@@ -263,18 +307,18 @@ fn target_for(cfg: &BiasConfig, class: BiasClass, starved: bool) -> i8 {
 ///   target at the normal rate — merging must not release a learned ramp);
 /// * `last_seen` takes the later stamp so LRU cannot evict a pair that was
 ///   live on either side.
-fn merge_entries(dst: &mut Entry, mut other: Entry, now: u64) {
-    if other.confidence > dst.confidence {
+fn merge_entries(dst: &mut Entry, mut other: Entry) {
+    if other.durable.confidence > dst.durable.confidence {
         std::mem::swap(dst, &mut other);
     }
     // `dst` now holds the higher-confidence entry; `other` is the loser.
-    let survivor_bias = dst.bias;
-    if other.bias.abs() > dst.bias.abs() {
-        dst.bias = other.bias;
+    let survivor_bias = dst.durable.bias;
+    if other.durable.bias.abs() > dst.durable.bias.abs() {
+        dst.durable.bias = other.durable.bias;
     }
-    dst.last_seen = dst.last_seen.max(other.last_seen);
-    if dst.bias != survivor_bias {
-        dst.bias_changed_at = Some(now);
+    dst.durable.last_seen = dst.durable.last_seen.max(other.durable.last_seen);
+    if dst.durable.bias != survivor_bias {
+        dst.live.changed = Some((survivor_bias, Cause::Relax));
     }
 }
 
@@ -289,12 +333,13 @@ fn want_stamp(current: Option<u64>, want: bool, now: u64) -> Option<u64> {
 /// (attack_want, release_want, delta) for one entry. Away from 0 toward the
 /// target is attack; toward 0 (target 0, overshoot, or relax credit) release.
 fn direction_wants(e: &Entry) -> (bool, bool, i16) {
-    let relax_pending = e.bias != 0 && e.relax_watermark - e.confidence >= RELAX_STEP;
-    let delta = i16::from(e.target) - i16::from(e.bias);
+    let relax_pending =
+        e.durable.bias != 0 && e.live.relax_watermark - e.durable.confidence >= RELAX_STEP;
+    let delta = i16::from(e.live.target) - i16::from(e.durable.bias);
     let (mut attack_want, mut release_want) = (false, relax_pending);
     if delta != 0 {
-        let next = e.bias + delta.signum() as i8;
-        if next.abs() > e.bias.abs() {
+        let next = e.durable.bias + delta.signum() as i8;
+        if next.abs() > e.durable.bias.abs() {
             attack_want = true;
         } else {
             release_want = true;
@@ -306,47 +351,24 @@ fn direction_wants(e: &Entry) -> (bool, bool, i16) {
 impl Entry {
     fn new(now: u64) -> Self {
         Entry {
-            score_ema: 0.0,
-            sample_count_ewma: 0.0,
-            class: BiasClass::Unknown,
-            bias: 0,
-            last_seen: now,
-            confidence: 0.0,
-            frozen: false,
-            target: 0,
-            aged_at: now,
-            relax_watermark: 0.0,
-            cpu_util_ewma: 0.0,
-            demand_ewma: 0.0,
-            util_init: false,
-            score_init: false,
-            starved: false,
-            win_score_sum: 0,
-            win_score_n: 0,
-            win_n: 0,
-            win_cpu_sum: 0,
-            win_util_sum: 0,
-            win_util_n: 0,
-            pending: None,
-            streak: 0,
-            want_since_attack: None,
-            attack_want_idle_since: None,
-            want_since_release: None,
-            last_step_attack: None,
-            last_step_release: None,
-            bias_changed_at: None,
-            applied_nice: None,
-            claim_recorded: false,
+            durable: Durable {
+                last_seen: now,
+                ..Durable::default()
+            },
+            live: Live {
+                aged_at: now,
+                ..Live::default()
+            },
         }
     }
 
     fn reset_window(&mut self) {
-        self.win_score_sum = 0;
-        self.win_score_n = 0;
-        self.win_n = 0;
-        self.win_cpu_sum = 0;
-        self.win_util_sum = 0;
-        self.win_util_n = 0;
+        self.live.win_score_sum = 0;
+        self.live.win_score_n = 0;
+        self.live.win_n = 0;
+        self.live.win_cpu_sum = 0;
+        self.live.win_util_sum = 0;
+        self.live.win_util_n = 0;
     }
 
     /// Closed-loop re-baseline after a frozen mismatch: unfreeze and drop
@@ -357,13 +379,13 @@ impl Entry {
     /// global-step FIFO on every re-baseline — under churn comms (a build's
     /// short-lived cc1plus/ld) that starved the ramp at its first step.
     fn rebaseline(&mut self, now: u64) {
-        self.frozen = false;
-        self.confidence = LOW_CONFIDENCE;
-        self.relax_watermark = LOW_CONFIDENCE;
-        self.pending = None;
-        self.streak = 0;
+        self.durable.frozen = false;
+        self.durable.confidence = LOW_CONFIDENCE;
+        self.live.relax_watermark = LOW_CONFIDENCE;
+        self.live.pending = None;
+        self.live.streak = 0;
         self.reset_window();
-        self.aged_at = now;
+        self.live.aged_at = now;
     }
 
     fn close_window(
@@ -373,40 +395,41 @@ impl Entry {
         alpha: f64,
         close_t: u64,
     ) {
-        if self.win_n == 0 {
+        if self.live.win_n == 0 {
             // Absent this window: silence is never evidence. Streaks,
             // confidence and target all hold; wall-time aging handles decay.
             return;
         }
-        self.aged_at = close_t;
+        self.live.aged_at = close_t;
 
-        if self.win_util_n > 0 {
-            let cpu = self.win_cpu_sum as f64 / self.win_util_n as f64;
-            let dem = self.win_util_sum as f64 / self.win_util_n as f64;
-            if self.util_init {
-                self.cpu_util_ewma += (cpu - self.cpu_util_ewma) * alpha;
-                self.demand_ewma += (dem - self.demand_ewma) * alpha;
+        if self.live.win_util_n > 0 {
+            let cpu = self.live.win_cpu_sum as f64 / self.live.win_util_n as f64;
+            let dem = self.live.win_util_sum as f64 / self.live.win_util_n as f64;
+            if self.live.util_init {
+                self.live.cpu_util_ewma += (cpu - self.live.cpu_util_ewma) * alpha;
+                self.live.demand_ewma += (dem - self.live.demand_ewma) * alpha;
             } else {
-                self.cpu_util_ewma = cpu;
-                self.demand_ewma = dem;
-                self.util_init = true;
+                self.live.cpu_util_ewma = cpu;
+                self.live.demand_ewma = dem;
+                self.live.util_init = true;
             }
         }
-        self.starved = self.demand_ewma > cfg.starved_min_demand as f64
-            && self.cpu_util_ewma < cfg.starved_ratio * self.demand_ewma;
+        self.live.starved = self.live.demand_ewma > cfg.starved_min_demand as f64
+            && self.live.cpu_util_ewma < cfg.starved_ratio * self.live.demand_ewma;
 
-        if self.sample_count_ewma == 0.0 {
-            self.sample_count_ewma = self.win_n as f64;
+        if self.durable.sample_count_ewma == 0.0 {
+            self.durable.sample_count_ewma = self.live.win_n as f64;
         } else {
-            self.sample_count_ewma += (self.win_n as f64 - self.sample_count_ewma) * alpha;
+            self.durable.sample_count_ewma +=
+                (self.live.win_n as f64 - self.durable.sample_count_ewma) * alpha;
         }
-        let score_mean = if self.win_score_n > 0 {
-            let mean = self.win_score_sum as f64 / self.win_score_n as f64;
-            if self.score_init {
-                self.score_ema += (mean - self.score_ema) * alpha;
+        let score_mean = if self.live.win_score_n > 0 {
+            let mean = self.live.win_score_sum as f64 / self.live.win_score_n as f64;
+            if self.live.score_init {
+                self.durable.score_ema += (mean - self.durable.score_ema) * alpha;
             } else {
-                self.score_ema = mean;
-                self.score_init = true;
+                self.durable.score_ema = mean;
+                self.live.score_init = true;
             }
             Some(mean)
         } else {
@@ -436,32 +459,33 @@ impl Entry {
                 cfg.min_samples
             };
             let need_streak = if decisive { 1 } else { HYSTERESIS_STREAK };
-            if self.win_score_n >= need {
+            if self.live.win_score_n >= need {
                 match cand {
                     Some(c) => {
-                        if self.pending == Some(c) {
-                            self.streak += 1;
+                        if self.live.pending == Some(c) {
+                            self.live.streak += 1;
                         } else {
-                            self.pending = Some(c);
-                            self.streak = 1;
+                            self.live.pending = Some(c);
+                            self.live.streak = 1;
                         }
-                        if self.streak >= need_streak {
-                            self.class = c;
-                            self.pending = None;
-                            self.streak = 0;
+                        if self.live.streak >= need_streak {
+                            self.durable.class = c;
+                            self.live.pending = None;
+                            self.live.streak = 0;
                         }
-                        self.confidence += (1.0 - self.confidence) * 0.5;
-                        self.relax_watermark = self.relax_watermark.max(self.confidence);
+                        self.durable.confidence += (1.0 - self.durable.confidence) * 0.5;
+                        self.live.relax_watermark =
+                            self.live.relax_watermark.max(self.durable.confidence);
                     }
                     None => {
                         // Deadband: class holds, but the bias relaxes toward 0
                         // through the release rule (target 0).
-                        self.pending = None;
-                        self.streak = 0;
+                        self.live.pending = None;
+                        self.live.streak = 0;
                     }
                 }
-                self.target = if cand.is_some() {
-                    target_for(cfg, self.class, self.starved)
+                self.live.target = if cand.is_some() {
+                    target_for(cfg, self.durable.class, self.live.starved)
                 } else {
                     0
                 };
@@ -474,33 +498,33 @@ impl Entry {
                 // used to spiral confidence to zero mid-activity, flushing a
                 // correct bias (measured: 0.488 → 0.007 over 6 min of
                 // active building).
-                self.pending = None;
-                self.streak = 0;
+                self.live.pending = None;
+                self.live.streak = 0;
             }
-        } else if self.win_score_n < cfg.min_samples {
+        } else if self.live.win_score_n < cfg.min_samples {
             // Observed but unscored (or no population threshold yet):
             // presence, not evidence against — hold as above.
-            self.pending = None;
-            self.streak = 0;
+            self.live.pending = None;
+            self.live.streak = 0;
         }
         self.reset_window();
     }
 
     fn release_ready(&self, cfg: &BiasConfig, now: u64) -> bool {
-        self.want_since_release.is_some_and(|w| {
+        self.live.want_since_release.is_some_and(|w| {
             now >= w.saturating_add(cfg.release_step_s)
-                && self
-                    .last_step_release
-                    .is_none_or(|l| now >= l.saturating_add(cfg.release_step_s))
+                && self.live.last_step_release.is_none_or(|l| {
+                    now >= l.saturating_add(cfg.release_step_s)
+                })
         })
     }
 
     fn attack_ready(&self, cfg: &BiasConfig, now: u64) -> bool {
-        self.want_since_attack.is_some_and(|w| {
+        self.live.want_since_attack.is_some_and(|w| {
             now >= w.saturating_add(cfg.attack_step_s)
-                && self
-                    .last_step_attack
-                    .is_none_or(|l| now >= l.saturating_add(cfg.attack_step_s))
+                && self.live.last_step_attack.is_none_or(|l| {
+                    now >= l.saturating_add(cfg.attack_step_s)
+                })
         })
     }
 }
@@ -555,9 +579,66 @@ impl BiasEngine {
         }
     }
 
-    /// Ingest one sampler batch observed at `now`.
-    pub fn record_batch(&mut self, batch: &[Sample], now: SystemTime) {
+    /// One delivered window. Verifies the closed loop against every row
+    /// first — absorption skips frozen entries, so a row that re-baselines one
+    /// counts as evidence in *this* batch — then absorbs it and lets the
+    /// controller step. Wall-clock aging is [`Self::tick`]'s job; the loop
+    /// owes one of those per iteration, batch or not (see `bias_pass`).
+    pub fn ingest(&mut self, batch: &[Sample], now: SystemTime) -> Vec<Change> {
         let t = unix_secs(now);
+        for s in batch {
+            self.verify_row(&s.comm, s.static_prio, t);
+        }
+        self.absorb(batch, t);
+        self.enforce_cap();
+        self.slew_pass(t, true);
+        self.drain_changes()
+    }
+
+    /// Wall-clock aging since the last pass: confidence decays, bias relaxes
+    /// toward 0, nothing attacks. Runs whether or not a batch arrived — a
+    /// batch cadence (500 ms) is shorter than the loop's idle timeout (1 s),
+    /// so a healthy stream would otherwise never age (measured live: a
+    /// vanished name held `confidence 0.994599` unchanged across 145 s).
+    pub fn tick(&mut self, now: SystemTime) -> Vec<Change> {
+        let t = unix_secs(now);
+        self.last_now = self.last_now.max(t);
+        self.age_entries(t);
+        self.slew_pass(t, false);
+        self.enforce_cap();
+        self.drain_changes()
+    }
+
+    /// Wall-time decay for every entry, seen or not: confidence halves every
+    /// `half_life_s` since its anchor, and zero confidence flushes the bias.
+    fn age_entries(&mut self, t: u64) {
+        let hl = self.cfg.half_life_s.max(1) as f64;
+        for e in self.entries.values_mut() {
+            let base = e.live.aged_at.max(e.durable.last_seen);
+            let dt = t.saturating_sub(base);
+            if dt > 0 {
+                e.durable.confidence *= 0.5f64.powf(dt as f64 / hl);
+                e.live.aged_at = t;
+            }
+            if e.durable.confidence < CONFIDENCE_EPS {
+                e.durable.confidence = 0.0;
+            }
+            if e.durable.confidence == 0.0 && e.durable.bias != 0 {
+                // History must never permanently fix the bias.
+                let prev = e.durable.bias;
+                e.durable.bias = 0;
+                e.live.relax_watermark = 0.0;
+                e.live.want_since_attack = None;
+                e.live.attack_want_idle_since = None;
+                e.live.want_since_release = None;
+                e.live.changed = Some((prev, Cause::Flush));
+            }
+        }
+    }
+
+    /// Advance the window clock to `t`, close every window that has ended, and
+    /// accumulate this batch into the window still open.
+    fn absorb(&mut self, batch: &[Sample], t: u64) {
         self.last_now = self.last_now.max(t);
         if self.window_end.is_none() {
             self.window_end = Some(t.saturating_add(self.cfg.window_s.max(1)));
@@ -575,113 +656,77 @@ impl BiasEngine {
             let key = entry_key(&s.comm, &self.groups).into_owned();
             let e = self.entries.entry(key).or_insert_with(|| Entry::new(t));
             // Frozen by closed-loop mismatch: no evidence updates until a
-            // matching sample un-freezes (verify_applied); aging still
-            // relaxes the stored bias toward 0 meanwhile.
-            if e.frozen {
+            // matching row re-baselines it (`verify_row`, before this call);
+            // aging still relaxes the stored bias toward 0 meanwhile.
+            if e.durable.frozen {
                 continue;
             }
-            if e.win_n == 0 {
+            if e.live.win_n == 0 {
                 self.win_names += 1;
             }
-            e.last_seen = t;
-            e.win_n += 1;
-            e.win_cpu_sum = e.win_cpu_sum.saturating_add(s.cpu_util_wall);
-            e.win_util_sum = e.win_util_sum.saturating_add(s.task_util_est);
-            e.win_util_n += 1;
+            e.durable.last_seen = t;
+            e.live.win_n += 1;
+            e.live.win_cpu_sum = e.live.win_cpu_sum.saturating_add(s.cpu_util_wall);
+            e.live.win_util_sum = e.live.win_util_sum.saturating_add(s.task_util_est);
+            e.live.win_util_n += 1;
             if let Some(score) = sample_score(s) {
-                e.win_score_sum = e.win_score_sum.saturating_add(score);
-                e.win_score_n += 1;
+                e.live.win_score_sum = e.live.win_score_sum.saturating_add(score);
+                e.live.win_score_n += 1;
                 self.pop_score_sum = self.pop_score_sum.saturating_add(score);
                 self.pop_score_n += 1;
             }
         }
-        self.enforce_cap();
-        self.slew_pass(t, true);
-    }
-
-    /// Wall-time aging: confidence decays while a name is unseen (half-life),
-    /// decay releases bias toward 0 one step per `RELAX_STEP`, and zero
-    /// confidence forces bias = 0. Never attacks — an absent stream must only
-    /// relax. The owner calls this on its own cadence.
-    pub fn age(&mut self, now: SystemTime) {
-        let t = unix_secs(now);
-        self.last_now = self.last_now.max(t);
-        let hl = self.cfg.half_life_s.max(1) as f64;
-        for e in self.entries.values_mut() {
-            let base = e.aged_at.max(e.last_seen);
-            let dt = t.saturating_sub(base);
-            if dt > 0 {
-                e.confidence *= 0.5f64.powf(dt as f64 / hl);
-                e.aged_at = t;
-            }
-            if e.confidence < CONFIDENCE_EPS {
-                e.confidence = 0.0;
-            }
-            if e.confidence == 0.0 && e.bias != 0 {
-                // History must never permanently fix the bias.
-                e.bias = 0;
-                e.relax_watermark = 0.0;
-                e.want_since_attack = None;
-                e.attack_want_idle_since = None;
-                e.want_since_release = None;
-                e.bias_changed_at = Some(t);
-            }
-        }
-        self.slew_pass(t, false);
-        self.enforce_cap();
     }
 
     /// Applied nice = `clamp(base_nice + bias, -20, 19)`, recomputed from the
     /// base every call (idempotent — never increments on itself).
     pub fn target_nice(&self, name: &str, base_nice: i8) -> i8 {
         let key = entry_key(name, &self.groups);
-        let bias = self.entries.get(key.as_ref()).map_or(0, |e| e.bias);
+        let bias = self
+            .entries
+            .get(key.as_ref())
+            .map_or(0, |e| e.durable.bias);
         (i16::from(base_nice) + i16::from(bias)).clamp(-20, 19) as i8
     }
 
-    /// Closed-loop check against the nice this daemon last applied for
-    /// `name`. Observed nice = `observed_static_prio - 20` (lavd's sample
-    /// field equals nice + 20). Semantics:
+    /// Closed-loop check for one row against the nice this daemon last applied
+    /// for `name`. Observed nice = `observed_static_prio - 20` (the sampler's
+    /// field is nice + 20). Semantics:
     /// - names we never applied are not verified (their ambient nice is not
-    ///   ours to compare against);
+    ///   ours to compare against), and unknown names are ignored;
     /// - `static_prio == 0` (nice −20) is indistinguishable from the lenient
     ///   default of an absent field — skip rather than fabricate a mismatch;
     /// - mismatch freezes the entry (no evidence updates); a later matching
-    ///   sample re-baselines it (unfreeze, confidence to low). A persistent
+    ///   row re-baselines it (unfreeze, confidence to low). A persistent
     ///   mismatch therefore cannot pin the bias: aging still flushes it.
-    pub fn verify_applied(&mut self, name: &str, observed_static_prio: u64) {
+    fn verify_row(&mut self, name: &str, observed_static_prio: u64, now: u64) {
         if observed_static_prio == 0 {
             return;
         }
-        let Self {
-            entries,
-            groups,
-            last_now,
-            ..
-        } = self;
+        let Self { entries, groups, .. } = self;
         let key = entry_key(name, groups);
         let Some(e) = entries.get_mut(key.as_ref()) else {
             return;
         };
-        let Some(expected_nice) = e.applied_nice else {
+        let Some(expected_nice) = e.live.applied_nice else {
             // No actuation on record at all (a restart: the expectation is
             // not persisted). No observation can ever "match", so the
             // freeze has nothing left to protect — a fresh sample
             // re-baselines the entry instead of bricking it forever. A
             // RELEASED claim (explicit `None`: the apply did not take) is
             // an authoritative record and must not unwind the freeze.
-            if e.frozen && !e.claim_recorded {
-                e.rebaseline(*last_now);
+            if e.durable.frozen && !e.live.claim_recorded {
+                e.rebaseline(now);
             }
             return;
         };
         let observed_nice = observed_static_prio as i64 - 20;
         if observed_nice == i64::from(expected_nice) {
-            if e.frozen {
-                e.rebaseline(*last_now);
+            if e.durable.frozen {
+                e.rebaseline(now);
             }
-        } else if !e.frozen {
-            e.frozen = true;
+        } else if !e.durable.frozen {
+            e.durable.frozen = true;
         }
     }
 
@@ -693,15 +738,17 @@ impl BiasEngine {
         } = self;
         let key = entry_key(name, groups);
         if let Some(e) = entries.get_mut(key.as_ref()) {
-            e.applied_nice = nice;
-            e.claim_recorded = true;
+            e.live.applied_nice = nice;
+            e.live.claim_recorded = true;
         }
     }
 
     /// The nice this daemon last applied for `name`, if any.
     pub fn applied_nice(&self, name: &str) -> Option<i8> {
         let key = entry_key(name, &self.groups);
-        self.entries.get(key.as_ref()).and_then(|e| e.applied_nice)
+        self.entries
+            .get(key.as_ref())
+            .and_then(|e| e.live.applied_nice)
     }
 
     /// Serializable state for persistence (see `bias_state::save`).
@@ -714,46 +761,30 @@ impl BiasEngine {
                 .iter()
                 .map(|(name, e)| EntrySnapshot {
                     name: name.clone(),
-                    score_ema: e.score_ema,
-                    sample_count_ewma: e.sample_count_ewma,
-                    class: e.class,
-                    bias: e.bias,
-                    last_seen: e.last_seen,
-                    confidence: e.confidence,
-                    frozen: e.frozen,
+                    durable: e.durable.clone(),
                 })
                 .collect(),
         }
     }
 
-    /// Restore persisted state (startup). Aging resumes from each entry's
-    /// `last_seen`; frozen entries stay frozen until a matching sample
-    /// re-baselines them.
+    /// Restore persisted state (startup). Everything transient is rebuilt by
+    /// [`Live::restore`]; aging resumes from each entry's `last_seen`, and
+    /// frozen entries stay frozen until a matching row re-baselines them.
     pub fn restore(&mut self, snapshot: BiasSnapshot) {
         self.threshold = snapshot.threshold_ema;
         for es in snapshot.entries {
-            let confidence = es.confidence.clamp(0.0, 1.0);
-            let mut e = Entry::new(es.last_seen);
-            e.score_ema = es.score_ema;
-            // 0.0 is a real score (a never-sleeping, never-waking task); the
-            // persisted value is always a real observation.
-            e.score_init = true;
-            e.sample_count_ewma = es.sample_count_ewma;
-            e.class = es.class;
-            e.bias = es.bias.clamp(self.cfg.min_bias, self.cfg.max_bias);
-            e.confidence = confidence;
-            e.frozen = es.frozen;
-            e.relax_watermark = confidence;
-            e.aged_at = es.last_seen;
-            // Starved status is rebuilt from fresh samples; restored
-            // RESPONSIVE entries target 0 until evidence says otherwise.
-            e.target = target_for(&self.cfg, es.class, false);
-            self.entries.insert(es.name, e);
+            let durable = Durable {
+                confidence: es.durable.confidence.clamp(0.0, 1.0),
+                bias: es.durable.bias.clamp(self.cfg.min_bias, self.cfg.max_bias),
+                ..es.durable
+            };
+            let live = Live::restore(&durable, &self.cfg);
+            self.entries.insert(es.name, Entry { durable, live });
         }
         self.last_now = self
             .entries
             .values()
-            .map(|e| e.last_seen)
+            .map(|e| e.durable.last_seen)
             .max()
             .unwrap_or(0);
         self.enforce_cap();
@@ -789,24 +820,24 @@ impl BiasEngine {
         if cfg.min_bias > cfg.max_bias {
             std::mem::swap(&mut cfg.min_bias, &mut cfg.max_bias);
         }
-        let now = self.last_now;
         self.groups = groups;
 
         let mut rekeyed: BTreeMap<String, Entry> = BTreeMap::new();
         for (name, mut e) in std::mem::take(&mut self.entries) {
-            let old_bias = e.bias;
-            e.bias = e.bias.clamp(cfg.min_bias, cfg.max_bias);
-            e.target = target_for(&cfg, e.class, e.starved);
-            if e.bias != old_bias {
-                // Report a clamp through the existing "bias changed" path.
-                e.bias_changed_at = Some(now);
+            let old_bias = e.durable.bias;
+            e.durable.bias = e.durable.bias.clamp(cfg.min_bias, cfg.max_bias);
+            e.live.target = target_for(&cfg, e.durable.class, e.live.starved);
+            if e.durable.bias != old_bias {
+                // Report a clamp through the normal "bias changed" path. A
+                // reload is not evidence, so it reports as a relax move.
+                e.live.changed = Some((old_bias, Cause::Relax));
             }
             let key = entry_key(&name, &self.groups).into_owned();
             match rekeyed.entry(key) {
                 MapEntry::Vacant(slot) => {
                     slot.insert(e);
                 }
-                MapEntry::Occupied(mut slot) => merge_entries(slot.get_mut(), e, now),
+                MapEntry::Occupied(mut slot) => merge_entries(slot.get_mut(), e),
             }
         }
         self.entries = rekeyed;
@@ -814,16 +845,22 @@ impl BiasEngine {
         self.enforce_cap();
     }
 
-    /// Names whose bias moved since the last call — each move logs exactly
-    /// once (consuming the marks is what rate-limits the summary line, so
-    /// marks are never dropped for being stale, e.g. moves that happened
-    /// while the sample stream was down).
-    pub fn take_changed_recently(&mut self) -> Vec<(String, i8)> {
+    /// Moves since the last call, each reported exactly once. Marks survive
+    /// until reported, so a move that happened while the stream was down is
+    /// logged at the next pass rather than lost.
+    fn drain_changes(&mut self) -> Vec<Change> {
         let mut out = Vec::new();
         for (name, e) in self.entries.iter_mut() {
-            if e.bias_changed_at.take().is_some() {
-                out.push((name.clone(), e.bias));
-            }
+            let Some((prev, cause)) = e.live.changed.take() else {
+                continue;
+            };
+            out.push(Change {
+                name: name.clone(),
+                prev,
+                bias: e.durable.bias,
+                class: e.durable.class,
+                cause,
+            });
         }
         out
     }
@@ -860,11 +897,11 @@ impl BiasEngine {
     /// timestamps).
     fn slew_pass(&mut self, now: u64, allow_attack: bool) {
         for e in self.entries.values_mut() {
-            if e.bias == 0 && e.relax_watermark - e.confidence >= RELAX_STEP {
-                e.relax_watermark = e.confidence; // nothing left to relax
+            if e.durable.bias == 0 && e.live.relax_watermark - e.durable.confidence >= RELAX_STEP {
+                e.live.relax_watermark = e.durable.confidence; // nothing left to relax
             }
             let (attack_want, release_want, _) = direction_wants(e);
-            e.want_since_release = want_stamp(e.want_since_release, release_want, now);
+            e.live.want_since_release = want_stamp(e.live.want_since_release, release_want, now);
             // The attack desire survives short deadband excursions: a
             // deadband window flips target to 0 but is not counter-evidence
             // (hysteresis holds the class), so clearing the want onset on
@@ -873,18 +910,18 @@ impl BiasEngine {
             // frozen at +1 through a whole build). A want that stays false
             // for a full hysteresis confirmation (2 windows) is abandoned.
             if attack_want {
-                e.want_since_attack = want_stamp(e.want_since_attack, true, now);
-                e.attack_want_idle_since = None;
-            } else if e.want_since_attack.is_some() {
-                let idle_since = *e.attack_want_idle_since.get_or_insert(now);
+                e.live.want_since_attack = want_stamp(e.live.want_since_attack, true, now);
+                e.live.attack_want_idle_since = None;
+            } else if e.live.want_since_attack.is_some() {
+                let idle_since = *e.live.attack_want_idle_since.get_or_insert(now);
                 if now.saturating_sub(idle_since)
                     >= u64::from(HYSTERESIS_STREAK) * self.cfg.window_s.max(1)
                 {
-                    e.want_since_attack = None;
-                    e.attack_want_idle_since = None;
+                    e.live.want_since_attack = None;
+                    e.live.attack_want_idle_since = None;
                 }
             } else {
-                e.attack_want_idle_since = None;
+                e.live.attack_want_idle_since = None;
             }
         }
 
@@ -901,13 +938,13 @@ impl BiasEngine {
         for (name, e) in &self.entries {
             let (attack_want, release_want, _) = direction_wants(e);
             if release_want && e.release_ready(&self.cfg, now) {
-                let key = (e.want_since_release.unwrap_or(now), name.clone());
+                let key = (e.live.want_since_release.unwrap_or(now), name.clone());
                 if best_release.as_ref().is_none_or(|b| key < *b) {
                     best_release = Some(key);
                 }
             }
             if allow_attack && attack_want && e.attack_ready(&self.cfg, now) {
-                let key = (e.want_since_attack.unwrap_or(now), name.clone());
+                let key = (e.live.want_since_attack.unwrap_or(now), name.clone());
                 if best_attack.as_ref().is_none_or(|b| key < *b) {
                     best_attack = Some(key);
                 }
@@ -926,18 +963,25 @@ impl BiasEngine {
 
         if let Some((name, is_release)) = winner {
             let e = self.entries.get_mut(&name).expect("selected entry exists");
+            let prev = e.durable.bias;
             if is_release {
-                e.bias -= e.bias.signum();
-                e.last_step_release = Some(now);
-                e.want_since_release = Some(now); // re-arm: back of the FIFO
-                e.relax_watermark = e.confidence;
+                e.durable.bias -= e.durable.bias.signum();
+                e.live.last_step_release = Some(now);
+                e.live.want_since_release = Some(now); // re-arm: back of the FIFO
+                e.live.relax_watermark = e.durable.confidence;
             } else {
-                let delta = i16::from(e.target) - i16::from(e.bias);
-                e.bias = (e.bias + delta.signum() as i8).clamp(self.cfg.min_bias, self.cfg.max_bias);
-                e.last_step_attack = Some(now);
-                e.want_since_attack = Some(now); // re-arm: back of the FIFO
+                let delta = i16::from(e.live.target) - i16::from(e.durable.bias);
+                e.durable.bias = (e.durable.bias + delta.signum() as i8)
+                    .clamp(self.cfg.min_bias, self.cfg.max_bias);
+                e.live.last_step_attack = Some(now);
+                e.live.want_since_attack = Some(now); // re-arm: back of the FIFO
             }
-            e.bias_changed_at = Some(now);
+            let cause = if is_release {
+                Cause::Relax
+            } else {
+                Cause::Evidence
+            };
+            e.live.changed = Some((prev, cause));
             self.last_global_step = Some(now);
             self.last_step_was_release = is_release;
         }
@@ -951,7 +995,7 @@ impl BiasEngine {
         let mut by_age: Vec<(u64, String)> = self
             .entries
             .iter()
-            .map(|(name, e)| (e.last_seen, name.clone()))
+            .map(|(name, e)| (e.durable.last_seen, name.clone()))
             .collect();
         by_age.sort(); // (last_seen, name): deterministic LRU order
         let drop = self.entries.len() - cap;
@@ -972,10 +1016,6 @@ mod tests {
 
     fn ts(t: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + t)
-    }
-
-    fn tick(eng: &mut BiasEngine, t: u64) {
-        eng.record_batch(&[], ts(t));
     }
 
     fn sample(comm: &str, wait: u64, wake: u64, rt: u64, util: u64, cpu: u64) -> Sample {
@@ -1046,12 +1086,32 @@ mod tests {
             .collect()
     }
 
-    fn snap_entry(eng: &BiasEngine, name: &str) -> EntrySnapshot {
+    /// The persisted half of one entry (what a restart keeps).
+    fn snap_entry(eng: &BiasEngine, name: &str) -> Durable {
         eng.snapshot()
             .entries
             .into_iter()
             .find(|e| e.name == name)
             .expect("entry present")
+            .durable
+    }
+
+    /// One row for `comm` carrying an explicit closed-loop observation.
+    fn at_prio(comm: &str, static_prio: u64) -> Sample {
+        Sample {
+            static_prio,
+            ..sample(comm, 31, 31, 5_000_000, 500, 500)
+        }
+    }
+
+    fn change(name: &str, prev: i8, bias: i8, class: BiasClass, cause: Cause) -> Change {
+        Change {
+            name: name.to_string(),
+            prev,
+            bias,
+            class,
+            cause,
+        }
     }
 
     /// Two classifying windows of `mk` samples against a 400-score population
@@ -1064,9 +1124,9 @@ mod tests {
             w1.extend(mk(n, 32));
             w2.extend(mk(n, 32));
         }
-        eng.record_batch(&w1, ts(1));
-        eng.record_batch(&w2, ts(61));
-        eng.record_batch(&[], ts(121));
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61));
+        eng.ingest(&[], ts(121));
     }
 
     fn drive_bulk(eng: &mut BiasEngine, names: &[&str]) {
@@ -1075,9 +1135,9 @@ mod tests {
 
     /// Three attack steps at want+60/120/180: bias 0 → 3.
     fn ramp_attack(eng: &mut BiasEngine) {
-        tick(eng, 181);
-        tick(eng, 241);
-        tick(eng, 301);
+        eng.ingest(&[], ts(181));
+        eng.ingest(&[], ts(241));
+        eng.ingest(&[], ts(301));
     }
 
     #[test]
@@ -1144,9 +1204,9 @@ mod tests {
             }
             w1.extend(a1);
             w2.extend(a2);
-            eng.record_batch(&w1, ts(1));
-            eng.record_batch(&w2, ts(61));
-            eng.record_batch(&[], ts(121));
+            eng.ingest(&w1, ts(1));
+            eng.ingest(&w2, ts(61));
+            eng.ingest(&[], ts(121));
             classes.push(snap_entry(&eng, "app").class);
         }
         assert_eq!(classes[0], BiasClass::Bulk);
@@ -1161,18 +1221,18 @@ mod tests {
         let mut w2 = noise_batch(60);
         w2.extend(bulk_batch("app", 32));
 
-        eng.record_batch(&w1, ts(1));
-        eng.record_batch(&w2, ts(61)); // closes w1: 1 window below threshold
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61)); // closes w1: 1 window below threshold
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Unknown);
 
-        eng.record_batch(&[], ts(121)); // closes w2: 2nd window → BULK
+        eng.ingest(&[], ts(121)); // closes w2: 2nd window → BULK
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
 
         // crossing into the deadband holds the class
         let mut w3 = noise_batch(60);
         w3.extend(dead_batch("app", 32));
-        eng.record_batch(&w3, ts(181));
-        eng.record_batch(&[], ts(241)); // closes w3: deadband
+        eng.ingest(&w3, ts(181));
+        eng.ingest(&[], ts(241)); // closes w3: deadband
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
     }
 
@@ -1184,16 +1244,16 @@ mod tests {
         let mut w2 = noise_batch(60);
         w2.extend(resp_batch("app", 32));
 
-        eng.record_batch(&w1, ts(1));
-        eng.record_batch(&w2, ts(61));
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61));
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Unknown);
-        eng.record_batch(&[], ts(121));
+        eng.ingest(&[], ts(121));
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Responsive);
 
         let mut w3 = noise_batch(60);
         w3.extend(dead_batch("app", 32));
-        eng.record_batch(&w3, ts(181));
-        eng.record_batch(&[], ts(241));
+        eng.ingest(&w3, ts(181));
+        eng.ingest(&[], ts(241));
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Responsive);
     }
 
@@ -1210,33 +1270,33 @@ mod tests {
 
         // attack: at most 1 step / 60 s, first step 60 s after want-onset
         assert_eq!(snap_entry(&eng, "app").bias, 0);
-        tick(&mut eng, 180);
+        eng.ingest(&[], ts(180));
         assert_eq!(snap_entry(&eng, "app").bias, 0);
-        tick(&mut eng, 181);
+        eng.ingest(&[], ts(181));
         assert_eq!(snap_entry(&eng, "app").bias, 1);
-        tick(&mut eng, 240);
+        eng.ingest(&[], ts(240));
         assert_eq!(snap_entry(&eng, "app").bias, 1);
-        tick(&mut eng, 241);
+        eng.ingest(&[], ts(241));
         assert_eq!(snap_entry(&eng, "app").bias, 2);
-        tick(&mut eng, 300);
+        eng.ingest(&[], ts(300));
         assert_eq!(snap_entry(&eng, "app").bias, 2);
-        tick(&mut eng, 301);
+        eng.ingest(&[], ts(301));
         assert_eq!(snap_entry(&eng, "app").bias, 3); // 3 steps × 60 s
-        tick(&mut eng, 400);
+        eng.ingest(&[], ts(400));
         assert_eq!(snap_entry(&eng, "app").bias, 3); // clamped at max
 
         // deadband window → target 0 → release at most 1 step / 300 s
         let mut w = noise_batch(60);
         w.extend(dead_batch("app", 32));
-        eng.record_batch(&w, ts(420));
-        eng.record_batch(&[], ts(480)); // closes deadband window (want at 480)
-        tick(&mut eng, 700);
+        eng.ingest(&w, ts(420));
+        eng.ingest(&[], ts(480)); // closes deadband window (want at 480)
+        eng.ingest(&[], ts(700));
         assert_eq!(snap_entry(&eng, "app").bias, 3);
-        tick(&mut eng, 780);
+        eng.ingest(&[], ts(780));
         assert_eq!(snap_entry(&eng, "app").bias, 2);
-        tick(&mut eng, 1080);
+        eng.ingest(&[], ts(1080));
         assert_eq!(snap_entry(&eng, "app").bias, 1);
-        tick(&mut eng, 1380);
+        eng.ingest(&[], ts(1380));
         assert_eq!(snap_entry(&eng, "app").bias, 0); // 3 steps × 300 s: slower
     }
 
@@ -1245,13 +1305,13 @@ mod tests {
         let mut eng = BiasEngine::new(BiasConfig::default());
         drive_bulk(&mut eng, &["aaa", "bbb"]); // both Bulk, wants armed at 121
 
-        tick(&mut eng, 181);
+        eng.ingest(&[], ts(181));
         assert_eq!(snap_entry(&eng, "aaa").bias, 1); // sorted order spends budget
         assert_eq!(snap_entry(&eng, "bbb").bias, 0);
-        tick(&mut eng, 182);
+        eng.ingest(&[], ts(182));
         assert_eq!(snap_entry(&eng, "aaa").bias, 1);
         assert_eq!(snap_entry(&eng, "bbb").bias, 0); // within the 5 s cap
-        tick(&mut eng, 186);
+        eng.ingest(&[], ts(186));
         assert_eq!(snap_entry(&eng, "bbb").bias, 1); // budget free again
         assert_eq!(snap_entry(&eng, "aaa").bias, 1);
     }
@@ -1268,16 +1328,20 @@ mod tests {
         let mut eng = BiasEngine::new(BiasConfig::default());
         let mut entries = vec![EntrySnapshot {
             name: "app".into(),
-            class: BiasClass::Bulk,
-            confidence: 0.9,
-            ..EntrySnapshot::default()
+            durable: Durable {
+                class: BiasClass::Bulk,
+                confidence: 0.9,
+                ..Durable::default()
+            },
         }];
         for i in 0..100 {
             entries.push(EntrySnapshot {
                 name: format!("z-flood-{i:03}"),
-                bias: 2,
-                confidence: 0.5,
-                ..EntrySnapshot::default()
+                durable: Durable {
+                    bias: 2,
+                    confidence: 0.5,
+                    ..Durable::default()
+                },
             });
         }
         eng.restore(BiasSnapshot {
@@ -1285,17 +1349,17 @@ mod tests {
             threshold_ema: None,
             entries,
         });
-        tick(&mut eng, 1); // wants stamp here: flood releases mature at 301
+        eng.ingest(&[], ts(1)); // wants stamp here: flood releases mature at 301
 
         for t in (301..=371).step_by(5) {
-            tick(&mut eng, t);
+            eng.ingest(&[], ts(t));
         }
         // the flood drains a little...
         let drained = eng
             .snapshot()
             .entries
             .iter()
-            .filter(|e| e.name.starts_with("z-flood") && e.bias < 2)
+            .filter(|e| e.name.starts_with("z-flood") && e.durable.bias < 2)
             .count();
         assert!(drained >= 3, "flood should drain, got {drained}");
         // ...and the attack still ramped 0 -> 3 at its own 30 s cadence
@@ -1314,21 +1378,21 @@ mod tests {
         assert_eq!(snap_entry(&eng, "starved").class, BiasClass::Responsive);
         ramp_attack(&mut eng);
         assert_eq!(snap_entry(&eng, "starved").bias, -1);
-        tick(&mut eng, 400);
+        eng.ingest(&[], ts(400));
         assert_eq!(snap_entry(&eng, "starved").bias, -1); // clamped at min
 
         // RESPONSIVE but delivered == demand → target 0, no −1
         let mut eng2 = BiasEngine::new(BiasConfig::default());
         drive_class(&mut eng2, &["ok"], resp_batch);
         ramp_attack(&mut eng2);
-        tick(&mut eng2, 400);
+        eng2.ingest(&[], ts(400));
         assert_eq!(snap_entry(&eng2, "ok").bias, 0);
 
         // bad ratio but demand below the noise floor → gate stays shut
         let mut eng3 = BiasEngine::new(BiasConfig::default());
         drive_class(&mut eng3, &["tiny"], tiny_demand_batch);
         ramp_attack(&mut eng3);
-        tick(&mut eng3, 400);
+        eng3.ingest(&[], ts(400));
         assert_eq!(snap_entry(&eng3, "tiny").bias, 0);
     }
 
@@ -1343,7 +1407,7 @@ mod tests {
 
         // one half-life of absence halves confidence exactly (aging anchor is
         // the last window close at t = 121)
-        eng.age(ts(121 + 1800));
+        eng.tick(ts(121 + 1800));
         let e = snap_entry(&eng, "app");
         assert!((e.confidence - 0.375).abs() < 1e-12);
         assert_eq!(e.bias, 3); // release is rate-limited: still parked
@@ -1354,7 +1418,7 @@ mod tests {
         let mut t = 121 + 1800;
         while t < 121 + 200_000 {
             t += 100;
-            eng.age(ts(t));
+            eng.tick(ts(t));
         }
         let e = snap_entry(&eng, "app");
         assert_eq!(e.confidence, 0.0);
@@ -1368,7 +1432,7 @@ mod tests {
         ramp_attack(&mut eng);
         assert_eq!(snap_entry(&eng, "app").bias, 3);
 
-        eng.age(ts(121 + 1800 * 80)); // decay underflows the epsilon in one call
+        eng.tick(ts(121 + 1800 * 80)); // decay underflows the epsilon in one call
         let e = snap_entry(&eng, "app");
         assert_eq!(e.confidence, 0.0);
         assert_eq!(e.bias, 0);
@@ -1382,9 +1446,9 @@ mod tests {
         };
         let mut eng = BiasEngine::new(cfg);
         for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
-            eng.record_batch(&bulk_batch(name, 1), ts(1 + i as u64));
+            eng.ingest(&bulk_batch(name, 1), ts(1 + i as u64));
         }
-        eng.age(ts(100));
+        eng.tick(ts(100));
         let mut names: Vec<String> = eng
             .snapshot()
             .entries
@@ -1402,22 +1466,28 @@ mod tests {
         ramp_attack(&mut eng); // bias 3
         // Never actuated by us: ambient nice is not ours to verify, so a
         // mismatching observation must not freeze anything.
-        eng.verify_applied("app", 20); // observed nice 0 ≠ 3 would mismatch
+        eng.ingest(&[at_prio("app", 20)], ts(360)); // nice 0 ≠ 3 would mismatch
         assert!(!snap_entry(&eng, "app").frozen);
         // Actuated now — the remembered value is the expectation.
         eng.note_applied("app", Some(3));
         assert_eq!(eng.applied_nice("app"), Some(3));
         // static_prio 0 (nice −20 / absent field default) → skip verification.
-        eng.verify_applied("app", 0);
+        eng.ingest(&[at_prio("app", 0)], ts(361));
         assert!(!snap_entry(&eng, "app").frozen);
         // Releasing the claim stops verification again.
         eng.note_applied("app", None);
         assert_eq!(eng.applied_nice("app"), None);
-        eng.verify_applied("app", 20);
+        eng.ingest(&[at_prio("app", 20)], ts(362));
         assert!(!snap_entry(&eng, "app").frozen);
-        // Unknown names are ignored (no entry created).
-        eng.verify_applied("ghost", 23);
-        assert!(eng.snapshot().entries.iter().all(|e| e.name != "ghost"));
+    }
+
+    /// The row check is private and `ingest` creates entries for the rows it
+    /// sees; an unknown name must still be a no-op (nothing to verify).
+    #[test]
+    fn verify_row_ignores_unknown_names() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        eng.verify_row("ghost", 23, unix_secs(ts(1)));
+        assert!(eng.snapshot().entries.is_empty());
     }
 
     #[test]
@@ -1429,14 +1499,14 @@ mod tests {
         assert_eq!(eng.target_nice("app", 0), 3);
 
         // observed nice 0 (static_prio 20) ≠ applied 3 → freeze
-        eng.verify_applied("app", 20);
+        eng.ingest(&[at_prio("app", 20)], ts(360));
         let e = snap_entry(&eng, "app");
         assert!(e.frozen);
         assert_eq!(e.bias, 3);
         assert_eq!(e.confidence, 0.75);
 
         // samples for other names leave the frozen entry untouched
-        eng.record_batch(&bulk_batch("other", 5), ts(361));
+        eng.ingest(&bulk_batch("other", 5), ts(361));
         let e = snap_entry(&eng, "app");
         assert!(e.frozen);
         assert_eq!(e.confidence, 0.75);
@@ -1444,19 +1514,81 @@ mod tests {
 
         // a persistent mismatch never re-baselines: samples are dropped and
         // confidence must not churn at LOW on every batch
-        eng.record_batch(&bulk_batch("app", 5), ts(362));
-        eng.verify_applied("app", 20);
+        eng.ingest(&bulk_batch("app", 5), ts(362));
         let e = snap_entry(&eng, "app");
         assert!(e.frozen);
         assert_eq!(e.confidence, 0.75);
 
         // a matching observation re-baselines: unfreeze + low confidence,
         // bias kept (evidence/aging will move it from here)
-        eng.verify_applied("app", 23); // nice 23 − 20 == 3
+        eng.ingest(&[at_prio("app", 23)], ts(363)); // nice 23 − 20 == 3
         let e = snap_entry(&eng, "app");
         assert!(!e.frozen);
         assert_eq!(e.confidence, LOW_CONFIDENCE);
         assert_eq!(e.bias, 3);
+    }
+
+    /// Verification must precede absorption: a row that re-baselines a frozen
+    /// entry is evidence in the *same* batch. Absorbing first drops the whole
+    /// window (frozen entries take no samples), so the classification lands
+    /// one window late.
+    #[test]
+    fn ingest_rebaselines_and_counts_the_same_batch() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]); // class Bulk, confidence 0.75
+        ramp_attack(&mut eng); // bias 3
+        eng.note_applied("app", Some(3));
+        eng.ingest(&[at_prio("app", 20)], ts(300)); // nice 0 ≠ 3 → frozen
+        assert!(snap_entry(&eng, "app").frozen);
+
+        // The batch reports the applied nice, so its re-baseline and the
+        // window it fills have to happen in the same call. The noise rows keep
+        // the population threshold from drifting onto `app` alone.
+        let mut batch = noise_batch(60);
+        batch.extend((0..32).map(|_| at_prio("app", 23)));
+        eng.ingest(&batch, ts(361));
+        let e = snap_entry(&eng, "app");
+        assert!(!e.frozen, "a matching row must re-baseline the entry");
+        assert_eq!(e.confidence, LOW_CONFIDENCE, "no window has closed yet");
+
+        eng.ingest(&[], ts(421)); // closes the window the batch fed
+        let e = snap_entry(&eng, "app");
+        assert!(
+            e.confidence > LOW_CONFIDENCE,
+            "the re-baselined batch must count as evidence, confidence {}",
+            e.confidence
+        );
+    }
+
+    /// A relax step taken while the sample stream is down used to be deferred
+    /// to the next batch or lost outright (the timeout arm never drained).
+    /// `tick` reports its own moves, with the cause that made them.
+    #[test]
+    fn tick_reports_relax_moves() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut eng, &["app"]);
+        ramp_attack(&mut eng); // bias 3, confidence 0.75
+
+        // A deadband window turns the target to 0; the release only fires
+        // release_step_s later, with no batch anywhere in between.
+        let mut w = noise_batch(60);
+        w.extend(dead_batch("app", 32));
+        eng.ingest(&w, ts(420));
+        eng.ingest(&[], ts(480)); // closes it: the release want stamps at 480
+        assert_eq!(
+            eng.tick(ts(780)),
+            vec![change("app", 3, 2, BiasClass::Bulk, Cause::Relax)],
+            "the no-evidence pass must report its relax step"
+        );
+
+        // Zero confidence flushes the rest, also without a batch.
+        let mut flushed = BiasEngine::new(BiasConfig::default());
+        drive_bulk(&mut flushed, &["app"]);
+        ramp_attack(&mut flushed); // bias 3
+        assert_eq!(
+            flushed.tick(ts(121 + 1800 * 80)),
+            vec![change("app", 3, 0, BiasClass::Bulk, Cause::Flush)]
+        );
     }
 
     #[test]
@@ -1465,19 +1597,18 @@ mod tests {
         drive_bulk(&mut eng, &["app"]);
         ramp_attack(&mut eng); // bias 3
         eng.note_applied("app", Some(3));
-        eng.verify_applied("app", 20); // mismatch → freeze
-        // Samples keep flowing while the loop keeps lying: the entry stays
-        // frozen and un-updated...
+        eng.ingest(&[at_prio("app", 20)], ts(360)); // mismatch → freeze
+        // Samples keep flowing while the loop keeps lying (they carry
+        // static_prio 20 = nice 0): the entry stays frozen and un-updated...
         for i in 0..5u64 {
-            eng.record_batch(&bulk_batch("app", 5), ts(400 + i * 60));
-            eng.verify_applied("app", 20);
+            eng.ingest(&bulk_batch("app", 5), ts(400 + i * 60));
             assert!(snap_entry(&eng, "app").frozen);
         }
         // ...but aging still flushes the bias: old learnings never pin it.
         let mut t = 400 + 5 * 60;
         while t < 200_000 {
             t += 100;
-            eng.age(ts(t));
+            eng.tick(ts(t));
         }
         assert_eq!(snap_entry(&eng, "app").bias, 0);
     }
@@ -1495,7 +1626,7 @@ mod tests {
         drive_bulk(&mut eng, &["app"]);
         ramp_attack(&mut eng); // bias 3
         eng.note_applied("app", Some(3));
-        eng.verify_applied("app", 20); // mismatch -> frozen
+        eng.ingest(&[at_prio("app", 20)], ts(360)); // mismatch -> frozen
 
         // restart: the state round-trips, the actuation on record does not
         let snap = eng.snapshot();
@@ -1504,7 +1635,7 @@ mod tests {
         assert!(snap_entry(&eng2, "app").frozen);
 
         // a fresh sample must re-baseline: bias kept, confidence low
-        eng2.verify_applied("app", 20);
+        eng2.ingest(&[at_prio("app", 20)], ts(361));
         let e = snap_entry(&eng2, "app");
         assert!(!e.frozen);
         assert_eq!(e.confidence, LOW_CONFIDENCE);
@@ -1522,10 +1653,10 @@ mod tests {
         drive_bulk(&mut eng, &["app"]);
         ramp_attack(&mut eng); // bias 3
         eng.note_applied("app", Some(3));
-        eng.verify_applied("app", 20); // mismatch -> frozen
+        eng.ingest(&[at_prio("app", 20)], ts(360)); // mismatch -> frozen
 
         eng.note_applied("app", None); // apply did not take: claim released
-        eng.verify_applied("app", 23); // would "match" — but nothing is claimed
+        eng.ingest(&[at_prio("app", 23)], ts(361)); // would "match" — but nothing is claimed
         assert!(
             snap_entry(&eng, "app").frozen,
             "a released claim must not unwind the freeze"
@@ -1546,8 +1677,10 @@ mod tests {
             threshold_ema: None,
             entries: vec![crate::bias_state::EntrySnapshot {
                 name: "app".into(),
-                bias: 4,
-                ..crate::bias_state::EntrySnapshot::default()
+                durable: crate::bias_state::Durable {
+                    bias: 4,
+                    ..crate::bias_state::Durable::default()
+                },
             }],
         };
         eng.restore(snap);
@@ -1568,19 +1701,23 @@ mod tests {
     }
 
     #[test]
-    fn changed_recently_logs_each_move_exactly_once() {
+    fn ingest_reports_each_move_exactly_once() {
         let mut eng = BiasEngine::new(BiasConfig::default());
         drive_bulk(&mut eng, &["app"]);
-        tick(&mut eng, 181); // app bias 0 → 1 at T0+181
-        assert_eq!(eng.take_changed_recently(), vec![("app".to_string(), 1)]);
-        // consuming the marks keeps the summary line from repeating
-        assert!(eng.take_changed_recently().is_empty());
-        // stale marks (e.g. moves during a stream outage) are still reported
-        // exactly once — the window must not swallow them
-        tick(&mut eng, 241); // app bias 1 → 2
-        eng.age(ts(241 + 10 * 60)); // far beyond window_s
-        assert_eq!(eng.take_changed_recently(), vec![("app".to_string(), 2)]);
-        assert!(eng.take_changed_recently().is_empty());
+        let changes = eng.ingest(&[], ts(181)); // app bias 0 → 1 at T0+181
+        assert_eq!(
+            changes,
+            vec![change("app", 0, 1, BiasClass::Bulk, Cause::Evidence)]
+        );
+        // the move was reported, not queued: a pass with nothing to do is silent
+        assert!(eng.ingest(&[], ts(186)).is_empty());
+        // the next step is a fresh report carrying its own `prev`
+        let changes = eng.ingest(&[], ts(211)); // app bias 1 → 2
+        assert_eq!(
+            changes,
+            vec![change("app", 1, 2, BiasClass::Bulk, Cause::Evidence)]
+        );
+        assert!(eng.ingest(&[], ts(216)).is_empty());
     }
 
     #[test]
@@ -1618,33 +1755,38 @@ mod tests {
         let mut w1 = noise_batch(60);
         w1.extend(decisive_bulk_batch("cc1plus", 4));
         w1.extend(decisive_bulk_batch("lto1", 4));
-        eng.record_batch(&w1, ts(1));
-        eng.record_batch(&[], ts(61)); // closes w1
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&[], ts(61)); // closes w1
 
         let snap = eng.snapshot();
         let names: Vec<&str> = snap.entries.iter().map(|e| e.name.as_str()).collect();
         // cc1plus/lto1 pooled into "build"; only the noise population beside it
         assert_eq!(names, vec!["build", "noise"]);
         assert_eq!(
-            snap.entries.iter().find(|e| e.name == "build").unwrap().class,
+            snap.entries
+                .iter()
+                .find(|e| e.name == "build")
+                .unwrap()
+                .durable
+                .class,
             BiasClass::Bulk
         );
 
         // ramp the pooled bias; every member name sees it
-        tick(&mut eng, 91);
-        tick(&mut eng, 121);
-        tick(&mut eng, 151);
+        eng.ingest(&[], ts(91));
+        eng.ingest(&[], ts(121));
+        eng.ingest(&[], ts(151));
         assert_eq!(eng.target_nice("lto1", 0), 3);
         assert_eq!(eng.target_nice("cc1plus", 0), 3);
 
         // actuation + closed-loop verification also key through members
         eng.note_applied("lto1", Some(3));
         assert_eq!(eng.applied_nice("cc1plus"), Some(3));
-        eng.verify_applied("ld", 20); // observed nice 0 ≠ 3 → freeze the entry
+        eng.ingest(&[at_prio("ld", 20)], ts(160)); // nice 0 ≠ 3 → freeze the entry
         assert!(snap_entry(&eng, "build").frozen);
 
         // non-members keep their own entries
-        eng.record_batch(&decisive_bulk_batch("x265", 4), ts(200));
+        eng.ingest(&decisive_bulk_batch("x265", 4), ts(200));
         assert!(eng.snapshot().entries.iter().any(|e| e.name == "x265"));
     }
 
@@ -1654,16 +1796,16 @@ mod tests {
         let mut eng = BiasEngine::new(BiasConfig::default());
         let mut w1 = noise_batch(60);
         w1.extend(decisive_bulk_batch("app", 7));
-        eng.record_batch(&w1, ts(1));
-        eng.record_batch(&[], ts(61)); // ONE window suffices
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&[], ts(61)); // ONE window suffices
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
 
         // one sample short of the floor: still just sparse evidence
         let mut eng2 = BiasEngine::new(BiasConfig::default());
         let mut w = noise_batch(60);
         w.extend(decisive_bulk_batch("app", 6));
-        eng2.record_batch(&w, ts(1));
-        eng2.record_batch(&[], ts(61));
+        eng2.ingest(&w, ts(1));
+        eng2.ingest(&[], ts(61));
         assert_eq!(snap_entry(&eng2, "app").class, BiasClass::Unknown);
     }
 
@@ -1676,17 +1818,17 @@ mod tests {
         w1.extend(bulk_batch("app", 29));
         let mut w2 = noise_batch(60);
         w2.extend(bulk_batch("app", 29));
-        eng.record_batch(&w1, ts(1));
-        eng.record_batch(&w2, ts(61));
-        eng.record_batch(&[], ts(121));
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61));
+        eng.ingest(&[], ts(121));
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Unknown);
 
         // …and one full window never suffices for non-decisive evidence
         let mut eng2 = BiasEngine::new(BiasConfig::default());
         let mut w = noise_batch(60);
         w.extend(bulk_batch("app", 32));
-        eng2.record_batch(&w, ts(1));
-        eng2.record_batch(&[], ts(61));
+        eng2.ingest(&w, ts(1));
+        eng2.ingest(&[], ts(61));
         assert_eq!(snap_entry(&eng2, "app").class, BiasClass::Unknown);
     }
 
@@ -1706,11 +1848,11 @@ mod tests {
         let mut eng = BiasEngine::new(BiasConfig::default()); // attack_step 30
         drive_bulk(&mut eng, &["app"]); // class Bulk at t=121, want armed at 121
         eng.note_applied("app", Some(3));
-        eng.verify_applied("app", 20); // mismatch -> frozen
-        eng.verify_applied("app", 23); // match -> re-baseline (conf -> LOW)
+        eng.ingest(&[at_prio("app", 20)], ts(140)); // mismatch -> frozen
+        eng.ingest(&[at_prio("app", 23)], ts(141)); // match -> re-baseline (conf -> LOW)
         assert_eq!(snap_entry(&eng, "app").confidence, LOW_CONFIDENCE);
 
-        tick(&mut eng, 151); // want(121) + 30 -> the step must still happen
+        eng.ingest(&[], ts(151)); // want(121) + 30 -> the step must still happen
         assert_eq!(snap_entry(&eng, "app").bias, 1);
     }
 
@@ -1728,23 +1870,23 @@ mod tests {
         drive_bulk(&mut eng, &["app"]); // class Bulk at t=121, want armed at 121
 
         // Take exactly one step — the live run's frozen starting point.
-        eng.record_batch(&borderline_batch("app", 32), ts(151));
+        eng.ingest(&borderline_batch("app", 32), ts(151));
         assert_eq!(snap_entry(&eng, "app").bias, 1);
 
         // Alternate decisive BULK windows (score 100) with borderline
         // deadband windows (score 324): `cand` flips Bulk↔None and the
         // target 3↔0 every window while the class holds BULK — the flip
         // pattern of the live build. Windows close at 181, 241, …;
-        // each record_batch closes the previous window first, then slew-passes.
+        // each ingest closes the previous window first, then slew-passes.
         for i in 0..6u64 {
             let mut bulk = noise_batch(60);
             bulk.extend(decisive_bulk_batch("app", 32));
             let mut dead = noise_batch(60);
             dead.extend(borderline_batch("app", 32));
-            eng.record_batch(&bulk, ts(181 + 120 * i)); // closes a dead window
-            eng.record_batch(&dead, ts(241 + 120 * i)); // closes a bulk window
+            eng.ingest(&bulk, ts(181 + 120 * i)); // closes a dead window
+            eng.ingest(&dead, ts(241 + 120 * i)); // closes a bulk window
         }
-        tick(&mut eng, 901); // close the trailing dead window
+        eng.ingest(&[], ts(901)); // close the trailing dead window
 
         let e = snap_entry(&eng, "app");
         assert_eq!(e.class, BiasClass::Bulk, "alternation must hold the class");
@@ -1765,8 +1907,8 @@ mod tests {
 
         // two windows of 5 scored samples each (below min_samples = 30)
         for (open, close) in [(181, 241), (241, 301)] {
-            eng.record_batch(&bulk_batch("app", 5), ts(open));
-            eng.record_batch(&[], ts(close));
+            eng.ingest(&bulk_batch("app", 5), ts(open));
+            eng.ingest(&[], ts(close));
             let e = snap_entry(&eng, "app");
             assert!(
                 (e.confidence - conf).abs() < 1e-12,
@@ -1791,8 +1933,8 @@ mod tests {
         let unscored: Batch = (0..32)
             .map(|_| sample("app", 0, 31, 0, 500, 500))
             .collect();
-        eng.record_batch(&unscored, ts(181));
-        eng.record_batch(&[], ts(241));
+        eng.ingest(&unscored, ts(181));
+        eng.ingest(&[], ts(241));
         let e = snap_entry(&eng, "app");
         assert_eq!(e.class, BiasClass::Bulk);
         assert!(
@@ -1826,8 +1968,8 @@ mod tests {
 
         let mut w = noise_batch(60);
         w.extend((0..32).map(|_| sample("cc1plus", 31, 31, 1_000_000_000, 500, 500)));
-        eng.record_batch(&w, ts(181));
-        eng.record_batch(&[], ts(241));
+        eng.ingest(&w, ts(181));
+        eng.ingest(&[], ts(241));
         // The 32 compiler samples score 100; smoothing from the real zero
         // gives 100 * (1 - e^-1) ~= 63.2, while treating 0.0 as
         // "uninitialized" would snap the EMA to 100.
@@ -1849,7 +1991,7 @@ mod tests {
         let mut eng = BiasEngine::new(cfg);
         drive_class(&mut eng, &["starved"], starved_batch);
         ramp_attack(&mut eng);
-        tick(&mut eng, 400);
+        eng.ingest(&[], ts(400));
         assert_eq!(
             snap_entry(&eng, "starved").bias,
             0,
@@ -1869,20 +2011,36 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_restore_round_trip_preserves_state() {
+    fn snapshot_restore_round_trip_keeps_bias_but_not_live_state() {
         let mut eng = BiasEngine::new(BiasConfig::default());
         drive_bulk(&mut eng, &["app"]);
         ramp_attack(&mut eng);
+        // Mid-ramp: a claim on record and a window open with samples in it.
+        eng.note_applied("app", Some(3));
+        let mid: Batch = (0..5).map(|_| at_prio("app", 23)).collect();
+        eng.ingest(&mid, ts(305));
         let snap = eng.snapshot();
 
         let mut eng2 = BiasEngine::new(BiasConfig::default());
         eng2.restore(snap.clone());
         assert_eq!(eng2.snapshot(), snap);
         assert_eq!(eng2.target_nice("app", 0), 3);
+        assert_eq!(snap_entry(&eng2, "app").bias, 3, "durable bias round-trips");
 
-        // aging resumes across the restart from each entry's last_seen
+        // The transient half is rebuilt, never persisted: no claim (the
+        // closed loop cannot verify against a restart), no want stamps, no
+        // window accumulators.
+        let e = &eng2.entries["app"];
+        assert_eq!(eng2.applied_nice("app"), None);
+        assert!(!e.live.claim_recorded);
+        assert!(e.live.want_since_attack.is_none());
+        assert!(e.live.want_since_release.is_none());
+        assert_eq!((e.live.win_n, e.live.win_score_n), (0, 0));
+        // aging resumes from the last sighting
+        assert_eq!(e.live.aged_at, snap_entry(&eng2, "app").last_seen);
+
         let before = snap_entry(&eng2, "app").confidence;
-        eng2.age(ts(61 + 1800));
+        eng2.tick(ts(305 + 1800));
         let after = snap_entry(&eng2, "app").confidence;
         assert!((after - before * 0.5).abs() < 1e-12);
     }
@@ -1903,15 +2061,15 @@ mod tests {
 
         let mut w = noise_batch(60);
         w.extend(decisive_bulk_batch("app", 7));
-        eng.record_batch(&w, ts(1)); // window 1..11
-        eng.record_batch(&[], ts(11)); // closes it: 10 s, not 60 s
+        eng.ingest(&w, ts(1)); // window 1..11
+        eng.ingest(&[], ts(11)); // closes it: 10 s, not 60 s
         assert_eq!(snap_entry(&eng, "app").class, BiasClass::Bulk);
 
         // Control: the same fixture under the default 60 s window is still
         // open at t = 11, so this assertion is about the new width.
         let mut wide = BiasEngine::new(BiasConfig::default());
-        wide.record_batch(&w, ts(1));
-        wide.record_batch(&[], ts(11));
+        wide.ingest(&w, ts(1));
+        wide.ingest(&[], ts(11));
         assert_eq!(snap_entry(&wide, "app").class, BiasClass::Unknown);
     }
 
@@ -1929,8 +2087,8 @@ mod tests {
         assert_eq!(sample_score(&sample("x", 1023, 1023, 400_000_000, 500, 500)), Some(441));
 
         let mut narrow = BiasEngine::new(BiasConfig::default());
-        narrow.record_batch(&noise_batch(60), ts(1));
-        narrow.record_batch(&[], ts(61)); // population only: T = 400
+        narrow.ingest(&noise_batch(60), ts(1));
+        narrow.ingest(&[], ts(61)); // population only: T = 400
         narrow.reconfigure(
             BiasConfig {
                 deadband_pct: 3,
@@ -1940,17 +2098,17 @@ mod tests {
         );
         let mut w = noise_batch(60);
         w.extend(near("app", 32));
-        narrow.record_batch(&w, ts(120));
-        narrow.record_batch(&[], ts(181));
+        narrow.ingest(&w, ts(120));
+        narrow.ingest(&[], ts(181));
         assert_eq!(snap_entry(&narrow, "app").class, BiasClass::Responsive);
 
         // Control: identical evidence under the default 15 % deadband holds
         // the class (no reconfigure ⇒ the key would have been ignored).
         let mut wide = BiasEngine::new(BiasConfig::default());
-        wide.record_batch(&noise_batch(60), ts(1));
-        wide.record_batch(&[], ts(61));
-        wide.record_batch(&w, ts(120));
-        wide.record_batch(&[], ts(181));
+        wide.ingest(&noise_batch(60), ts(1));
+        wide.ingest(&[], ts(61));
+        wide.ingest(&w, ts(120));
+        wide.ingest(&[], ts(181));
         assert_eq!(snap_entry(&wide, "app").class, BiasClass::Unknown);
     }
 
@@ -1962,7 +2120,7 @@ mod tests {
         drive_bulk(&mut eng, &["app"]);
         ramp_attack(&mut eng);
         let before = snap_entry(&eng, "app");
-        assert_eq!((before.bias, eng.entries["app"].target), (3, 3));
+        assert_eq!((before.bias, eng.entries["app"].live.target), (3, 3));
         let threshold_before = eng.snapshot().threshold_ema;
 
         eng.reconfigure(
@@ -1975,15 +2133,23 @@ mod tests {
 
         let after = snap_entry(&eng, "app");
         assert_eq!(after.bias, 1, "clamped immediately");
-        assert_eq!(eng.entries["app"].target, 1, "target follows the class and the new clamp");
+        assert_eq!(
+            eng.entries["app"].live.target,
+            1,
+            "target follows the class and the new clamp"
+        );
         assert_eq!(eng.target_nice("app", 0), 1);
         // Historical evidence is not configuration: it must survive.
         assert_eq!(after.score_ema, before.score_ema);
         assert_eq!(after.confidence, before.confidence);
         assert_eq!(after.class, before.class);
         assert_eq!(eng.snapshot().threshold_ema, threshold_before);
-        // The clamp surfaces on the normal "bias changed" log path.
-        assert_eq!(eng.take_changed_recently(), vec![("app".to_string(), 1)]);
+        // The clamp surfaces on the normal "bias changed" path at the next
+        // pass, marked as a non-evidence move.
+        assert_eq!(
+            eng.ingest(&[], ts(305)),
+            vec![change("app", 3, 1, BiasClass::Bulk, Cause::Relax)]
+        );
     }
 
     /// Changing `bias_group.<tag>` changes history keys: the members are
@@ -1999,8 +2165,8 @@ mod tests {
         // A second family member with weaker evidence (one decisive window).
         let mut w = noise_batch(60);
         w.extend(decisive_bulk_batch("lto1", 8));
-        eng.record_batch(&w, ts(361));
-        eng.record_batch(&[], ts(421)); // closes lto1's window
+        eng.ingest(&w, ts(361));
+        eng.ingest(&[], ts(421)); // closes lto1's window
         let weak = snap_entry(&eng, "lto1");
         assert_eq!(weak.class, BiasClass::Bulk);
         assert!(weak.confidence < strong.confidence, "{weak:?} vs {strong:?}");

@@ -38,8 +38,11 @@ green/clean — the done-gate for any code wave).
 - Falsify new checks (mutation probe / red-first) before trusting a green suite;
   never weaken assertions to pass. Judge runs by target artifacts, not pipe exit codes.
 - Journal telemetry is only `bias changed` lines — freeze/rebaseline/classify
-  events are silent. A restart that restores history emits a one-off burst
-  (each restored entry re-stamps wants on the first slew pass). Bias state comes from `aranicy dump bias` and
+  events are silent. Each line now carries `prev`, `class` and `cause`
+  (`Evidence`/`Relax`/`Flush`), so an evidence step and a relax stop looking
+  alike; relax/flush moves taken while no batch arrives are reported too, so the
+  line rate rises when the stream dies. A restart that restores history emits a
+  one-off burst (each restored entry re-stamps wants on the first slew pass). Bias state comes from `aranicy dump bias` and
   `/var/lib/aranicy/bias-state`.
 
 ## Pitfalls & lessons
@@ -122,7 +125,23 @@ accepts and always errors retries at the floor forever.
   connections; resetting per connection silently replays the first (often the
   failure) entry and wedges reconnect tests in confusing ways.
 
-## Bias-engine control-law lessons — Last reviewed: 2026-10-31 (threshold-mean pitfall is live again: the v0.2.3 ramp-starvation defect is exactly this failure mode)
+## Bias-engine control-law lessons — Last reviewed: 2026-11-09 (threshold-mean pitfall is live again: the v0.2.3 ramp-starvation defect is exactly this failure mode)
+
+- The engine has two verbs and the loop owes both per iteration: `ingest`
+  (verify → absorb → attack pass) and `tick` (wall-clock decay → relax pass).
+  Aging must NOT be left to the loop's idle timeout: batches arrive every
+  500 ms and the timeout is 1 s, so a healthy stream never fires it (measured
+  live: a vanished name held `confidence 0.994599` unchanged across 145 s;
+  with `bias_pass` the same cohort decayed at ratio 0.9772/60 s = one
+  half-life law). `daemon::bias_pass` is the composition and
+  `a_pass_ages_what_the_batch_did_not_mention` pins it.
+- `ingest` verifies every row before absorbing: absorption skips frozen
+  entries, so a re-baselining row must be verified first or its first window
+  is silently lost (`ingest_rebaselines_and_counts_the_same_batch`).
+- `bias_state::Durable` is the entire persistence list — `bias_state::Live`
+  deliberately has no `Deserialize`, so transient state loaded from disk is a
+  compile error and adding a durable field needs no second projection. The old
+  hand-written projection silently dropped `relax_watermark`.
 
 - "No faster than N steps × interval" rate limits must gate the FIRST step on
   want-onset + interval too; gating only last-step + interval lets a ramp of
@@ -277,10 +296,11 @@ signal while tests are running.
 
 An entry with `confidence == 0` and `bias == 0` can still be selected for an
 **attack** step (`direction_wants` compares `target` to `bias`): the step sets
-`bias = ±1`, then `age()` in the same `bias_loop` iteration zeroes it because
-confidence is 0. Net effect: the global step budget is spent, the FIFO
-re-arms, and the journal logs `bias changed … bias=0` (a "change" to the same
-value) roughly every 11 minutes per such name. Fix belongs with the wave-2
+`bias = ±1`, then the aging pass in the same loop iteration zeroes it because
+confidence is 0. Net effect: the global step budget is spent and the FIFO
+re-arms. The split verbs make the waste visible: `ingest` reports
+`prev=0 bias=1 cause=Evidence`, `tick` then reports
+`prev=1 bias=0 cause=Flush` for the same name. Fix belongs with the wave-2
 classifier work, not as a drive-by change to the control law.
 
 ## Bias-engine config defaults — Last reviewed: 2026-10-31 (verify against `crates/aranicy-daemon/src/config.rs`; do not re-derive)

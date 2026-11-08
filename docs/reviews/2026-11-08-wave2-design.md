@@ -359,6 +359,18 @@ for c in &changes {
 The guard now drops before logging (today an explicit `drop(engine)`,
 `daemon.rs:269`), so the mutex is never held across a write.
 
+**Correction (implemented 2026-11-09).** The sketch above is wrong for the
+batch arm: batches arrive every 500 ms (`bias_cadence_ms`) while `recv_timeout`
+is 1 s, so `tick` would never run on a healthy stream and wall-clock aging
+would stop — measured live, a vanished name held `confidence 0.994599`
+unchanged across 145 s. The batch arm therefore runs `bias_pass` =
+`ingest` then `tick` at the same timestamp, exactly the pre-seam
+`record_batch` → `age` sequence; `tick` remains the only no-evidence verb (it
+never attacks) and the timeout arm calls it alone. Post-fix the same cohort
+decayed at 0.9772 per 60 s (one half-life law). Two consequences: aging is not
+optional per iteration, and a no-op attack now shows both its `Evidence` and
+its `Flush` line.
+
 ## 4.4 What `Change` contains, and the journal contract
 
 Today the line is `tracing::info!(name, bias, "bias changed")`

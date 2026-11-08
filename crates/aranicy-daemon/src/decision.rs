@@ -560,10 +560,12 @@ mod tests {
             threshold_ema: None,
             entries: vec![EntrySnapshot {
                 name: comm.to_string(),
-                bias,
-                confidence: 1.0,
-                last_seen: 1_000,
-                ..EntrySnapshot::default()
+                durable: crate::bias_state::Durable {
+                    bias,
+                    confidence: 1.0,
+                    last_seen: 1_000,
+                    ..crate::bias_state::Durable::default()
+                },
             }],
         });
         engine

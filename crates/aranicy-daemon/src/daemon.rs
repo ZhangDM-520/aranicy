@@ -231,10 +231,11 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bias thread: consumes sampler batches, updates the engine, verifies our own
-/// applied nice against lavd's `static_prio` view, ages history, debounces
-/// state writes. Aging continues on `Timeout` so a dead stream relaxes bias
-/// instead of freezing it (owner rule).
+/// Bias thread: consumes sampler batches, feeds the engine one verb per
+/// event (`ingest` for a delivered window, `tick` when the stream is quiet)
+/// and logs every move it reports, debounces state writes. Aging continues on
+/// `Timeout` so a dead stream relaxes bias instead of freezing it (owner
+/// rule).
 fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>) {
     use std::sync::mpsc::RecvTimeoutError;
     let state_path = shared.config().bias_state_path.clone();
@@ -243,20 +244,11 @@ fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>
         match rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(batch) => {
                 let now = std::time::SystemTime::now();
-                let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
-                for s in &batch {
-                    // Closed loop verifies ONLY against the nice this daemon
-                    // applied for the comm — never re-derived from rules
-                    // (comm and the rule-name namespace differ) and skipped
-                    // for comms we never touched.
-                    engine.verify_applied(&s.comm, s.static_prio);
-                }
-                engine.record_batch(&batch, now);
-                engine.age(now);
-                for (name, bias) in engine.take_changed_recently() {
-                    tracing::info!(name, bias, "bias changed");
-                }
-                drop(engine);
+                let changes = {
+                    let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
+                    bias_pass(&mut engine, &batch, now)
+                };
+                log_changes(&changes);
                 if last_save.elapsed() >= std::time::Duration::from_secs(60) {
                     let snap =
                         shared.bias.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
@@ -267,14 +259,46 @@ fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                shared
-                    .bias
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .age(std::time::SystemTime::now());
+                let changes = {
+                    let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
+                    engine.tick(std::time::SystemTime::now())
+                };
+                log_changes(&changes);
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+/// One bias-loop iteration over a delivered window: evidence first, then the
+/// wall-clock aging every iteration owes. Both are required — batches arrive
+/// every 500 ms while the loop's idle timeout is 1 s, so aging cannot be left
+/// to the timeout arm: a vanished name would keep its confidence, and its
+/// bias, for as long as the stream stayed up (measured live before this was
+/// split out: a stale entry held `confidence 0.994599` across 145 s).
+fn bias_pass(
+    engine: &mut BiasEngine,
+    batch: &[aranicy_wire::Sample],
+    now: std::time::SystemTime,
+) -> Vec<crate::bias::Change> {
+    let mut changes = engine.ingest(batch, now);
+    changes.extend(engine.tick(now));
+    changes
+}
+
+/// The `bias changed` journal line: `name`/`bias` stay first (existing greps
+/// depend on them), `prev`/`class`/`cause` make the move diagnosable — an
+/// evidence-driven step and a relax are otherwise indistinguishable.
+fn log_changes(changes: &[crate::bias::Change]) {
+    for c in changes {
+        tracing::info!(
+            name = %c.name,
+            bias = c.bias,
+            prev = c.prev,
+            class = ?c.class,
+            cause = ?c.cause,
+            "bias changed"
+        );
     }
 }
 
@@ -764,5 +788,36 @@ mod tests {
         let (manager, warnings) = init_cgroups(&BTreeMap::new());
         // Empty defs must not fail even if creation is impossible.
         assert!(warnings.is_empty() || !manager.mount.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn a_pass_ages_what_the_batch_did_not_mention() {
+        use crate::bias_state::{BiasSnapshot, Durable, EntrySnapshot};
+        let mut engine = BiasEngine::new(crate::bias::BiasConfig::default());
+        engine.restore(BiasSnapshot {
+            version: bias_state::BIAS_STATE_VERSION,
+            threshold_ema: None,
+            entries: vec![EntrySnapshot {
+                name: "gone".into(),
+                durable: Durable {
+                    confidence: 0.5,
+                    last_seen: 1_000,
+                    bias: 2,
+                    ..Durable::default()
+                },
+            }],
+        });
+
+        // One loop iteration, one batch, and the name is not in it. The batch
+        // cadence outruns the loop's idle timeout, so the pass — not the
+        // timeout arm — must be what ages the entry.
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000 + 1_800);
+        let _ = bias_pass(&mut engine, &[], now);
+        let e = engine.snapshot().entries.into_iter().next().expect("entry");
+        assert!(
+            (e.durable.confidence - 0.25).abs() < 1e-12,
+            "a delivered batch must also age the rest: confidence {}",
+            e.durable.confidence
+        );
     }
 }

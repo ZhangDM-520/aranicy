@@ -39,11 +39,12 @@ pub enum BiasClass {
     Responsive,
 }
 
-/// One persisted per-name history entry.
+/// Exactly what survives a restart. Adding a field here persists it; the
+/// engine's transient half (`Live`, in `bias.rs`) has no such list to keep in
+/// sync.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct EntrySnapshot {
-    pub name: String,
+pub struct Durable {
     /// EWMA of the name's per-window weight-free score.
     pub score_ema: f64,
     /// EWMA of the name's per-window sample counts.
@@ -56,6 +57,17 @@ pub struct EntrySnapshot {
     pub confidence: f64,
     /// Closed-loop mismatch freeze (restored entries keep the re-baseline flag).
     pub frozen: bool,
+}
+
+/// One persisted per-name history entry. `Durable` is flattened so the
+/// on-disk record stays `{"name": …, "score_ema": …}` — a v1 file loads
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct EntrySnapshot {
+    pub name: String,
+    #[serde(flatten)]
+    pub durable: Durable,
 }
 
 /// Full persisted bias state.
@@ -138,23 +150,27 @@ mod tests {
             entries: vec![
                 EntrySnapshot {
                     name: "app".into(),
-                    score_ema: 784.0,
-                    sample_count_ewma: 32.0,
-                    class: BiasClass::Responsive,
-                    bias: -1,
-                    last_seen: 1_760_000_000,
-                    confidence: 0.75,
-                    frozen: false,
+                    durable: Durable {
+                        score_ema: 784.0,
+                        sample_count_ewma: 32.0,
+                        class: BiasClass::Responsive,
+                        bias: -1,
+                        last_seen: 1_760_000_000,
+                        confidence: 0.75,
+                        frozen: false,
+                    },
                 },
                 EntrySnapshot {
                     name: "bulk".into(),
-                    score_ema: 100.0,
-                    sample_count_ewma: 41.5,
-                    class: BiasClass::Bulk,
-                    bias: 3,
-                    last_seen: 1_760_000_060,
-                    confidence: 0.25,
-                    frozen: true,
+                    durable: Durable {
+                        score_ema: 100.0,
+                        sample_count_ewma: 41.5,
+                        class: BiasClass::Bulk,
+                        bias: 3,
+                        last_seen: 1_760_000_060,
+                        confidence: 0.25,
+                        frozen: true,
+                    },
                 },
             ],
         }
@@ -198,6 +214,42 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// The on-disk shape is a contract: `Durable` is flattened, so a v1 file
+    /// (`{"name": …, "score_ema": …}`) must still load and must be written
+    /// back flat, never as a nested object.
+    #[test]
+    fn v1_on_disk_fixture_survives_the_flattened_durable() {
+        let raw = br#"{
+            "version": 1,
+            "threshold_ema": 400.0,
+            "entries": [{
+                "name": "build",
+                "score_ema": 100.0,
+                "sample_count_ewma": 32.0,
+                "class": "bulk",
+                "bias": 3,
+                "last_seen": 1760000000,
+                "confidence": 0.75,
+                "frozen": false
+            }]
+        }"#;
+        let snap: BiasSnapshot = serde_json::from_slice(raw).expect("v1 fixture must load");
+        let e = &snap.entries[0];
+        assert_eq!(e.name, "build");
+        assert_eq!(e.durable.score_ema, 100.0);
+        assert_eq!(e.durable.sample_count_ewma, 32.0);
+        assert_eq!(e.durable.class, BiasClass::Bulk);
+        assert_eq!((e.durable.bias, e.durable.last_seen), (3, 1_760_000_000));
+        assert_eq!((e.durable.confidence, e.durable.frozen), (0.75, false));
+
+        let back = serde_json::to_value(e).expect("serialize");
+        assert_eq!(back["score_ema"], serde_json::json!(100.0));
+        assert!(
+            back.get("durable").is_none(),
+            "the durable half must stay flattened: {back}"
+        );
+    }
+
     #[test]
     fn load_refuses_a_newer_version() {
         let dir = scratch_dir("newer");
@@ -227,9 +279,9 @@ mod tests {
         assert_eq!(snap.entries.len(), 1);
         let e = &snap.entries[0];
         assert_eq!(e.name, "a");
-        assert_eq!(e.bias, 2);
-        assert_eq!(e.class, BiasClass::Unknown);
-        assert_eq!(e.confidence, 0.0);
-        assert!(!e.frozen);
+        assert_eq!(e.durable.bias, 2);
+        assert_eq!(e.durable.class, BiasClass::Unknown);
+        assert_eq!(e.durable.confidence, 0.0);
+        assert!(!e.durable.frozen);
     }
 }
