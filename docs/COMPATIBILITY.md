@@ -112,10 +112,16 @@ the distro `libbpf` (plus clang-built BPF objects at build time). It ships
 `libbpf`-version-independent behaviour because every kernel interaction goes
 through libbpf's stable API.
 
-The sampler speaks the `scx_stats` protocol to whatever server is bound at
-`sched_collector_socket` (default the collector's
-`/run/aranicy/collector-stats.sock`) and reconnects with backoff if it goes
-away; no scheduler is probed or named.
+The sampler speaks the `scx_stats` protocol to the one server configured at
+`bias_collector_socket` (default the collector's
+`/run/aranicy/collector-stats.sock`), asks it for exactly one target
+(`sched_samples`, rows under the `samples` key) and reconnects with
+exponential backoff if it goes away; no scheduler is probed, no schema is
+discovered and no target name is guessed. `scx_lavd`/`scx_mavd` serve that
+same target name, so pointing the key at a scheduler socket still works; a
+server that cannot serve it (aggregate-only scheduler, stale protocol) leaves
+the sampler `degraded` with the stable reason `transport down` — never
+silently live.
 
 - History keyed by the **kernel comm** (the `scx_lavd` sample namespace; rule
   matching uses the separate argv[0]-derived name), with fuzzy keying: a

@@ -97,11 +97,16 @@ it live); the counter-write lesson below survives for any external nice-writer.
   `openat(12, "NNN/cmdline", ...)` — do not grep for `</proc>` annotations
   when proving `openat`-on-dirfd behavior.
 
-## sched_ext stats-protocol pitfalls (sampler.rs) — Last reviewed: 2026-10-31
+## sched_ext stats-protocol pitfalls (sampler.rs) — Last reviewed: 2026-11-08
 
-Currency: since commit `01710f9` (2026-10-30) the sampler is a schema-driven
-`scx_stats` client (socket/target discovery by probing), so the scx_lavd-specific
-protocol notes below are historical; the general test/fixture pitfalls remain live.
+Currency: since 2026-11-08 the sampler is a fixed-binding client — one server,
+one target (`sched_samples`), one row key (`samples`), no `stats_meta`, no
+probing — so the scx_lavd `stats_meta` note below is historical; the general
+test/fixture pitfalls remain live. `scx_stats` 1.1.4 has no preemption logic
+(`grep -rn preempt src/` is empty): the "preempted by another sampler" string
+lives only in lavd/mavd's own stats modules. Reconnect backoff must reset on
+the first *parsed* round trip, not on `connect()` — otherwise a server that
+accepts and always errors retries at the floor forever.
 
 - scx_lavd 1.1.4 `stats_meta` reports `SchedSample.fields` as a name ->
   {datum, desc} MAP, not the array of names its docs suggest. Any consumer

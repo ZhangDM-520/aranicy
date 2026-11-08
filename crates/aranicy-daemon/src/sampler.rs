@@ -1,58 +1,43 @@
-//! scx_stats per-task sampling client (plan.md §4.1).
+//! `scx_stats` per-task sampling client.
 //!
 //! Interface frozen between workstreams: [`Sample`] / [`Batch`].
 //!
-//! Client side of the scx_stats framework protocol: one JSON line in, one
-//! JSON line out over a root-owned UNIX socket (verified live against
-//! scx_lavd 1.1.4 and the byte-identical scx_mavd schema):
+//! There is exactly one stats server — our collector (`aranicy-collectord`, a
+//! separate GPL-2.0 package) — and it serves exactly one target
+//! ([`STATS_TARGET`]) with one row key ([`ROWS_KEY`]). No scheduler is probed,
+//! no schema is discovered and no target name is guessed: a server that does
+//! not answer that one request is a transport failure, full stop. The socket
+//! path is configurable (`bias_collector_socket`) for tests and relocated
+//! installs.
 //!
-//! * `{"req":"stats","args":{"target":"<target>","nr_samples":"512"}}`
+//! Wire contract, one JSON line in and one JSON line out per request:
+//!
+//! * `{"req":"stats","args":{"target":"sched_samples","nr_samples":"512"}}`
 //!   — `nr_samples` is sent as a decimal *string*; the response envelope is
-//!   `{"errno":N,"args":{"resp":{...}}}` (on `errno != 0` the `resp` carries
-//!   a message string). Per-task targets wrap rows as `{"samples":[...]}`;
-//!   aggregate targets (e.g. `"top"`) return plain objects and are never
-//!   sampled here.
-//! * `{"req":"stats_meta"}` reports every registered struct with its fields
-//!   and is re-run on every (re)connect — it is the ONLY schema signal
-//!   (scx_stats carries no version). On 1.1.4 the payload is
-//!   `{"SchedSample":{"fields":{name:{datum,desc},..}}}`; other builds may
-//!   send an array of names — both shapes are accepted.
-//! * Schema binding is discovery-based (multi-scheduler): the per-task
-//!   struct is whichever meta struct carries `pid`+`comm`+≥1 bias signal
-//!   field, and the per-task target name is probed — target names are
-//!   arbitrary strings that cannot be enumerated; unknown targets answer
-//!   `errno != 0`. A reachable server with only aggregate schemas degrades
-//!   with reason [`REASON_NO_PER_TASK`].
+//!   `{"errno":N,"args":{"resp":{"samples":[...]}}}`. On `errno != 0` the
+//!   `resp` carries a message string. (`scx_stats` serializes concurrent
+//!   samplers itself; it never reports that another one took over.)
 //! * Each request asks for the full observation budget
 //!   ([`aranicy_wire::SAMPLE_CAP`]); the response reports `truncated` — how
 //!   many rows the budget dropped — and the sampler logs that at `warn!`
-//!   (on change, at most once per minute). Sequential round-trips only —
+//!   (interval-only: at most once a minute). Sequential round-trips only —
 //!   pipelining serializes server-side.
-//! * Only one client may sample a per-task target at a time; a competing
-//!   client answers `errno != 0` with a message containing "preempted by
-//!   another sampler" (substring match, weak contract). Reconnecting reclaims
-//!   ownership; an idle connection steals it on its first request.
 //!
-//! Socket: the collector (`aranicy-collectord`, a separate GPL-2.0 package)
-//! serves `/run/aranicy/collector-stats.sock`. There is exactly ONE stats
-//! source now — scheduler discovery was retired: the collector is
-//! scheduler-agnostic, so no glob or scheduler probe is needed. The path is
-//! configurable (`bias_collector_socket`) for tests and relocated installs.
+//! Field names are the collector's verbatim; [`canonical_field`] is the only
+//! schema-drift hook and [`Sample`] parses leniently.
 //!
-//! [`spawn`] runs the single sampler thread: it delivers [`Batch`]es through
-//! an `mpsc::Sender`, logs exactly one line per [`SamplerState`] transition,
-//! and reconnects with exponential backoff after any transport failure.
+//! [`spawn_collector`] runs the single sampler thread: it delivers [`Batch`]es
+//! through an `mpsc::Sender`, logs exactly one line per [`SamplerState`]
+//! transition, and reconnects with exponential backoff after any transport
+//! failure. The socket sits behind [`Endpoint`]/[`Link`], so the reconnect,
+//! backoff and pacing loop is exercised without a socket, a sleep or a
+//! five-second timeout.
 
-// The daemon wiring (owned elsewhere) consumes this API; until that lands the
-// items are intentionally unreachable from `main`.
-#![allow(dead_code)]
-
-use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -61,55 +46,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 /// Parse a per-task row into the shared wire sample. Parsing is lenient:
-/// unknown fields ignored, missing fields defaulted (`serde(default)`) —
-/// schemas drift across versions (`stats_meta` detects availability).
+/// unknown fields ignored, missing fields defaulted (`serde(default)`).
 ///
 /// Because of that leniency a *missing* field is indistinguishable from a
 /// meaningful zero (`wait_freq == 0` legitimately means "never slept"). That
-/// is deliberate for now: the collector always emits all fields, and the
-/// leniency is what keeps an older/newer server parseable.
+/// is deliberate: the collector always emits all fields, and the leniency is
+/// what keeps an older/newer server parseable.
 pub use aranicy_wire::Sample;
 
-/// One batch: at most ~60 samples (16 KB ringbuf cap), lossy, hot-task biased.
+/// One batch: lossy, ordered by demand, cut to the observation budget.
 pub type Batch = Vec<Sample>;
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Default wall-clock pacing between `sched_samples` requests.
+/// Default wall-clock pacing between sample requests.
 pub const DEFAULT_CADENCE: Duration = Duration::from_millis(500);
+
+/// The collector is the only server: one target, one row key.
+const STATS_TARGET: &str = "sched_samples";
+const ROWS_KEY: &str = "samples";
 
 const REASON_STARTING: &str = "starting";
 const REASON_TRANSPORT: &str = "transport down";
-/// Canonical preemption reason; also the substring matched in server messages.
-const REASON_PREEMPTED: &str = "preempted by another sampler";
-/// Reachable scx_stats server whose schema has no per-task rows (aggregate-only
-/// schedulers, e.g. bpfland/flow/p2dq). Distinct from transport-down: the
-/// socket works, the data bias learning needs is simply not exposed.
-const REASON_NO_PER_TASK: &str = "no per-task stats";
 
-/// Fields that make a stats struct "per-task" for our purposes: task identity
-/// (`pid`, `comm`) plus at least one bias signal. A struct with `pid`/`comm`
-/// but none of these could never feed [`sample_score`] (it skips samples with
-/// absent freq/runtime fields), so it must not be bound.
-const SIGNAL_FIELDS: &[&str] = &[
-    "wait_freq",
-    "wake_freq",
-    "avg_runtime_wall",
-    "task_util_est",
-    "cpu_util_wall",
-    "static_prio",
-];
-
-/// Target-name candidates probed after the struct-derived names (scx_stats
-/// target names are arbitrary server-side strings and cannot be enumerated;
-/// unknown targets answer `errno != 0` and the next candidate is tried).
-const PROBE_TARGETS: &[&str] = &["sched_samples", "task_samples", "samples", "tasks"];
-
-/// Slow reconnect cadence after losing the sampler race
-/// (±25% jitter → 5.25–8.75 s).
-const PREEMPT_RETRY: Duration = Duration::from_secs(7);
 /// Exponential reconnect backoff: 1 s doubling to a 30 s cap, ±25% jitter.
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -121,23 +78,114 @@ const TRUNC_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// thread immediately — it calls `shutdown(2)` on the live socket.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Default collector stats socket (systemd `RuntimeDirectory=aranicy`).
-pub const DEFAULT_COLLECTOR_SOCKET: &str = "/run/aranicy/collector-stats.sock";
+// ---------------------------------------------------------------------------
+// Transport seam
+// ---------------------------------------------------------------------------
+
+/// Everything the loop can observe from the wire. I/O, EOF, timeout,
+/// malformed JSON and a server-side `errno != 0` are the same failure: the
+/// link is dead, reconnect with backoff.
+pub(crate) enum Fail {
+    Transport(String),
+}
+
+/// One sequential request/response on a stats socket.
+pub(crate) trait Link: Send {
+    fn round_trip(&mut self, req: &Value) -> Result<Value, Fail>;
+    /// Wake a blocked read (shutdown path); parked by the handle.
+    fn abort_handle(&self) -> Option<Arc<dyn Abortable>>;
+}
+
+/// The shutdown side of a live link.
+pub(crate) trait Abortable: Send + Sync {
+    fn abort(&self);
+}
+
+/// How the loop obtains a fresh link. The only thing tests substitute.
+pub(crate) trait Endpoint: Send + Sync + 'static {
+    fn open(&self) -> Result<Box<dyn Link>, Fail>;
+}
+
+impl Abortable for UnixStream {
+    fn abort(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+/// The production link: a connected socket plus a cloned fd for line reads.
+struct UnixLink {
+    stream: Arc<UnixStream>,
+    reader: BufReader<UnixStream>,
+}
+
+impl UnixLink {
+    fn new(stream: UnixStream) -> std::io::Result<Self> {
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        // A second fd for line reads; `shutdown(2)` on `stream` (same socket
+        // object) still wakes them.
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self {
+            stream: Arc::new(stream),
+            reader,
+        })
+    }
+}
+
+impl Link for UnixLink {
+    fn round_trip(&mut self, req: &Value) -> Result<Value, Fail> {
+        let line = serde_json::to_string(req)
+            .map_err(|e| Fail::Transport(format!("serialize request: {e}")))?;
+        let mut w = &*self.stream;
+        w.write_all(line.as_bytes())
+            .and_then(|_| w.write_all(b"\n"))
+            .and_then(|_| w.flush())
+            .map_err(|e| Fail::Transport(format!("write: {e}")))?;
+        let mut buf = String::new();
+        let line = match self.reader.read_line(&mut buf) {
+            Ok(0) => return Err(Fail::Transport("connection closed (EOF)".to_owned())),
+            Ok(_) => buf,
+            Err(e) => return Err(Fail::Transport(format!("read: {e}"))),
+        };
+        let (errno, resp) = parse_envelope(&line)?;
+        check_errno(errno, &resp)?;
+        Ok(resp)
+    }
+
+    fn abort_handle(&self) -> Option<Arc<dyn Abortable>> {
+        Some(Arc::clone(&self.stream) as Arc<dyn Abortable>)
+    }
+}
+
+/// The only production endpoint: connect to one UNIX socket.
+struct UnixEndpoint {
+    path: PathBuf,
+}
+
+impl Endpoint for UnixEndpoint {
+    fn open(&self) -> Result<Box<dyn Link>, Fail> {
+        let fail = |e: std::io::Error| Fail::Transport(format!("{}: {e}", self.path.display()));
+        let stream = UnixStream::connect(&self.path).map_err(fail)?;
+        let link = UnixLink::new(stream).map_err(fail)?;
+        Ok(Box::new(link))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /// Sampler state machine, exposed for the daemon/log.
 ///
-/// `Degraded` covers "transport down", "preempted by another sampler" and
-/// "no per-task stats" (a reachable scx_stats server with only aggregate
-/// schemas): the daemon keeps applying the already-learned bias and stops
-/// updating it until the sampler is [`SamplerState::Live`] again. The
-/// `reason` strings are stable: `"starting"` (before first bind),
-/// `"transport down"`, `"preempted by another sampler"`, `"no per-task
-/// stats"`.
+/// `Degraded` means "not delivering batches": the daemon keeps applying the
+/// already-learned bias and stops updating it until the sampler is
+/// [`SamplerState::Live`] again. The `reason` strings are a stable contract:
+/// `"starting"` (before the first round trip) and `"transport down"` (I/O,
+/// EOF, timeout, malformed payload or a server-side error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SamplerState {
-    /// Connected, `stats_meta` ran, batches flowing.
+    /// The first `stats` round trip parsed; batches flowing.
     Live,
-    /// Not delivering batches; see the enum docs for `reason` values.
+    /// Not delivering batches; `reason` is `"starting"` or `"transport down"`.
     Degraded { reason: String },
 }
 
@@ -146,10 +194,6 @@ impl SamplerState {
         Self::Degraded {
             reason: reason.to_owned(),
         }
-    }
-
-    pub fn is_live(&self) -> bool {
-        matches!(self, Self::Live)
     }
 }
 
@@ -162,65 +206,26 @@ impl fmt::Display for SamplerState {
     }
 }
 
-/// Field-availability snapshot of the bound per-task struct, taken from
-/// `stats_meta` on every (re)connect (feature detection across versions).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FieldSet {
-    names: BTreeSet<String>,
-}
-
-impl FieldSet {
-    pub fn has(&self, field: &str) -> bool {
-        self.names.contains(field)
-    }
-
-    pub fn len(&self) -> usize {
-        self.names.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
-
-    pub fn sched_sample_fields(&self) -> impl Iterator<Item = &str> {
-        self.names.iter().map(String::as_str)
-    }
-
-    fn insert(&mut self, name: String) {
-        self.names.insert(name);
-    }
-}
-
 /// Handle to the sampler thread (the daemon spawns exactly one).
 pub struct SchedSamplerHandle {
+    /// The daemon never inspects the state (it reacts to batches, and the
+    /// transition itself is traced); only tests observe it.
+    #[cfg(test)]
     shared: Arc<Mutex<Shared>>,
     stop: Arc<StopFlag>,
-    slot: StreamSlot,
+    slot: AbortSlot,
     thread: Option<JoinHandle<()>>,
 }
 
 impl SchedSamplerHandle {
-    /// Current state (cheap snapshot, for the daemon/log).
-    pub fn state(&self) -> SamplerState {
-        locked(&self.shared).state.clone()
-    }
-
-    /// Latest `stats_meta` field snapshot (empty until the first bind).
-    pub fn fields(&self) -> FieldSet {
-        locked(&self.shared)
-            .binding
-            .as_ref()
-            .map(|b| b.fields.clone())
-            .unwrap_or_default()
-    }
-
     /// Request shutdown and unblock the thread promptly: the inter-batch wait
     /// is a condvar wait, and a blocked socket read is woken by `shutdown(2)`
-    /// on the shared stream. Idempotent.
+    /// on the live link. Idempotent.
     pub fn shutdown(&self) {
         self.stop.request();
-        if let Some(stream) = locked(&self.slot).clone() {
-            let _ = stream.shutdown(Shutdown::Both);
+        let abort = locked(&self.slot).take();
+        if let Some(abort) = abort {
+            abort.abort();
         }
     }
 
@@ -240,23 +245,15 @@ impl Drop for SchedSamplerHandle {
     }
 }
 
-/// Spawn the single sampler thread against an explicit socket list.
-///
-/// It tries `socket_paths` in order on every (re)connect (`ENOENT` /
-/// `ECONNREFUSED` count as "absent"), binds the per-task schema via
-/// `stats_meta` + target probing, then requests the bound target every
-/// `cadence` (wall-clock paced: missed slots are skipped, never caught up in
-/// bursts) and delivers each parsed [`Batch`] to `tx`. A dropped receiver
-/// stops the thread. Exactly one tracing line is emitted per
-/// [`SamplerState`] transition; batches are never logged. A zero `cadence`
-/// falls back to [`DEFAULT_CADENCE`].
-pub fn spawn(socket: &Path, cadence: Duration, tx: Sender<Batch>) -> SchedSamplerHandle {
-    spawn_with(socket.to_path_buf(), tuning(cadence), tx)
-}
-
-/// Spawn against the collector's fixed socket ([`DEFAULT_COLLECTOR_SOCKET`]).
+/// Spawn against the collector's fixed stats socket.
 pub fn spawn_collector(socket: PathBuf, cadence: Duration, tx: Sender<Batch>) -> SchedSamplerHandle {
-    spawn_with(socket, tuning(cadence), tx)
+    let live_detail = format!("bound SchedSample via {STATS_TARGET} at {}", socket.display());
+    spawn_with(
+        Box::new(UnixEndpoint { path: socket }),
+        tuning(cadence),
+        live_detail,
+        tx,
+    )
 }
 
 fn tuning(cadence: Duration) -> Tuning {
@@ -268,27 +265,44 @@ fn tuning(cadence: Duration) -> Tuning {
         },
         backoff_start: BACKOFF_START,
         backoff_cap: BACKOFF_CAP,
-        preempt_retry: PREEMPT_RETRY,
     }
 }
 
-fn spawn_with(socket: PathBuf, tuning: Tuning, tx: Sender<Batch>) -> SchedSamplerHandle {
+/// Spawn the single sampler thread over an arbitrary [`Endpoint`].
+///
+/// It requests [`STATS_TARGET`] every `cadence` (wall-clock paced: missed
+/// slots are skipped, never caught up in bursts) and delivers each parsed
+/// [`Batch`] to `tx`. A dropped receiver stops the thread. Exactly one
+/// tracing line is emitted per [`SamplerState`] transition; batches are never
+/// logged. A zero `cadence` falls back to [`DEFAULT_CADENCE`].
+fn spawn_with(
+    endpoint: Box<dyn Endpoint>,
+    tuning: Tuning,
+    live_detail: String,
+    tx: Sender<Batch>,
+) -> SchedSamplerHandle {
     let shared = Arc::new(Mutex::new(Shared {
         state: SamplerState::degraded(REASON_STARTING),
-        binding: None,
     }));
     let stop = Arc::new(StopFlag::new());
-    let slot: StreamSlot = Arc::new(Mutex::new(None));
+    let slot: AbortSlot = Arc::new(Mutex::new(None));
     let thread = std::thread::Builder::new()
         .name("stats-sampler".to_owned())
         .spawn({
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
             let slot = Arc::clone(&slot);
-            move || run(socket, tuning, tx, shared, stop, slot)
+            let runner = Runner {
+                endpoint,
+                tuning,
+                live_detail,
+                tx,
+            };
+            move || run(runner, shared, stop, slot)
         })
         .expect("spawn stats sampler thread");
     SchedSamplerHandle {
+        #[cfg(test)]
         shared,
         stop,
         slot,
@@ -300,32 +314,28 @@ fn spawn_with(socket: PathBuf, tuning: Tuning, tx: Sender<Batch>) -> SchedSample
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Where the live stream is parked so `shutdown()` can wake blocked reads.
-type StreamSlot = Arc<Mutex<Option<Arc<UnixStream>>>>;
+/// Where the live link's abort handle is parked so `shutdown()` can wake a
+/// blocked read.
+type AbortSlot = Arc<Mutex<Option<Arc<dyn Abortable>>>>;
 
 struct Tuning {
     cadence: Duration,
     backoff_start: Duration,
     backoff_cap: Duration,
-    preempt_retry: Duration,
 }
 
-/// Schema binding chosen at (re)connect: which `stats_meta` struct supplies
-/// per-task rows and which target name serves them (target names are
-/// server-side magic strings — see [`probe_target`]).
-#[derive(Debug, Clone)]
-struct TargetBinding {
-    meta_struct: String,
-    target: String,
-    /// Response key holding the row array (lavd/mavd: `"samples"`); empty
-    /// string means the response IS the bare array.
-    rows_key: String,
-    fields: FieldSet,
+/// What the sampler thread needs to run: the transport, the cadence, and the
+/// consumer.
+struct Runner {
+    endpoint: Box<dyn Endpoint>,
+    tuning: Tuning,
+    /// Log detail for `Live` transitions (which socket, which target).
+    live_detail: String,
+    tx: Sender<Batch>,
 }
 
 struct Shared {
     state: SamplerState,
-    binding: Option<TargetBinding>,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -333,8 +343,8 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The one-and-only log site: a single line per state transition, never
-/// per-batch. `detail` carries the bind summary for `Live` transitions
-/// (socket, schema, target, field count).
+/// per-batch. `detail` carries the bind summary for `Live` transitions and the
+/// transport error for `Degraded` ones.
 fn transition(shared: &Mutex<Shared>, new: SamplerState, detail: &str) {
     let mut s = locked(shared);
     if s.state == new {
@@ -447,133 +457,14 @@ impl Backoff {
     }
 }
 
-/// Failure classification: preemption takes the slow-retry path; a server
-/// rejection (`errno != 0`, e.g. an unknown stats target) skips to the next
-/// candidate during probing and takes the exponential backoff path in the
-/// main loop; wire failures (I/O, EOF, parse) take the backoff path.
-enum Fail {
-    Preempted(String),
-    Rejected(String),
-    Transport(String),
-}
-
-struct Connection {
-    stream: Arc<UnixStream>,
-    reader: BufReader<UnixStream>,
-}
-
-impl Connection {
-    fn open(path: &Path) -> std::io::Result<Self> {
-        let stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(READ_TIMEOUT))?;
-        // A second fd for line reads; `shutdown(2)` on `stream` (same socket
-        // object) still wakes them.
-        let reader = BufReader::new(stream.try_clone()?);
-        Ok(Self {
-            stream: Arc::new(stream),
-            reader,
-        })
-    }
-
-    fn write_line(&self, payload: &Value) -> Result<(), Fail> {
-        let line = serde_json::to_string(payload)
-            .map_err(|e| Fail::Transport(format!("serialize request: {e}")))?;
-        let mut w = &*self.stream;
-        w.write_all(line.as_bytes())
-            .and_then(|_| w.write_all(b"\n"))
-            .and_then(|_| w.flush())
-            .map_err(|e| Fail::Transport(format!("write: {e}")))
-    }
-
-    fn read_line(&mut self) -> Result<String, Fail> {
-        let mut buf = String::new();
-        match self.reader.read_line(&mut buf) {
-            Ok(0) => Err(Fail::Transport("connection closed (EOF)".to_owned())),
-            Ok(_) => Ok(buf),
-            Err(e) => Err(Fail::Transport(format!("read: {e}"))),
-        }
-    }
-
-    /// One sequential round-trip: request line out, response line in, unwrap
-    /// the envelope, check `errno`.
-    fn round_trip(&mut self, req: &Value) -> Result<Value, Fail> {
-        self.write_line(req)?;
-        let line = self.read_line()?;
-        let (errno, resp) = parse_envelope(&line)?;
-        check_errno(errno, &resp)?;
-        Ok(resp)
-    }
-}
-
-/// Binding outcome while trying one candidate socket.
-enum BindOutcome {
-    /// Server reachable but no per-task schema/target (aggregate-only
-    /// scheduler): this socket cannot feed bias learning.
-    NoPerTask(String),
-    /// Wire-level failure (absent/stale socket, EOF, timeout).
-    Transport(String),
-    /// Another sampler owns the target; slow targeted retry.
-    Preempted(String),
-}
-
-fn map_fail(fail: Fail) -> BindOutcome {
-    match fail {
-        Fail::Preempted(m) => BindOutcome::Preempted(m),
-        Fail::Rejected(m) => BindOutcome::Transport(m),
-        Fail::Transport(m) => BindOutcome::Transport(m),
-    }
-}
-
-/// Connect to one socket and bind the per-task schema: `stats_meta` chooses
-/// the struct, then [`probe_target`] finds the target name that serves its
-/// rows. Aggregate-only servers yield [`BindOutcome::NoPerTask`].
-fn try_bind(path: &Path, slot: &StreamSlot) -> Result<(Connection, TargetBinding), BindOutcome> {
-    let mut conn = Connection::open(path)
-        .map_err(|e| BindOutcome::Transport(format!("{}: {e}", path.display())))?;
-    *locked(slot) = Some(Arc::clone(&conn.stream));
-    let result = bind_handshake(&mut conn, path);
-    if result.is_err() {
-        // Failed handshake: drop the parked stream with the connection so
-        // the fd closes now and shutdown() can never hit this dead stream.
-        *locked(slot) = None;
-    }
-    result.map(|binding| (conn, binding))
-}
-
-fn bind_handshake(conn: &mut Connection, path: &Path) -> Result<TargetBinding, BindOutcome> {
-    let meta = conn
-        .round_trip(&json!({ "req": "stats_meta" }))
-        .map_err(map_fail)?;
-    let (meta_struct, fields) = find_task_struct(&meta).ok_or_else(|| {
-        BindOutcome::NoPerTask(format!("{}: schema has no per-task struct", path.display()))
-    })?;
-    let candidates = target_candidates(&meta_struct);
-    let (target, rows_key) = probe_target(conn, &candidates).map_err(|f| match f {
-        Fail::Preempted(m) => BindOutcome::Preempted(m),
-        Fail::Rejected(_) => BindOutcome::NoPerTask(format!(
-            "{}: no per-task stats target among {candidates:?}",
-            path.display()
-        )),
-        Fail::Transport(m) => BindOutcome::Transport(m),
-    })?;
-    Ok(TargetBinding {
-        meta_struct,
-        target,
-        rows_key,
-        fields,
-    })
-}
-
-fn run(
-    socket: PathBuf,
-    tuning: Tuning,
-    tx: Sender<Batch>,
-    shared: Arc<Mutex<Shared>>,
-    stop: Arc<StopFlag>,
-    slot: StreamSlot,
-) {
+fn run(runner: Runner, shared: Arc<Mutex<Shared>>, stop: Arc<StopFlag>, slot: AbortSlot) {
+    let Runner {
+        endpoint,
+        tuning,
+        live_detail,
+        tx,
+    } = runner;
     let mut backoff = Backoff::new(tuning.backoff_start, tuning.backoff_cap);
-    let mut rng = seed_rng();
     // Observation-budget visibility survives reconnects: warn when the served
     // window is truncated, at most once per `TRUNC_WARN_INTERVAL`.
     let mut last_trunc_warn: Option<Instant> = None;
@@ -581,72 +472,20 @@ fn run(
         if stop.requested() {
             break;
         }
-        // Bind: exactly one socket (the collector). The loop shape is kept
-        // because the bind outcome handling below still distinguishes
-        // transport failures from preemption and from a server without
-        // per-task rows.
-        let mut attempt: Option<(Connection, TargetBinding, PathBuf)> = None;
-        let mut saw_no_per_task = false;
-        let mut saw_preempted = false;
-        let mut detail = String::new();
-        for path in std::iter::once(socket.clone()) {
-            if stop.requested() {
-                break 'outer;
-            }
-            match try_bind(&path, &slot) {
-                Ok((conn, binding)) => {
-                    attempt = Some((conn, binding, path));
-                    break;
-                }
-                Err(BindOutcome::NoPerTask(d)) => {
-                    saw_no_per_task = true;
-                    detail = d;
-                }
-                Err(BindOutcome::Transport(d)) => {
-                    detail = d;
-                }
-                Err(BindOutcome::Preempted(msg)) => {
-                    saw_preempted = true;
-                    detail = msg;
-                }
-            }
-        }
-        let (mut conn, binding, bound_path) = match attempt {
-            Some(bound) => bound,
-            None => {
-                if stop.requested() {
-                    break;
-                }
-                let (reason, wait) = if saw_preempted {
-                    (
-                        REASON_PREEMPTED,
-                        jitter(tuning.preempt_retry, &mut rng),
-                    )
-                } else if saw_no_per_task {
-                    (REASON_NO_PER_TASK, backoff.delay())
-                } else {
-                    (REASON_TRANSPORT, backoff.delay())
-                };
-                transition(&shared, SamplerState::degraded(reason), &detail);
-                if !stop.wait(wait) {
+        // One socket, one request shape: opening is the whole "bind", and a
+        // server that accepts but never answers a `stats` request stays
+        // `Degraded` — the state flips only on a parsed round trip.
+        let mut link = match endpoint.open() {
+            Ok(link) => link,
+            Err(Fail::Transport(detail)) => {
+                transition(&shared, SamplerState::degraded(REASON_TRANSPORT), &detail);
+                if !stop.wait(backoff.delay()) {
                     break;
                 }
                 continue 'outer;
             }
         };
-        backoff.reset();
-        locked(&shared).binding = Some(binding.clone());
-        transition(
-            &shared,
-            SamplerState::Live,
-            &format!(
-                "bound {} via {} at {} ({} fields)",
-                binding.meta_struct,
-                binding.target,
-                bound_path.display(),
-                binding.fields.len()
-            ),
-        );
+        *locked(&slot) = link.abort_handle();
         let mut next = Instant::now();
         loop {
             if !stop.wait_until(next) {
@@ -656,48 +495,31 @@ fn run(
                 "req": "stats",
                 // Full observation budget: the collector cuts to the same
                 // number, so asking for less would silently shrink it.
-                "args": { "target": binding.target, "nr_samples": aranicy_wire::SAMPLE_CAP.to_string() }
+                "args": { "target": STATS_TARGET, "nr_samples": aranicy_wire::SAMPLE_CAP.to_string() }
             });
-            let (batch, truncated) = match conn.round_trip(&req) {
-                Ok(resp) => match parse_batch(&resp, &binding.rows_key) {
-                    Ok(parsed) => parsed,
-                    Err(detail) => {
-                        // Malformed payload: close and resync via reconnect.
-                        if stop.requested() {
-                            break 'outer;
-                        }
-                        transition(&shared, SamplerState::degraded(REASON_TRANSPORT), &detail);
-                        drop(conn);
-                        *locked(&slot) = None; // release the parked stream fd
-                        if !stop.wait(backoff.delay()) {
-                            break 'outer;
-                        }
-                        continue 'outer;
-                    }
-                },
-                Err(fail) => {
+            let (batch, truncated) = match link
+                .round_trip(&req)
+                .and_then(|resp| parse_batch(&resp).map_err(Fail::Transport))
+            {
+                Ok(parsed) => parsed,
+                Err(Fail::Transport(detail)) => {
                     if stop.requested() {
                         break 'outer;
                     }
-                    let (reason, detail, wait) = match fail {
-                        Fail::Preempted(msg) => (
-                            REASON_PREEMPTED,
-                            msg,
-                            jitter(tuning.preempt_retry, &mut rng),
-                        ),
-                        Fail::Rejected(msg) | Fail::Transport(msg) => {
-                            (REASON_TRANSPORT, msg, backoff.delay())
-                        }
-                    };
-                    transition(&shared, SamplerState::degraded(reason), &detail);
-                    drop(conn);
-                    *locked(&slot) = None; // release the parked stream fd
-                    if !stop.wait(wait) {
+                    // Clear the parked handle before announcing the state, so
+                    // an observer of `Degraded` can never find a dead link.
+                    *locked(&slot) = None;
+                    transition(&shared, SamplerState::degraded(REASON_TRANSPORT), &detail);
+                    if !stop.wait(backoff.delay()) {
                         break 'outer;
                     }
                     continue 'outer;
                 }
             };
+            // A parsed round trip is the whole "bind": only then is the
+            // connection known good, so only then does the backoff reset.
+            backoff.reset();
+            transition(&shared, SamplerState::Live, &live_detail);
             // Interval-only: the count moves by a few rows every window, so a
             // "changed" trigger would fire at the cadence (measured: 26
             // warnings/min) — a flood, not a diagnostic.
@@ -724,7 +546,10 @@ fn run(
             }
         }
     }
-    *locked(&slot) = None;
+    let abort = locked(&slot).take();
+    if let Some(abort) = abort {
+        abort.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -746,20 +571,13 @@ fn parse_envelope(line: &str) -> Result<(i64, Value), Fail> {
     Ok((errno, resp))
 }
 
+/// A server-side rejection (`errno != 0`) carries its message in `resp`; it is
+/// as fatal as a dropped connection.
 fn check_errno(errno: i64, resp: &Value) -> Result<(), Fail> {
     if errno == 0 {
         return Ok(());
     }
-    let msg = resp_message(resp);
-    if msg.contains(REASON_PREEMPTED) {
-        Err(Fail::Preempted(msg))
-    } else {
-        Err(Fail::Rejected(format!("errno {errno}: {msg}")))
-    }
-}
-
-fn resp_message(resp: &Value) -> String {
-    match resp {
+    let msg = match resp {
         Value::String(s) => s.clone(),
         Value::Object(map) => map
             .get("message")
@@ -769,141 +587,8 @@ fn resp_message(resp: &Value) -> String {
             .map(str::to_owned)
             .unwrap_or_else(|| resp.to_string()),
         other => other.to_string(),
-    }
-}
-
-/// The per-task struct in a `stats_meta` payload: `pid` + `comm` + at least
-/// one [`SIGNAL_FIELDS`] entry. Aggregate structs (e.g. `SysStats`,
-/// `Metrics`) yield `None`. Returns the struct name and its field set. If
-/// several structs qualify (no known schema does), the one with the most
-/// signal fields wins; ties break on name order.
-fn find_task_struct(resp: &Value) -> Option<(String, FieldSet)> {
-    let obj = resp.as_object()?;
-    let mut best: Option<(String, FieldSet)> = None;
-    for (name, body) in obj {
-        let mut set = FieldSet::default();
-        match body.get("fields") {
-            Some(Value::Object(map)) => {
-                for key in map.keys() {
-                    set.insert(key.clone());
-                }
-            }
-            Some(Value::Array(items)) => {
-                for item in items {
-                    match item {
-                        Value::String(n) => set.insert(n.clone()),
-                        Value::Object(map) => {
-                            if let Some(n) = map.get("name").and_then(Value::as_str) {
-                                set.insert(n.to_owned());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => continue,
-        }
-        if !set.has("pid") || !set.has("comm") {
-            continue;
-        }
-        let signals = SIGNAL_FIELDS.iter().filter(|f| set.has(f)).count();
-        if signals == 0 {
-            continue;
-        }
-        let better = match &best {
-            None => true,
-            Some((best_name, best_set)) => {
-                let best_signals = SIGNAL_FIELDS.iter().filter(|f| best_set.has(f)).count();
-                signals > best_signals || (signals == best_signals && name < best_name)
-            }
-        };
-        if better {
-            best = Some((name.clone(), set));
-        }
-    }
-    best
-}
-
-/// Candidate per-task target names: plural and singular snake_case of the
-/// bound struct name first (lavd/mavd: `SchedSample` → `sched_samples`),
-/// then [`PROBE_TARGETS`]; deduplicated, order preserved.
-fn target_candidates(meta_struct: &str) -> Vec<String> {
-    let snake = snake_case(meta_struct);
-    let mut out: Vec<String> = Vec::new();
-    for cand in std::iter::once(format!("{snake}s"))
-        .chain(std::iter::once(snake))
-        .chain(PROBE_TARGETS.iter().map(|s| (*s).to_owned()))
-    {
-        if !out.contains(&cand) {
-            out.push(cand);
-        }
-    }
-    out
-}
-
-fn snake_case(name: &str) -> String {
-    // SchedSample → sched_sample; already-snake names pass through unchanged.
-    let mut out = String::with_capacity(name.len() + 4);
-    for (i, ch) in name.chars().enumerate() {
-        if ch.is_uppercase() {
-            if i > 0 && !out.ends_with('_') {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// The response key whose value is the row array of a per-task payload
-/// (lavd/mavd: `"samples"`); `Some("")` when the response IS the array. Row
-/// arrays may contain unreadable junk entries (parse drops them per-row), so
-/// one object element is enough; an empty array counts only under the known
-/// `"samples"` key (an aggregate payload like mlfq's `op_lat: []` must not
-/// masquerade as rows).
-fn rows_key(resp: &Value) -> Option<String> {
-    fn object_rows(items: &[Value]) -> bool {
-        items.iter().any(Value::is_object)
-    }
-    match resp {
-        Value::Array(items) if object_rows(items) => Some(String::new()),
-        Value::Object(map) => map
-            .iter()
-            .find(|(k, v)| match v {
-                Value::Array(items) => {
-                    object_rows(items) || (items.is_empty() && k.as_str() == "samples")
-                }
-                _ => false,
-            })
-            .map(|(k, _)| k.clone()),
-        _ => None,
-    }
-}
-
-/// Probe candidate target names on a bound connection; the first whose
-/// response carries per-task rows (see [`rows_key`]) wins. Unknown targets
-/// answer `errno != 0` (→ next candidate); a wire failure aborts.
-fn probe_target(conn: &mut Connection, candidates: &[String]) -> Result<(String, String), Fail> {
-    for name in candidates {
-        let req = json!({ "req": "stats", "args": { "target": name, "nr_samples": "1" } });
-        match conn.round_trip(&req) {
-            Ok(resp) => {
-                if let Some(key) = rows_key(&resp) {
-                    return Ok((name.clone(), key));
-                }
-                // errno 0 but not per-task shaped (e.g. aggregate "top"):
-                // keep looking.
-            }
-            Err(Fail::Preempted(m)) => return Err(Fail::Preempted(m)),
-            Err(Fail::Rejected(_)) => continue,
-            Err(fail @ Fail::Transport(_)) => return Err(fail),
-        }
-    }
-    Err(Fail::Rejected(format!(
-        "no per-task stats target among {candidates:?}"
-    )))
+    };
+    Err(Fail::Transport(format!("errno {errno}: {msg}")))
 }
 
 /// Numeric fields of [`Sample`] (`pid` signed, the rest unsigned); these are
@@ -953,8 +638,8 @@ fn canonical_field(raw: &str) -> &str {
     raw
 }
 
-/// Lenient [`Sample`] parse: unknown fields ignored (the `scx_stats` schema
-/// carries many more fields and drifts), numbers accepted as ints or strings,
+/// Lenient [`Sample`] parse: unknown fields ignored (a server may carry more
+/// fields than [`Sample`] knows), numbers accepted as ints or strings,
 /// wrong-typed or missing fields defaulted via `serde(default)`.
 fn lenient_sample(raw: &Value) -> Option<Sample> {
     let raw = raw.as_object()?;
@@ -974,20 +659,18 @@ fn lenient_sample(raw: &Value) -> Option<Sample> {
     serde_json::from_value(Value::Object(norm)).ok()
 }
 
-/// `resp` → ([`Batch`], `truncated`) via the bound row-container key (see
-/// [`rows_key`]). Unreadable entries are dropped individually (leniency); a
-/// payload without the row array is a transport-level failure.
+/// `resp` → ([`Batch`], `truncated`). Unreadable entries are dropped
+/// individually (leniency); a payload without the [`ROWS_KEY`] array is a
+/// transport-level failure.
 ///
 /// `truncated` is the observation budget's report: how many rows the server
 /// dropped on this window (aggregation cut plus the requested `nr_samples`).
 /// An older server does not send it and defaults to zero.
-fn parse_batch(resp: &Value, rows_key: &str) -> Result<(Batch, u32), String> {
-    let samples = if rows_key.is_empty() {
-        resp.as_array()
-    } else {
-        resp.get(rows_key).and_then(Value::as_array)
-    }
-    .ok_or_else(|| format!("response missing {rows_key:?} rows array"))?;
+fn parse_batch(resp: &Value) -> Result<(Batch, u32), String> {
+    let samples = resp
+        .get(ROWS_KEY)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("response missing {ROWS_KEY:?} rows array"))?;
     let truncated = resp.get("truncated").and_then(Value::as_u64).unwrap_or(0);
     let mut out = Vec::with_capacity(samples.len().min(64));
     for raw in samples {
@@ -1000,10 +683,10 @@ fn parse_batch(resp: &Value, rows_key: &str) -> Result<(Batch, u32), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: fake stats server replaying live-shaped canned payloads.
+// Tests: a scripted transport for the loop, a real socket for the kernel.
 //
-// Socket dirs live under `CARGO_TARGET_TMPDIR` when available, else under the
-// crate's `target/` dir — never `/tmp` (hard policy on this host).
+// Real-socket dirs live under `CARGO_TARGET_TMPDIR` when available, else under
+// the crate's `target/` dir — never `/tmp` (hard policy on this host).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1011,55 +694,13 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
 
-    /// Real scx_lavd 1.1.4 `SchedSample` schema captured live on this host:
-    /// 38 fields, name → datum type (as reported by `stats_meta`).
-    const LIVE_FIELDS: &[(&str, &str)] = &[
-        ("avg_lat_cri", "u64"),
-        ("avg_runtime_wall", "u64"),
-        ("comm", "string"),
-        ("cpu_heat", "u64"),
-        ("cpu_id", "u64"),
-        ("cpu_util_invr", "u64"),
-        ("cpu_util_wall", "u64"),
-        ("cpuperf_cur", "u64"),
-        ("dom_pinned_util_invr", "u64"),
-        ("dom_pinned_util_wall", "u64"),
-        ("dsq_consume_lat", "u64"),
-        ("dsq_id", "u64"),
-        ("lat_cri", "u64"),
-        ("lat_headroom", "u64"),
-        ("mseq", "u64"),
-        ("norm_lat_cri", "u64"),
-        ("nr_active", "u64"),
-        ("perf_cri", "u64"),
-        ("pid", "i64"),
-        ("prev_cpu_id", "u64"),
-        ("rerunnable_interval_wall", "u64"),
-        ("resched_interval_wall", "u64"),
-        ("run_freq", "u64"),
-        ("slice_used_wall", "u64"),
-        ("slice_wall", "u64"),
-        ("stat", "string"),
-        ("static_prio", "u64"),
-        ("steal_util_invr", "u64"),
-        ("steal_util_wall", "u64"),
-        ("suggested_cpu_id", "u64"),
-        ("task_util_est", "u64"),
-        ("thr_perf_cri", "u64"),
-        ("vuln_thresh", "u64"),
-        ("wait_freq", "u64"),
-        ("wake_freq", "u64"),
-        ("waker_comm", "string"),
-        ("waker_pid", "i64"),
-        ("warm_cpu_id", "u64"),
-    ];
-
-    /// Template mirrors a live sample captured on this host (values from a
-    /// real `kworker` sample). `cpu_heat`/`warm_cpu_id`/… are unknown to
-    /// [`Sample`] — their presence proves leniency in every test.
+    /// Template mirroring a live sample captured on this host (values from a
+    /// real `kworker`). Most fields are unknown to [`Sample`] — their presence
+    /// proves leniency in every test.
     fn live_sample(pid: i64, comm: &str) -> Value {
         json!({
             "avg_lat_cri": 1789,
@@ -1107,54 +748,118 @@ mod tests {
         json!({ "errno": 0, "args": { "resp": { "samples": samples } } }).to_string()
     }
 
-    /// Live 1.1.4 `stats_meta` shape: `fields` is a name → {datum, desc} map.
-    fn meta_map_line() -> String {
-        let fields: serde_json::Map<String, Value> = LIVE_FIELDS
-            .iter()
-            .map(|(name, datum)| {
-                ((*name).to_owned(), json!({ "datum": datum, "desc": format!("{name} field") }))
-            })
-            .collect();
-        json!({
-            "errno": 0,
-            "args": { "resp": {
-                "SchedSample": { "fields": fields },
-                "SysStats": { "fields": { "nr_running": { "datum": "u64", "desc": "Runnable tasks" } } }
-            }}
-        })
-        .to_string()
-    }
-
-    /// The brief's documented shape: `fields` is an array of names.
-    fn meta_array_line() -> String {
-        let names: Vec<&str> = LIVE_FIELDS.iter().map(|(n, _)| *n).collect();
-        json!({
-            "errno": 0,
-            "args": { "resp": { "SchedSample": { "fields": names } } }
-        })
-        .to_string()
-    }
-
-    fn preempt_line() -> String {
-        json!({
-            "errno": 22,
-            "args": { "resp": "sched_samples: preempted by another sampler" }
-        })
-        .to_string()
-    }
-
+    /// One scripted exchange, shared by the scripted endpoint and the real
+    /// socket server.
     #[derive(Clone)]
     enum Reply {
         Line(String),
+        /// Answer after blocking this long (a slow server).
+        Slow(Duration, String),
         /// Close the connection without answering (EOF mid-request).
         Eof,
         /// Accept and read but never answer (wedged server).
         Hang,
     }
 
+    /// A scripted [`Endpoint`]: one reply script per `open()` (the last one
+    /// repeats forever) plus the open/abort counts a test needs to observe.
+    /// No socket, and no sleep beyond what a [`Reply::Slow`] asks for.
+    struct Script {
+        conns: Vec<Vec<Reply>>,
+        opened: AtomicU64,
+        aborts: AtomicU64,
+    }
+
+    impl Script {
+        fn new(conns: Vec<Vec<Reply>>) -> Self {
+            assert!(!conns.is_empty(), "a script needs at least one connection");
+            Self {
+                conns,
+                opened: AtomicU64::new(0),
+                aborts: AtomicU64::new(0),
+            }
+        }
+
+        fn opened(&self) -> u64 {
+            self.opened.load(Ordering::SeqCst)
+        }
+
+        fn aborts(&self) -> u64 {
+            self.aborts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Endpoint for Arc<Script> {
+        fn open(&self) -> Result<Box<dyn Link>, Fail> {
+            let index = self.opened.fetch_add(1, Ordering::SeqCst) as usize;
+            let replies = self
+                .conns
+                .get(index)
+                .or_else(|| self.conns.last())
+                .cloned()
+                .unwrap_or_default();
+            Ok(Box::new(ScriptLink {
+                replies,
+                cursor: 0,
+                script: Arc::clone(self),
+            }))
+        }
+    }
+
+    struct ScriptLink {
+        replies: Vec<Reply>,
+        cursor: usize,
+        script: Arc<Script>,
+    }
+
+    impl ScriptLink {
+        /// The same envelope handling [`UnixLink`] applies to a real line.
+        fn parse(line: &str) -> Result<Value, Fail> {
+            let (errno, resp) = parse_envelope(line)?;
+            check_errno(errno, &resp)?;
+            Ok(resp)
+        }
+    }
+
+    impl Link for ScriptLink {
+        fn round_trip(&mut self, _req: &Value) -> Result<Value, Fail> {
+            let reply = self
+                .replies
+                .get(self.cursor)
+                .or_else(|| self.replies.last())
+                .cloned()
+                .unwrap_or(Reply::Eof);
+            self.cursor += 1;
+            match reply {
+                Reply::Line(line) => Self::parse(&line),
+                Reply::Slow(delay, line) => {
+                    std::thread::sleep(delay);
+                    Self::parse(&line)
+                }
+                Reply::Eof => Err(Fail::Transport("connection closed (EOF)".to_owned())),
+                Reply::Hang => loop {
+                    std::thread::park_timeout(Duration::from_millis(20));
+                },
+            }
+        }
+
+        fn abort_handle(&self) -> Option<Arc<dyn Abortable>> {
+            Some(Arc::new(ScriptAbort(Arc::clone(&self.script))))
+        }
+    }
+
+    struct ScriptAbort(Arc<Script>);
+
+    impl Abortable for ScriptAbort {
+        fn abort(&self) {
+            self.0.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A real AF_UNIX server replaying the same [`Reply`] vocabulary: only the
+    /// two kernel-facing tests need it.
     struct FakeServer {
         path: PathBuf,
-        conns: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
     }
@@ -1163,32 +868,13 @@ mod tests {
         /// Replay `script` as a FIFO across all requests/connections; once
         /// exhausted, repeat the last entry forever.
         fn start(dir: &Path, script: Vec<Reply>) -> Self {
-            let script = Arc::new(script);
-            Self::start_with(dir, move |served, _req| {
-                script
-                    .get(served)
-                    .or_else(|| script.last())
-                    .cloned()
-                    .unwrap_or(Reply::Eof)
-            })
-        }
-
-        /// Request-aware mode: `respond(served_so_far, request_line)` picks
-        /// the reply per request (target-aware servers for bind-handshake
-        /// tests).
-        fn start_with<F>(dir: &Path, respond: F) -> Self
-        where
-            F: Fn(usize, &str) -> Reply + Send + Sync + 'static,
-        {
             let path = dir.join("stats");
             let listener = UnixListener::bind(&path).expect("bind fake stats socket");
             listener.set_nonblocking(true).expect("nonblocking listener");
             let stop = Arc::new(AtomicBool::new(false));
-            let conns = Arc::new(AtomicU64::new(0));
+            let script = Arc::new(script);
             let thread = std::thread::spawn({
                 let stop = Arc::clone(&stop);
-                let conns = Arc::clone(&conns);
-                let respond = Arc::new(respond);
                 move || {
                     let mut served = 0usize;
                     while !stop.load(Ordering::SeqCst) {
@@ -1199,7 +885,6 @@ mod tests {
                                 continue;
                             }
                         };
-                        conns.fetch_add(1, Ordering::SeqCst);
                         conn.set_read_timeout(Some(Duration::from_millis(50)))
                             .expect("server read timeout");
                         let mut buf: Vec<u8> = Vec::new();
@@ -1220,12 +905,21 @@ mod tests {
                                 Err(_) => break,
                             }
                             if buf.contains(&b'\n') {
-                                let req = String::from_utf8_lossy(&buf).into_owned();
                                 buf.clear();
-                                let reply = respond(served, &req);
+                                let reply = script
+                                    .get(served)
+                                    .or_else(|| script.last())
+                                    .cloned()
+                                    .unwrap_or(Reply::Eof);
                                 served += 1;
                                 match reply {
                                     Reply::Line(line) => {
+                                        let _ = conn.write_all(line.as_bytes());
+                                        let _ = conn.write_all(b"\n");
+                                        let _ = conn.flush();
+                                    }
+                                    Reply::Slow(delay, line) => {
+                                        std::thread::sleep(delay);
                                         let _ = conn.write_all(line.as_bytes());
                                         let _ = conn.write_all(b"\n");
                                         let _ = conn.flush();
@@ -1245,7 +939,6 @@ mod tests {
             });
             Self {
                 path,
-                conns,
                 stop,
                 thread: Some(thread),
             }
@@ -1253,10 +946,6 @@ mod tests {
 
         fn socket(&self) -> PathBuf {
             self.path.clone()
-        }
-
-        fn connections(&self) -> u64 {
-            self.conns.load(Ordering::SeqCst)
         }
     }
 
@@ -1300,17 +989,41 @@ mod tests {
         }
     }
 
-    fn fast_tuning(preempt_retry: Duration) -> Tuning {
+    fn fast_tuning() -> Tuning {
+        tuning_with(
+            Duration::from_millis(30),
+            Duration::from_millis(120),
+        )
+    }
+
+    fn tuning_with(backoff_start: Duration, backoff_cap: Duration) -> Tuning {
         Tuning {
             cadence: Duration::from_millis(25),
-            backoff_start: Duration::from_millis(30),
-            backoff_cap: Duration::from_millis(120),
-            preempt_retry,
+            backoff_start,
+            backoff_cap,
         }
+    }
+
+    fn spawn_scripted(
+        script: &Arc<Script>,
+        tuning: Tuning,
+        tx: Sender<Batch>,
+    ) -> SchedSamplerHandle {
+        spawn_with(
+            Box::new(Arc::clone(script)),
+            tuning,
+            format!("bound SchedSample via {STATS_TARGET} at script"),
+            tx,
+        )
     }
 
     fn recv_batch(rx: &mpsc::Receiver<Batch>, timeout: Duration) -> Batch {
         rx.recv_timeout(timeout).expect("timed out waiting for batch")
+    }
+
+    fn recv_timed(rx: &mpsc::Receiver<Batch>, timeout: Duration) -> (Batch, Instant) {
+        let batch = recv_batch(rx, timeout);
+        (batch, Instant::now())
     }
 
     fn wait_for_state<F: Fn(&SamplerState) -> bool>(
@@ -1320,7 +1033,7 @@ mod tests {
     ) -> SamplerState {
         let t0 = Instant::now();
         loop {
-            let s = h.state();
+            let s = locked(&h.shared).state.clone();
             if pred(&s) {
                 return s;
             }
@@ -1333,39 +1046,19 @@ mod tests {
     }
 
     #[test]
-    fn live_shaped_payloads_have_38_fields() {
-        let sample = live_sample(1, "x");
-        let obj = sample.as_object().unwrap();
-        assert_eq!(obj.len(), 38);
-        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-        let meta: BTreeSet<&str> = LIVE_FIELDS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(keys, meta);
-    }
-
-    #[test]
     fn happy_path_batches_delivered() {
-        let dir = TestDir::new("happy");
-        let b1 = batch_line(vec![
-            live_sample(1557, "kworker/u99:1"),
-            live_sample(2210, "firefox"),
-        ]);
         let mut tweaked = live_sample(2210, "mpv");
         tweaked["static_prio"] = json!("120"); // number-as-string leniency
-        let b2 = batch_line(vec![tweaked]);
-        let b3 = batch_line(vec![live_sample(4242, "spinner")]);
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                // Bind-handshake probe (target discovery, nr_samples=1).
-                Reply::Line(batch_line(vec![])),
-                Reply::Line(b1),
-                Reply::Line(b2),
-                Reply::Line(b3),
-            ],
-        );
+        let script = Arc::new(Script::new(vec![vec![
+            Reply::Line(batch_line(vec![
+                live_sample(1557, "kworker/u99:1"),
+                live_sample(2210, "firefox"),
+            ])),
+            Reply::Line(batch_line(vec![tweaked])),
+            Reply::Line(batch_line(vec![live_sample(4242, "spinner")])),
+        ]]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn(&server.socket(), Duration::from_millis(60), tx);
+        let h = spawn_scripted(&script, fast_tuning(), tx);
 
         let first = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(first.len(), 2);
@@ -1377,7 +1070,7 @@ mod tests {
         assert_eq!(first[0].task_util_est, 7);
         assert_eq!(first[0].cpu_util_wall, 3);
         assert_eq!(first[0].static_prio, 0);
-        assert!(h.state().is_live());
+        assert_eq!(wait_for_state(&h, |s| matches!(s, SamplerState::Live), Duration::from_secs(2)), SamplerState::Live);
 
         let second = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(second.len(), 1);
@@ -1387,6 +1080,9 @@ mod tests {
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].pid, 4242);
 
+        // Three requests, three replies: there is no handshake round trip.
+        assert_eq!(script.opened(), 1);
+
         h.shutdown();
         let t0 = Instant::now();
         h.join().unwrap();
@@ -1394,82 +1090,42 @@ mod tests {
     }
 
     #[test]
-    fn stats_meta_field_detection() {
-        let dir = TestDir::new("meta");
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![live_sample(1, "x")])),
-            ],
-        );
+    fn transport_failure_degraded_then_reconnect_live() {
+        // The degraded -> live transition is the contract; the cause is a dead
+        // link, not a lost sampler race.
+        let script = Arc::new(Script::new(vec![
+            vec![Reply::Eof],
+            vec![Reply::Line(batch_line(vec![live_sample(7, "resumed")]))],
+        ]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
-        let _ = recv_batch(&rx, Duration::from_secs(5));
-        wait_for_state(&h, |s| s.is_live(), Duration::from_secs(2));
-
-        let fields = h.fields();
-        assert_eq!(fields.len(), 38);
-        assert!(fields.has("norm_lat_cri"));
-        assert!(fields.has("cpu_heat")); // known to lavd, unknown to Sample
-        assert!(fields.has("warm_cpu_id"));
-        assert!(fields.has("static_prio"));
-        assert!(!fields.has("definitely_not_a_field"));
-        assert!(fields.sched_sample_fields().any(|f| f == "wait_freq"));
-
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn stats_meta_array_shape_parses() {
-        let dir = TestDir::new("metaarr");
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_array_line()),
-                Reply::Line(batch_line(vec![live_sample(2, "y")])),
-            ],
+        // Long backoff so the Degraded window is easy to observe.
+        let h = spawn_scripted(
+            &script,
+            tuning_with(Duration::from_millis(400), Duration::from_millis(400)),
+            tx,
         );
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
-        let _ = recv_batch(&rx, Duration::from_secs(5));
-        let fields = h.fields();
-        assert_eq!(fields.len(), 38);
-        assert!(fields.has("warm_cpu_id"));
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn preempted_degraded_then_reconnect_live() {
-        let dir = TestDir::new("preempt");
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(preempt_line()),
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![live_sample(7, "resumed")])),
-            ],
-        );
-        let (tx, rx) = mpsc::channel();
-        // Long preempt retry so the Degraded window is easy to observe.
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(500)), tx);
 
         let degraded = wait_for_state(
             &h,
-            |s| matches!(s, SamplerState::Degraded { reason } if reason == REASON_PREEMPTED),
+            |s| matches!(s, SamplerState::Degraded { reason } if reason == "transport down"),
             Duration::from_secs(3),
         );
-        assert_eq!(degraded, SamplerState::degraded(REASON_PREEMPTED));
+        assert_eq!(degraded, SamplerState::degraded(REASON_TRANSPORT));
 
-        // The reconnect reclaims ownership and batches flow again.
-        wait_for_state(&h, |s| s.is_live(), Duration::from_secs(5));
+        let degraded_at = Instant::now();
+        wait_for_state(&h, |s| matches!(s, SamplerState::Live), Duration::from_secs(5));
+        // The 400 ms backoff carries ±25 % jitter (300..500 ms), and the
+        // observation itself can lag: only a loop that ignores the backoff
+        // could reconnect this fast.
+        assert!(
+            degraded_at.elapsed() >= Duration::from_millis(150),
+            "reconnected after {:?}, without waiting for the backoff",
+            degraded_at.elapsed()
+        );
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].pid, 7);
-        assert!(server.connections() >= 2);
+        assert_eq!(script.opened(), 2);
 
         h.shutdown();
         h.join().unwrap();
@@ -1477,24 +1133,22 @@ mod tests {
 
     #[test]
     fn eof_mid_request_reconnects() {
-        let dir = TestDir::new("eof");
-        let server = FakeServer::start(
-            dir.path(),
+        let script = Arc::new(Script::new(vec![
             vec![
-                Reply::Line(meta_map_line()),
+                Reply::Line(batch_line(vec![live_sample(10, "before-eof")])),
                 Reply::Eof,
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![live_sample(11, "after-eof")])),
             ],
-        );
+            vec![Reply::Line(batch_line(vec![live_sample(11, "after-eof")]))],
+        ]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_scripted(&script, fast_tuning(), tx);
 
+        assert_eq!(recv_batch(&rx, Duration::from_secs(5))[0].pid, 10);
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].pid, 11);
-        wait_for_state(&h, |s| s.is_live(), Duration::from_secs(2));
-        assert!(server.connections() >= 2);
+        wait_for_state(&h, |s| matches!(s, SamplerState::Live), Duration::from_secs(2));
+        assert_eq!(script.opened(), 2);
 
         h.shutdown();
         h.join().unwrap();
@@ -1502,61 +1156,35 @@ mod tests {
 
     #[test]
     fn malformed_json_line_tolerated_and_reconnects() {
-        let dir = TestDir::new("badjson");
-        let server = FakeServer::start(
-            dir.path(),
+        let script = Arc::new(Script::new(vec![
             vec![
-                Reply::Line(meta_map_line()),
+                Reply::Line(batch_line(vec![live_sample(12, "pre")])),
                 Reply::Line("{\"errno\":0,\"args\":{\"resp\":{\"samples\":[".to_owned()),
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![live_sample(12, "after-malformed")])),
             ],
-        );
+            vec![Reply::Line(batch_line(vec![live_sample(13, "after-malformed")]))],
+        ]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_scripted(&script, fast_tuning(), tx);
 
+        assert_eq!(recv_batch(&rx, Duration::from_secs(5))[0].pid, 12);
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].pid, 12);
-        wait_for_state(&h, |s| s.is_live(), Duration::from_secs(2));
-        assert!(server.connections() >= 2);
+        assert_eq!(batch[0].pid, 13);
+        wait_for_state(&h, |s| matches!(s, SamplerState::Live), Duration::from_secs(2));
+        assert_eq!(script.opened(), 2);
 
         h.shutdown();
         h.join().unwrap();
-    }
-
-    #[test]
-    fn shutdown_unblocks_unresponsive_server() {
-        let dir = TestDir::new("hang");
-        let server = FakeServer::start(dir.path(), vec![Reply::Hang]);
-        let (tx, rx) = mpsc::channel();
-        let h = spawn(&server.socket(), DEFAULT_CADENCE, tx);
-        // Let the thread block on the never-answered stats_meta read.
-        std::thread::sleep(Duration::from_millis(150));
-        let t0 = Instant::now();
-        h.shutdown();
-        h.join().unwrap();
-        assert!(
-            t0.elapsed() < Duration::from_secs(2),
-            "join took {:?}",
-            t0.elapsed()
-        );
-        drop(rx);
     }
 
     #[test]
     fn empty_batch_delivered() {
-        let dir = TestDir::new("empty");
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![])),
-                Reply::Line(batch_line(vec![])),
-            ],
-        );
+        let script = Arc::new(Script::new(vec![vec![
+            Reply::Line(batch_line(vec![])),
+            Reply::Line(batch_line(vec![])),
+        ]]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_scripted(&script, fast_tuning(), tx);
 
         assert!(recv_batch(&rx, Duration::from_secs(5)).is_empty());
         assert!(recv_batch(&rx, Duration::from_secs(5)).is_empty());
@@ -1567,17 +1195,10 @@ mod tests {
 
     #[test]
     fn batch_at_ringbuf_cap() {
-        let dir = TestDir::new("cap60");
         let samples: Vec<Value> = (0..60i64).map(|i| live_sample(1000 + i, "spinner")).collect();
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(samples)),
-            ],
-        );
+        let script = Arc::new(Script::new(vec![vec![Reply::Line(batch_line(samples))]]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_scripted(&script, fast_tuning(), tx);
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 60); // the ~60-sample ringbuf cap shape
@@ -1590,21 +1211,16 @@ mod tests {
 
     #[test]
     fn lenient_samples_string_numbers_unknowns_defaults() {
-        let dir = TestDir::new("lenient");
         let mut a = live_sample(7, "a");
         a["task_util_est"] = json!(" 999 "); // trimmed string number
         a["static_prio"] = json!("120");
         let garbage = json!(["not", "a", "sample"]);
         let c = json!({ "pid": 42, "comm": 7, "wait_freq": "oops" });
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(meta_map_line()),
-                Reply::Line(batch_line(vec![a, garbage, c])),
-            ],
-        );
+        let script = Arc::new(Script::new(vec![vec![Reply::Line(batch_line(vec![
+            a, garbage, c,
+        ]))]]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(server.socket().to_path_buf(), fast_tuning(Duration::from_millis(300)), tx);
+        let h = spawn_scripted(&script, fast_tuning(), tx);
 
         let batch = recv_batch(&rx, Duration::from_secs(5));
         assert_eq!(batch.len(), 2); // non-object entry skipped
@@ -1625,334 +1241,175 @@ mod tests {
             "samples": [live_sample(1, "a")],
             "truncated": 3,
         });
-        let (batch, truncated) = parse_batch(&with, "samples").expect("parses");
+        let (batch, truncated) = parse_batch(&with).expect("parses");
         assert_eq!(batch.len(), 1);
         assert_eq!(truncated, 3);
 
         let without = json!({ "samples": [] });
-        let (batch, truncated) = parse_batch(&without, "samples").expect("parses");
+        let (batch, truncated) = parse_batch(&without).expect("parses");
         assert!(batch.is_empty());
         assert_eq!(truncated, 0, "an older server sends no truncation count");
     }
 
-    // -----------------------------------------------------------------------
-    // Multi-scheduler schema binding (stat-ext/scx survey at da3c98b30).
-    // -----------------------------------------------------------------------
-
-    /// mavd's schema: byte-identical `SchedSample` plus `SysStats` with the
-    /// mavd-only `nr_reenq_kfunc` counter.
-    fn mavd_meta_line() -> String {
-        let fields: serde_json::Map<String, Value> = LIVE_FIELDS
-            .iter()
-            .map(|(name, datum)| {
-                ((*name).to_owned(), json!({ "datum": datum, "desc": format!("{name} field") }))
-            })
-            .collect();
-        json!({
-            "errno": 0,
-            "args": { "resp": {
-                "SchedSample": { "fields": fields },
-                "SysStats": { "fields": {
-                    "nr_running": { "datum": "u64", "desc": "Runnable tasks" },
-                    "nr_reenq_kfunc": { "datum": "u64", "desc": "mavd-only counter" }
-                }}
-            }}
-        })
-        .to_string()
-    }
-
-    /// Minimal per-task schema (a hypothetical renamed struct).
-    fn task_fields_json() -> Value {
-        json!({
-            "pid": { "datum": "i64", "desc": "pid" },
-            "comm": { "datum": "string", "desc": "comm" },
-            "wait_freq": { "datum": "u64", "desc": "wait" },
-            "wake_freq": { "datum": "u64", "desc": "wake" },
-            "avg_runtime_wall": { "datum": "u64", "desc": "runtime" }
-        })
-    }
-
-    fn unknown_target_line() -> String {
-        json!({ "errno": 22, "args": { "resp": "unknown stat target" } }).to_string()
-    }
-
-    /// Server that answers by request kind: `meta` for stats_meta, rows only
-    /// under `rows_target`, `errno 22` for every other stats target.
-    fn target_aware_server(
-        dir: &Path,
-        meta: String,
-        rows_target: &'static str,
-        rows: Vec<Value>,
-    ) -> FakeServer {
-        FakeServer::start_with(dir, move |_, req| {
-            let parsed: Value = serde_json::from_str(req.trim()).unwrap_or(Value::Null);
-            if parsed["req"] == "stats_meta" {
-                return Reply::Line(meta.clone());
-            }
-            let target = parsed["args"]["target"].as_str().unwrap_or("");
-            if target == rows_target {
-                Reply::Line(batch_line(rows.clone()))
-            } else {
-                Reply::Line(unknown_target_line())
-            }
-        })
-    }
-
     #[test]
-    fn mavd_schema_binds_and_delivers() {
-        let dir = TestDir::new("mavd");
-        let server = FakeServer::start(
-            dir.path(),
-            vec![
-                Reply::Line(mavd_meta_line()),
-                Reply::Line(batch_line(vec![])), // bind-handshake probe
-                Reply::Line(batch_line(vec![live_sample(77, "mavd-task")])),
-            ],
-        );
+    fn failed_round_trip_clears_the_abort_slot() {
+        // A dead link must not stay parked: `shutdown()` would abort a stale
+        // handle while the thread is already reconnecting.
+        let script = Arc::new(Script::new(vec![vec![Reply::Eof]]));
         let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            server.socket().to_path_buf(),
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].pid, 77);
-        assert_eq!(batch[0].comm, "mavd-task");
-        assert!(h.fields().has("wait_freq"));
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn renamed_struct_binds_via_derived_target() {
-        // Struct renamed to TaskSample, target renamed to its SINGULAR
-        // snake_case (task_sample): the derived-plural probe fails and the
-        // derived-singular candidate wins.
-        let dir = TestDir::new("renamed");
-        let meta = json!({
-            "errno": 0,
-            "args": { "resp": { "TaskSample": { "fields": task_fields_json() } } }
-        })
-        .to_string();
-        let server = target_aware_server(
-            dir.path(),
-            meta,
-            "task_sample",
-            vec![json!({ "pid": 9, "comm": "renamed", "wait_freq": 5, "wake_freq": 6,
-                         "avg_runtime_wall": 7, "task_util_est": 8, "cpu_util_wall": 9,
-                         "static_prio": 20 })],
-        );
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            server.socket().to_path_buf(),
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].pid, 9);
-        assert_eq!(batch[0].wait_freq, 5);
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn unknown_targets_fall_through_to_probe_list() {
-        // Struct name derives nothing usable ("zeds"/"zed"); rows are served
-        // only under "tasks" — the last PROBE_TARGETS entry.
-        let dir = TestDir::new("probe-fall");
-        let meta = json!({
-            "errno": 0,
-            "args": { "resp": { "Zed": { "fields": task_fields_json() } } }
-        })
-        .to_string();
-        let server = target_aware_server(
-            dir.path(),
-            meta,
-            "tasks",
-            vec![json!({ "pid": 3, "comm": "zed-task", "wait_freq": 1, "wake_freq": 2,
-                         "avg_runtime_wall": 3 })],
-        );
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            server.socket().to_path_buf(),
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-        let batch = recv_batch(&rx, Duration::from_secs(5));
-        assert_eq!(batch[0].comm, "zed-task");
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn aggregate_only_reports_no_per_task() {
-        // bpfland/flow/p2dq shape: only aggregate Metrics structs. The
-        // sampler must degrade with the stable reason — not crash, not loop
-        // hot, and NOT report live.
-        let dir = TestDir::new("aggregate");
-        let meta = json!({
-            "errno": 0,
-            "args": { "resp": {
-                "Metrics": { "fields": {
-                    "nr_running": { "datum": "u64", "desc": "runnable" },
-                    "nr_cpus": { "datum": "u64", "desc": "cpus" }
-                }}
-            }}
-        })
-        .to_string();
-        let server = FakeServer::start_with(dir.path(), move |_, req| {
-            let parsed: Value = serde_json::from_str(req.trim()).unwrap_or(Value::Null);
-            if parsed["req"] == "stats_meta" {
-                Reply::Line(meta.clone())
-            } else {
-                Reply::Line(unknown_target_line())
-            }
-        });
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            server.socket().to_path_buf(),
-            fast_tuning(Duration::from_millis(300)),
+        let h = spawn_scripted(
+            &script,
+            tuning_with(Duration::from_millis(400), Duration::from_millis(400)),
             tx,
         );
         wait_for_state(
             &h,
-            // The reason STRING is a stable contract (daemon docs/COMPATIBILITY)
-            // — match the literal, not the constant.
-            |s| matches!(s, SamplerState::Degraded { reason } if reason == "no per-task stats"),
-            Duration::from_secs(5),
-        );
-        assert!(rx.try_recv().is_err(), "no batches from an aggregate-only server");
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn empty_samples_rows_still_bind() {
-        // An idle system legitimately answers {"samples": []} to the
-        // nr_samples=1 probe — the binding must survive it.
-        let dir = TestDir::new("empty-rows");
-        let server = FakeServer::start_with(dir.path(), move |_, req| {
-            let parsed: Value = serde_json::from_str(req.trim()).unwrap_or(Value::Null);
-            if parsed["req"] == "stats_meta" {
-                Reply::Line(meta_map_line())
-            } else {
-                Reply::Line(batch_line(vec![]))
-            }
-        });
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            server.socket().to_path_buf(),
-            fast_tuning(Duration::from_millis(200)),
-            tx,
-        );
-        wait_for_state(&h, |s| s.is_live(), Duration::from_secs(5));
-        drop(rx);
-        h.shutdown();
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn find_task_struct_gates_on_identity_and_signals() {
-        // A struct qualifies only with pid + comm + ≥1 signal field. Each
-        // gate has a decoy in the meta below; weakening either gate picks
-        // the wrong struct (or any struct at all).
-        let full = task_fields_json();
-        let meta = json!({
-            "Metrics": { "fields": { "nr_running": { "datum": "u64" } } },
-            // per-CPU counters carry signal NAMES (more than TaskSample, to
-            // defeat the signal-count tie-break) but no task identity
-            "CpuStats": { "fields": {
-                "cpu_util_wall": { "datum": "u64" },
-                "task_util_est": { "datum": "u64" },
-                "wait_freq": { "datum": "u64" },
-                "wake_freq": { "datum": "u64" }
-            }},
-            "TaskSample": { "fields": full }
-        });
-        let (name, set) = find_task_struct(&meta).expect("TaskSample qualifies");
-        assert_eq!(name, "TaskSample");
-        assert!(set.has("pid") && set.has("wait_freq"));
-
-        // identity without signals can never feed sample_score: no binding
-        let meta = json!({
-            "Metrics": { "fields": { "nr_running": { "datum": "u64" } } },
-            "TaskHint": { "fields": {
-                "pid": { "datum": "i64" },
-                "comm": { "datum": "string" }
-            }}
-        });
-        assert!(find_task_struct(&meta).is_none());
-
-        // pure aggregate: no binding
-        let meta = json!({ "Metrics": { "fields": { "nr_running": { "datum": "u64" } } } });
-        assert!(find_task_struct(&meta).is_none());
-    }
-
-    #[test]
-    fn rows_key_rejects_aggregate_arrays() {
-        // mlfq-style aggregate `op_lat` arrays (empty or not) must never
-        // masquerade as per-task rows; known row containers must parse.
-        assert_eq!(rows_key(&json!({ "op_lat": [] })), None);
-        assert_eq!(rows_key(&json!({ "op_lat": [1, 2, 3] })), None);
-        assert_eq!(rows_key(&json!({ "samples": [] })), Some("samples".to_owned()));
-        assert_eq!(
-            rows_key(&json!({ "samples": [{ "pid": 1 }] })),
-            Some("samples".to_owned())
-        );
-        assert_eq!(rows_key(&json!([{ "pid": 1 }])), Some(String::new()));
-        assert_eq!(rows_key(&json!([1, 2])), None);
-    }
-
-    #[test]
-    fn target_candidates_prefer_struct_derived_names() {
-        assert_eq!(
-            target_candidates("SchedSample"),
-            vec!["sched_samples", "sched_sample", "task_samples", "samples", "tasks"]
-        );
-        assert_eq!(
-            target_candidates("TaskSample"),
-            vec!["task_samples", "task_sample", "sched_samples", "samples", "tasks"]
-        );
-    }
-
-    #[test]
-    fn failed_bind_releases_parked_stream() {
-        // A failed handshake must not leave the connection parked in the
-        // stream slot: the fd would outlive the attempt and shutdown()
-        // could hit a dead stream later.
-        let dir = TestDir::new("slot-release");
-        let meta = json!({
-            "errno": 0,
-            "args": { "resp": {
-                "Metrics": { "fields": { "nr_running": { "datum": "u64" } } }
-            }}
-        })
-        .to_string();
-        let _server = FakeServer::start_with(dir.path(), move |_, req| {
-            let parsed: Value = serde_json::from_str(req.trim()).unwrap_or(Value::Null);
-            if parsed["req"] == "stats_meta" {
-                Reply::Line(meta.clone())
-            } else {
-                Reply::Line(unknown_target_line())
-            }
-        });
-        let (tx, rx) = mpsc::channel();
-        let h = spawn_with(
-            dir.path().join("stats"),
-            fast_tuning(Duration::from_millis(300)),
-            tx,
-        );
-        wait_for_state(
-            &h,
-            |s| matches!(s, SamplerState::Degraded { reason } if reason == "no per-task stats"),
+            |s| matches!(s, SamplerState::Degraded { reason } if reason == "transport down"),
             Duration::from_secs(5),
         );
         assert!(
             locked(&h.slot).is_none(),
-            "failed bind must release the parked stream"
+            "a dead link must not stay parked in the abort slot"
         );
         drop(rx);
         h.shutdown();
         h.join().unwrap();
+    }
+
+    #[test]
+    fn backoff_doubles_to_cap() {
+        // The schedule itself, without waiting for it: 1, 2, 4, 8, 16, 30, 30
+        // seconds with ±25 % jitter, and a reset that really returns to the
+        // floor. (That the loop honours these delays is the reconnect tests'
+        // job — they would never reach `Live` otherwise.)
+        let start = Duration::from_millis(100);
+        let cap = Duration::from_millis(3000);
+        let mut backoff = Backoff::new(start, cap);
+        for base_ms in [100u64, 200, 400, 800, 1600, 3000, 3000] {
+            let delay = backoff.delay();
+            let lo = Duration::from_millis(base_ms * 3 / 4);
+            let hi = Duration::from_millis(base_ms * 5 / 4);
+            assert!(
+                delay >= lo && delay <= hi,
+                "delay {delay:?} outside [{lo:?}, {hi:?}] for a {base_ms} ms step"
+            );
+        }
+        backoff.reset();
+        let delay = backoff.delay();
+        assert!(
+            delay >= Duration::from_millis(75) && delay <= Duration::from_millis(125),
+            "reset must return to the {start:?} floor, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn pacing_skips_missed_slots() {
+        // A round trip that overruns several 40 ms slots must resume at the
+        // next slot, never replay the missed ones back to back.
+        const CADENCE: Duration = Duration::from_millis(40);
+        let script = Arc::new(Script::new(vec![vec![
+            Reply::Slow(
+                Duration::from_millis(130),
+                batch_line(vec![live_sample(1, "slow")]),
+            ),
+            Reply::Line(batch_line(vec![live_sample(2, "next")])),
+        ]]));
+        let (tx, rx) = mpsc::channel();
+        let h = spawn_with(
+            Box::new(Arc::clone(&script)),
+            Tuning {
+                cadence: CADENCE,
+                backoff_start: Duration::from_millis(30),
+                backoff_cap: Duration::from_millis(120),
+            },
+            "scripted".to_owned(),
+            tx,
+        );
+
+        let (first, t1) = recv_timed(&rx, Duration::from_secs(5));
+        assert_eq!(first[0].pid, 1);
+        let (second, t2) = recv_timed(&rx, Duration::from_secs(5));
+        assert_eq!(second[0].pid, 2);
+        // Same slot as the slow round trip ended in -> ~20 ms later; a
+        // catch-up burst would deliver both back to back.
+        let gap = t2 - t1;
+        assert!(
+            gap >= Duration::from_millis(15),
+            "catch-up burst: second batch arrived {gap:?} after the first (cadence {CADENCE:?})"
+        );
+
+        h.shutdown();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn consumer_drop_exits_promptly() {
+        let script = Arc::new(Script::new(vec![vec![Reply::Line(batch_line(vec![
+            live_sample(1, "a"),
+        ]))]]));
+        let (tx, rx) = mpsc::channel();
+        let h = spawn_scripted(&script, fast_tuning(), tx);
+        // Prove the loop is running before pulling the consumer away.
+        let _ = recv_batch(&rx, Duration::from_secs(5));
+
+        let t0 = Instant::now();
+        drop(rx);
+        h.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "thread outlived its consumer by {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(script.opened(), 1, "a dead consumer must not reconnect");
+        assert_eq!(script.aborts(), 1, "the live link must be aborted on the way out");
+    }
+
+    // -----------------------------------------------------------------------
+    // Real socket: framing and `shutdown(2)` are kernel/libc behaviour.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unix_socket_round_trip() {
+        let dir = TestDir::new("unix-happy");
+        let mut tweaked = live_sample(2210, "mpv");
+        tweaked["static_prio"] = json!("120");
+        let server = FakeServer::start(
+            dir.path(),
+            vec![
+                Reply::Line(batch_line(vec![live_sample(1557, "kworker/u99:1")])),
+                Reply::Line(batch_line(vec![tweaked])),
+            ],
+        );
+        let (tx, rx) = mpsc::channel();
+        let h = spawn_collector(server.socket(), Duration::from_millis(25), tx);
+
+        let first = recv_batch(&rx, Duration::from_secs(5));
+        assert_eq!(first[0].pid, 1557);
+        assert_eq!(first[0].comm, "kworker/u99:1");
+        let second = recv_batch(&rx, Duration::from_secs(5));
+        assert_eq!(second[0].static_prio, 120, "number-as-string survives framing");
+        wait_for_state(&h, |s| matches!(s, SamplerState::Live), Duration::from_secs(2));
+
+        h.shutdown();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_unblocks_unresponsive_server() {
+        let dir = TestDir::new("hang");
+        let server = FakeServer::start(dir.path(), vec![Reply::Hang]);
+        let (tx, rx) = mpsc::channel();
+        let h = spawn_collector(server.socket(), DEFAULT_CADENCE, tx);
+        // Let the thread block on the never-answered stats read.
+        std::thread::sleep(Duration::from_millis(150));
+        let t0 = Instant::now();
+        h.shutdown();
+        h.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "join took {:?}",
+            t0.elapsed()
+        );
+        drop(rx);
     }
 }
