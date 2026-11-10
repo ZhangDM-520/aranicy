@@ -1,9 +1,9 @@
 //! `aranicy start` runtime: singleton, signals, worker loop, drift corrector.
 //!
 //! Threading model:
-//! * **worker** (main thread): `next_event()` → name resolution →
+//! * **worker** (main thread): `next_batch()` → per-frame name resolution →
 //!   [`decision::plan`] → [`decision::execute`]. Stack buffers only; no
-//!   `format!`/`String` per event.
+//!   `format!`/`String` per event, and one `read` per batch of exec events.
 //! * **signal** thread: `sigwait` over SIGHUP/SIGTERM/SIGINT. SIGHUP performs
 //!   the reload *on this thread* (the rule swap is an `RwLock<Arc<..>>` store,
 //!   so the worker sees it on its next event); SIGTERM/SIGINT stop the daemon.
@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use aranicy_apply::{probe_capabilities, Capabilities, CgroupManager};
-use aranicy_wire::ExecFrame;
+use aranicy_wire::{BatchBuf, FrameRef};
 
 use crate::event_client::EventClient;
 use aranicy_model::CgroupDef;
@@ -500,11 +500,16 @@ fn worker_loop(shared: &Arc<Shared>, source: &Arc<EventClient>) {
         last: Instant::now(),
         dropped: 0,
     };
+    // The reader owns the batch buffer: a burst of execs costs one read and
+    // the frames are iterated in place.
+    let mut batch = BatchBuf::new();
     loop {
-        match source.next_event() {
-            Ok(None) => return,
-            Ok(Some(ev)) => {
-                handle_event(shared, &ev);
+        match source.next_batch(&mut batch) {
+            Ok(false) => return,
+            Ok(true) => {
+                for ev in batch.frames() {
+                    handle_event(shared, ev);
+                }
                 maybe_summary(shared, source, &mut summary);
             }
             Err(e) => {
@@ -522,17 +527,18 @@ struct SummaryState {
     dropped: u64,
 }
 
-fn handle_event(shared: &Shared, ev: &ExecFrame) {
+fn handle_event(shared: &Shared, ev: FrameRef<'_>) {
     // The collector resolves the match name at capture time (microseconds
     // after exec), which is strictly better than re-deriving it here: by the
     // time the event crosses the socket, a short-lived tool may already be
     // gone. Fall back to the local resolver only when capture failed.
     let mut buf = [0u8; NAME_CAP];
-    let len = if ev.name.is_empty() {
-        shared.proc.derive_name(ev.pid, ev.comm_bytes(), &mut buf)
+    let len = if ev.name().is_empty() {
+        shared.proc.derive_name(ev.pid(), ev.comm(), &mut buf)
     } else {
-        let n = ev.name.len().min(NAME_CAP);
-        buf[..n].copy_from_slice(&ev.name[..n]);
+        let name = ev.name();
+        let n = name.len().min(NAME_CAP);
+        buf[..n].copy_from_slice(&name[..n]);
         n
     };
     let rules = shared.rules();
@@ -540,8 +546,8 @@ fn handle_event(shared: &Shared, ev: &ExecFrame) {
     let cgroups = shared.cgroups();
     let plan = decision::plan_locked(
         &buf[..len],
-        ev.comm_bytes(),
-        ev.pid,
+        ev.comm(),
+        ev.pid(),
         &rules,
         &shared.bias,
         &cfg,
@@ -552,7 +558,7 @@ fn handle_event(shared: &Shared, ev: &ExecFrame) {
         cgroups: &cgroups,
     };
     let sink = Sink::new(&cfg, &shared.bias, Route::Exec);
-    decision::execute(plan, ev.pid, &applier, &shared.counters, &sink);
+    decision::execute(plan, ev.pid(), &applier, &shared.counters, &sink);
 }
 
 /// One rate-limited aggregate line per ~60 s, and only when something went

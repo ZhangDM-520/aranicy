@@ -13,7 +13,7 @@ use libbpf_rs::{Link, MapCore, MapFlags, Object, ObjectBuilder, RingBuffer, Ring
 use aranicy_procname::{NAME_CAP, ProcResolver};
 
 use crate::agg::{RawAcc, Snapshot, parse_raw};
-use crate::events::{COMM_LEN, EventQueue, ExecFrame};
+use crate::events::{EventQueue, FrameBuf, COMM_LEN};
 
 static BPF_OBJ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/collector.bpf.o"));
 
@@ -85,7 +85,7 @@ impl StatsCollector {
                 comm.copy_from_slice(&data[8..8 + COMM_LEN]);
                 let mut name_buf = [0u8; NAME_CAP];
                 let n = proc.derive_name(pid, &comm[..comm_len], &mut name_buf);
-                queue.push(ExecFrame::new(pid, comm, comm_len as u8, &name_buf[..n]));
+                queue.push(FrameBuf::new(pid, comm, comm_len as u8, &name_buf[..n]));
                 0
             })
             .context("failed to register exec ring buffer")?;

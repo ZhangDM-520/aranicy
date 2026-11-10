@@ -304,3 +304,134 @@ with learned bias gets its nice applied per exec (one `setpriority`-family
 walk, same as a ruled name) — that is the designed actuation path; the
 confounded round showed the pathological extreme is verbose logging, not
 actuation. Bias applies to every sampled comm, kernel threads included.
+
+## v0.3.0 split baseline — 2026-11-09
+
+v0.3.0 moved every BPF program into `aranicy-collectord`, so per-exec cost is
+no longer one process's bill: the collector captures, the daemon resolves and
+applies, and the two talk over a Unix socket. The historical ≤5 % / 24.4k
+instructions-per-exec / cs ≈ 1.0 invariants describe the retired single-process
+architecture and are not directly comparable. `tools/storm/run_bench.py` is now
+a two-process harness: `--pid` is repeatable, `--perf` measures each pid
+separately (idle window subtracted), and the storm generator can cluster
+arrivals (`--burst`) so a batching win is measurable at all.
+
+### Commands
+
+```sh
+# build the generator (C only, no deps)
+gcc -O2 -o tools/storm/storm tools/storm/storm.c
+
+# pids of the two halves of the split
+systemctl show -p MainPID --value aranicy aranicy-collector
+
+# uniform cell — the historical arrival pattern
+python3 tools/storm/run_bench.py \
+  --pid <daemon-pid> --pid <collector-pid> \
+  --label <daemon-pid>=daemon --label <collector-pid>=collector \
+  --perf --rate 2000 --duration 15 --workers 4 --reps 3
+
+# burst cell — same average rate, arrivals clustered 16 deep per worker slot
+python3 tools/storm/run_bench.py \
+  --pid <daemon-pid> --pid <collector-pid> \
+  --label <daemon-pid>=daemon --label <collector-pid>=collector \
+  --perf --rate 2000 --duration 15 --workers 4 --reps 3 --burst 16
+
+# paired A/B of two binary pairs in one session (installs, restarts, measures
+# both; --dry-run prints the command sequence instead of touching anything).
+# Both cells install into /usr/bin, so the candidate MUST be staged elsewhere —
+# a --next-dir of /usr/bin is overwritten by the prev install and the "next"
+# cell then measures prev (the harness refuses this).
+mkdir -p /tmp/aranicy-next
+install -m 0755 target/release/aranicy /tmp/aranicy-next/
+install -m 0755 collector/target/release/aranicy-collectord /tmp/aranicy-next/
+python3 tools/storm/run_bench.py --compare --perf --rate 2000 --duration 15 \
+  --workers 4 --prev-dir /usr/bin --prev-suffix .prev \
+  --next-dir /tmp/aranicy-next
+python3 tools/storm/run_bench.py --compare --perf --burst 16 --dry-run \
+  --prev-dir /usr/bin --prev-suffix .prev --next-dir /tmp/aranicy-next
+```
+
+`--burst N` spawns N children back-to-back per worker slot and then waits for
+the slot deadline, which is N intervals wide: `--rate` stays the achieved
+average and `--burst 1` reproduces the legacy pacing exactly (verified:
+2 500 execs / 5.000 s / 500.0 s⁻¹ for both binaries). Each cell reports
+`instr/exec`, `cs/exec`, `read/exec`, `write/exec`, wall-%, max-1 s wall-%, RSS
+and the idle instruction floor per pid, plus a `total` row, and prints the
+single-process reference invariants above the table.
+
+### Measured — 2 000 execs/s, 21 s, 4 workers, unruled `gsa-storm-probe`
+
+Hand-measured on this host with `perf stat -p <pid>` around the storm, governor
+`powersave`; marginal cost per exec = (storm − idle) ÷ executed execs.
+
+| metric (per exec event) | daemon | collector | total |
+|---|---|---|---|
+| instructions | **28–32k** (27.9 / 28.8 / 31.7k) | **25–27k** (25.3 / 25.9 / 26.5k) | **54–58k** vs 24.4k single-process → ≈2.2× |
+| context switches | 0.79 | 0.83 | 1.6 |
+| `read` syscalls | 0.996 (41 848 / 42 000) | — | — |
+| wall-% of one core | 6.1 | 6.2 | 12.3 |
+| idle instructions/s | 1.2–2.3M | 15–25M | — |
+
+Harness cross-check of this table (same host, `--perf --rate 2000 --duration 15
+--workers 4`, 3 reps, medians): daemon **29.1k** instr/exec, cs/exec **1.01**,
+read/exec **1.00**, wall 4.47 %, idle 0.7M instr/s; collector **27.7k**,
+cs/exec 0.98, read/exec 1.00, wall 4.73 %, idle 14.6M. Instructions, reads and
+the idle floors reproduce; wall-% does not (see below); cs/exec reproduces at
+≈1.0 rather than the 0.8 of the hand run, so that row needs a paired re-run
+before it is used for anything.
+
+### Why instructions/event is the invariant and wall-% is not
+
+The per-event instruction count is work, not time: it is identical at 1.8 GHz
+`powersave` and 3.1 GHz `performance` (2026-10-23: 1.22 G vs 1.32 G over the
+same 30 s window while wall-% moved 2.05 % → 6.55 %). Wall-% is
+`instructions ÷ (frequency × IPC)`, and both of those move with the governor,
+core placement and ambient load on this host (measured 0.89–3.43 GHz and IPC
+0.67–0.87 within single sessions). So an A/B on the split is judged on
+instr/exec, cs/exec and read/exec (each measured against an idle window of the
+same length, which removes the fixed per-process tax), and wall-% is reported
+only as a description of the current power state — never as the criterion.
+
+### The exec seam — batched frames, measured 2026-11-10
+
+`aranicy_wire` now hands out borrowed frames (`FrameBuf` owns 280 bytes,
+`FrameRef` borrows a view, `BatchBuf` is the reader's stack buffer) and the
+pump writes one `writev` per batch of up to `BATCH_FRAMES` = 16. The owned
+`Vec<u8>` name and its per-event heap allocation are gone on both sides.
+
+Paired A/B (`--compare`, prev = the v0.3.0 build, next = this change, 3 reps,
+2 000 execs/s, 10 s, `powersave`, medians):
+
+| cell | metric (per exec) | prev | next |
+|---|---|---|---|
+| burst 16 | daemon `read` | 1.04 | **1.03** |
+| burst 16 | collector `write` | 1.00 | **1.00** |
+| burst 16 | instr, total | 154 471 | 154 590 |
+| uniform | daemon `read` | 1.03 | 1.13 |
+| uniform | collector `write` | 1.00 | 1.10 |
+| uniform | instr, total | 158 014 | 150 866 |
+
+**The syscall win the report predicted does not materialise, and the reason is
+structural.** The pump is woken by a condvar on every push and drains the queue
+within microseconds, while forked children are spaced by fork+exec latency
+(≥50 µs) even inside a 16-deep burst — so the queue is empty when the pump
+looks and every batch is one frame. Batching can only engage when the producer
+outruns the pump (backlog), which a paced storm never produces. Making it
+engage needs a deliberate hold window, which buys syscalls with added exec
+latency; that is a policy decision, not a free win, and
+`bias_pass`/`burn` lessons apply (an unconditional spin costs more than it
+saves on non-clustering arrivals).
+
+The change is kept because its cost is nil (one lock per event either way, and
+`writev` with one iovec is `write`) and it degrades exactly to the old
+behaviour when the queue is not backed up; the seam is also where a future
+hold window would live. The instruction column cannot arbitrate anything on
+this host while the live bias history is polluted by test-thread entries: the
+same binary measured 135k–175k instr/exec across cells, and the daemon's
+per-window work scales with the 8 192-row budget, so neither direction is
+attributable from 3 reps.
+
+**Dropped open item:** `BATCH_FRAMES` 16 vs 32 cannot be discriminated,
+because measured batches average 1.0 frames on both cells. The buffer size is
+a ceiling, not a target.

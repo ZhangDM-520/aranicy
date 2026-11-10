@@ -37,6 +37,9 @@ green/clean — the done-gate for any code wave).
   end-to-end. (2026-10-28 multi-writer lesson.)
 - Falsify new checks (mutation probe / red-first) before trusting a green suite;
   never weaken assertions to pass. Judge runs by target artifacts, not pipe exit codes.
+- After a mutation probe, restore the file WITHOUT `cp -p`: preserved mtimes can
+  make cargo reuse the mutated artifact and report a phantom failure (or a
+  phantom pass). `touch` the restored file, or copy without `-p`.
 - Journal telemetry is only `bias changed` lines — freeze/rebaseline/classify
   events are silent. Each line now carries `prev`, `class` and `cause`
   (`Evidence`/`Relax`/`Flush`), so an evidence step and a relax stop looking
@@ -63,6 +66,32 @@ green/clean — the done-gate for any code wave).
 - Leftover-BPF audits must diff against a pre-run baseline: this host already
   had a `handle_exec` tracepoint prog (id 332, loaded 2026-10-22 19:42) with
   links 69/70 from another consumer; grep-zero is not the right oracle.
+
+## Exec-event transport (the v0.3.0 socket hop) — Last reviewed: 2026-11-10
+
+- The split costs 1 write + 1 read + 1 wake per exec event: measured
+  `read/exec` 1.03 (daemon) and `write/exec` 1.00 (collector) at 2 000 execs/s,
+  on both paced and 16-deep-burst cells. Borrowed frames (`FrameBuf`/`FrameRef`/
+  `BatchBuf`) removed the per-event name `Vec` allocation; they did **not**
+  remove the syscalls.
+- Queue-drain batching cannot coalesce on this workload: the pump is woken by a
+  condvar per push and drains within microseconds, while forked children are
+  >= 50 us apart even inside a 16-deep burst. A two-lock pump did coalesce
+  (read 0.81 / write 0.89) purely because the extra lock delayed it — so batch
+  size is a function of pump dwell time, not buffer size. `BATCH_FRAMES`
+  is a ceiling, not a target; 16 vs 32 cannot be discriminated (batches average
+  1.0). Getting << 1 syscalls/event needs an explicit hold window, i.e. a
+  latency-for-syscalls policy choice; measure it, never assume it.
+- Live `instr/exec` is not an A/B metric while the bias history is polluted
+  (`cargo test` fills it with test-thread names) and per-window work scales with
+  the 8 192-row budget: the same binary measured 135k-175k across cells. Judge
+  transport changes on `read/exec` + `write/exec` (structural) and report
+  instruction deltas only when they clear that bar.
+- `run_bench.py` must count `writev` in the `write` column (a batched collector
+  otherwise reports 0.00 writes/exec and looks like a regression).
+- Unix-socket test fixtures need a pid in the path: a stale socket file from a
+  previous test *process* makes `bind` fail EADDRINUSE (surfaced only under
+  `--test-threads 16`).
 
 ## Host interference: external nice-writers fight tests — Last reviewed: 2026-10-31
 
