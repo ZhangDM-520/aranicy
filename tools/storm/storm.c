@@ -5,6 +5,12 @@
  * can present a ruled or unruled *name* to the auto-nice daemon under test
  * without copying or renaming binaries.
  *
+ * Arrival pattern: each worker emits --burst children back-to-back (default 1,
+ * i.e. one child per slot = uniform arrivals) and then sleeps until the next
+ * burst slot. The slot is --burst intervals wide, so the average rate is
+ * unchanged and --rate stays the measured achieved rate; only the arrival
+ * clustering changes. --burst 1 therefore keeps the exact legacy pacing.
+ *
  * Output (single line on stdout at exit):
  *   RESULT execs=<N> elapsed=<sec> rate=<execs/sec>
  */
@@ -31,12 +37,14 @@ static void on_alarm(int sig)
 static void usage(const char *p)
 {
     fprintf(stderr,
-            "usage: %s [--rate N] [--duration S] [--workers W] [--argv0 NAME] [--target PATH]\n"
+            "usage: %s [--rate N] [--duration S] [--workers W] [--argv0 NAME] [--target PATH] [--burst N]\n"
             "  --rate      execs/sec across all workers (default 2000)\n"
             "  --duration  seconds to run (default 60)\n"
             "  --workers   forking threads (default 4)\n"
             "  --argv0     argv[0] presented to the child (default gsa-storm-probe)\n"
-            "  --target    binary to execv (default /bin/true)\n",
+            "  --target    binary to execv (default /bin/true)\n"
+            "  --burst     children spawned back-to-back per worker per slot (default 1);\n"
+            "              the slot widens to burst intervals so the average rate is unchanged\n",
             p);
     exit(2);
 }
@@ -52,6 +60,7 @@ static void add_ns(struct timespec *ts, long ns)
 
 struct worker_arg {
     long interval_ns;
+    long burst;
     const char *argv0;
     const char *target;
 };
@@ -62,15 +71,21 @@ static void *worker(void *p)
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (!g_stop) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            char *child_argv[] = { (char *)a->argv0, NULL };
-            execv(a->target, child_argv);
-            _exit(127);
+        /* One burst, then sleep until the burst slot that is `burst`
+         * intervals wide — the per-slot *deadline* stays absolute, so a
+         * slow burst does not shift the phase and the long-run average rate
+         * is per_worker execs/s regardless of --burst. */
+        for (long b = 0; b < a->burst && !g_stop; b++) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                char *child_argv[] = { (char *)a->argv0, NULL };
+                execv(a->target, child_argv);
+                _exit(127);
+            }
+            if (pid > 0)
+                atomic_fetch_add(&g_execs, 1);
         }
-        if (pid > 0)
-            atomic_fetch_add(&g_execs, 1);
-        add_ns(&next, a->interval_ns);
+        add_ns(&next, a->interval_ns * a->burst);
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
     return NULL;
@@ -78,7 +93,7 @@ static void *worker(void *p)
 
 int main(int argc, char **argv)
 {
-    long rate = 2000, duration = 60, workers = 4;
+    long rate = 2000, duration = 60, workers = 4, burst = 1;
     const char *argv0 = "gsa-storm-probe";
     const char *target = "/bin/true";
 
@@ -93,10 +108,12 @@ int main(int argc, char **argv)
             argv0 = argv[++i];
         else if (!strcmp(argv[i], "--target") && i + 1 < argc)
             target = argv[++i];
+        else if (!strcmp(argv[i], "--burst") && i + 1 < argc)
+            burst = atol(argv[++i]);
         else
             usage(argv[0]);
     }
-    if (rate <= 0 || duration <= 0 || workers <= 0)
+    if (rate <= 0 || duration <= 0 || workers <= 0 || burst <= 0)
         usage(argv[0]);
     if (workers > rate)
         workers = rate;
@@ -111,6 +128,7 @@ int main(int argc, char **argv)
 
     struct worker_arg wa = {
         .interval_ns = 1000000000L / per_worker,
+        .burst = burst,
         .argv0 = argv0,
         .target = target,
     };
