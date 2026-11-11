@@ -255,7 +255,7 @@ pub(crate) fn classify(map: &Map<String, Value>) -> Result<(Object, Vec<String>)
     if is_rule {
         // `null` on name/name_regex/type is treated as absent (these are not
         // policy fields; only policy fields participate in null suppression).
-        let name = map
+        let name: Option<Arc<str>> = map
             .get("name")
             .map(|v| str_field(v, "name"))
             .transpose()?
@@ -273,7 +273,19 @@ pub(crate) fn classify(map: &Map<String, Value>) -> Result<(Object, Vec<String>)
             .transpose()?
             .flatten()
             .map(Arc::from);
-        let (partial, notes) = parse_policy_fields(map, &["name", "name_regex", "type"])?;
+        let (partial, mut notes) = parse_policy_fields(map, &["name", "name_regex", "type"])?;
+        // Two ways to write a rule that can never match. Both are silent at
+        // runtime (no process ever carries that name), so the load has to say
+        // so - `lint` is the only place a corpus author will see it.
+        if let Some(n) = name.as_deref() {
+            if n.is_empty() {
+                notes.push("empty name can never match a process".to_string());
+            } else if n.contains('*') || n.contains('?') || n.contains('[') {
+                notes.push(format!(
+                    "name {n:?} is matched exactly; patterns need name_regex"
+                ));
+            }
+        }
         Ok((
             Object::Rule(RuleDraft {
                 name,

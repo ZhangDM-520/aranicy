@@ -112,7 +112,7 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     let (cfg, rules) = load::load_all(&paths)
         .map_err(|e| anyhow::anyhow!("cannot load config/rules: {e}"))?;
     init_tracing(&cfg.loglevel);
-    log_startup_warnings(&cfg, &rules);
+    log_startup_warnings(&cfg, &rules, &paths.config_dir);
 
     let caps = probe_capabilities();
     if !caps.latency_nice {
@@ -346,13 +346,31 @@ fn init_tracing(level: &str) {
         .try_init();
 }
 
-fn log_startup_warnings(cfg: &Config, rules: &RuleSet) {
-    for w in &cfg.warnings {
-        tracing::warn!("config: {w}");
+fn log_startup_warnings(cfg: &Config, rules: &RuleSet, rules_dir: &std::path::Path) {
+    for w in startup_warnings(cfg, rules, rules_dir) {
+        tracing::warn!("{w}");
     }
-    for w in &rules.warnings {
-        tracing::warn!("{}:{}: {}", w.file.display(), w.line, w.message);
+}
+
+/// The warning lines a start (or a reload) emits, in one place so the
+/// zero-rule case can be asserted without a tracing subscriber.
+fn startup_warnings(cfg: &Config, rules: &RuleSet, rules_dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = cfg.warnings.iter().map(|w| format!("config: {w}")).collect();
+    out.extend(
+        rules
+            .warnings
+            .iter()
+            .map(|w| format!("{}:{}: {}", w.file.display(), w.line, w.message)),
+    );
+    if cfg.rule_load && load::rule_count(rules) == 0 {
+        out.push(format!(
+            "no rules loaded from {}: with an empty rule set only the learned \
+             bias changes priorities. The package ships no rule corpus - point \
+             ANANICY_CPP_CONFDIR at yours, or write files ending in .rules",
+            rules_dir.display()
+        ));
     }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +753,27 @@ mod tests {
             drift_cv: Condvar::new(),
             drift_m: Mutex::new(()),
         })
+    }
+
+    #[test]
+    fn an_empty_rule_set_warns_at_startup() {
+        let dir = TestDir::new("empty-rules-warn");
+        let cfg = Config::default();
+        let lines = startup_warnings(&cfg, &RuleSet::empty(), dir.path());
+        assert!(
+            lines.iter().any(|l| l.contains("no rules loaded")),
+            "a fresh install must not look healthy: {lines:?}"
+        );
+
+        // One rule silences it.
+        let dir2 = TestDir::new("one-rule-no-warn");
+        std::fs::write(dir2.path().join("50-a.rules"), "{\"name\": \"x\", \"nice\": 1}\n").unwrap();
+        let rules = aranicy_rules::load_dir(dir2.path(), &Default::default()).expect("load");
+        let lines = startup_warnings(&cfg, &rules, dir2.path());
+        assert!(
+            !lines.iter().any(|l| l.contains("no rules loaded")),
+            "one rule is enough: {lines:?}"
+        );
     }
 
     #[test]

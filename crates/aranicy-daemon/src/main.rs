@@ -49,7 +49,11 @@ enum Action {
         #[arg(value_parser = ["rules", "types", "cgroups", "proc", "autogroup", "bias"])]
         what: String,
     },
-    /// Validate rules and report problems without running (exit 1 on errors).
+    /// Validate rules and report problems without running.
+    ///
+    /// Exit 1 on any finding: an error (a rule that would not load) or a
+    /// warning (a rule that loads but can never match, a file that is never
+    /// read). A corpus that is green is a corpus that will produce policy.
     Lint,
     /// Show which rule a process name would match, without applying anything.
     MatchTest {

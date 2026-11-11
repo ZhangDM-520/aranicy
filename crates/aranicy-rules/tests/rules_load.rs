@@ -355,3 +355,42 @@ fn sched_string_mapping() {
     assert_eq!(rs.lookup("s5").unwrap().0.sched, Some(SchedPolicy::Idle));
     assert_eq!(rs.lookup("s6").unwrap().0.sched, Some(SchedPolicy::Rr));
 }
+
+#[test]
+fn rules_that_can_never_match_are_named_in_the_load() {
+    let f = Fixture::new("never-match");
+    f.write(
+        "50-a.rules",
+        "{\"name\": \"\", \"nice\": 1}\n\
+         {\"name\": \"cc1*\", \"nice\": 2}\n",
+    );
+    let rs = f.load_default();
+    let m = messages(&rs);
+    assert!(
+        m.iter().any(|x| x.contains("empty name can never match")),
+        "{m:?}"
+    );
+    assert!(
+        m.iter().any(|x| x.contains("patterns need name_regex")),
+        "{m:?}"
+    );
+    assert_eq!(rs.exact.len(), 2, "both still load");
+}
+
+#[test]
+fn a_rules_directory_file_that_is_never_read_is_reported_not_ignored() {
+    let f = Fixture::new("skip-ext");
+    f.write("50-a.rules", "{\"name\": \"ok\", \"nice\": 1}\n");
+    f.write("60-b.json", "{\"name\": \"json\", \"nice\": 1}\n");
+    f.write("70-c.rules.bak", "{\"name\": \"bak\", \"nice\": 1}\n");
+    f.write("README.md", "# notes, not a corpus\n");
+    let rs = f.load_default();
+    let skipped: Vec<_> = rs
+        .warnings
+        .iter()
+        .filter(|w| w.message.contains("skipped"))
+        .map(|w| w.file.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(skipped, vec!["60-b.json", "70-c.rules.bak"], "{skipped:?}");
+    assert_eq!(rs.exact.len(), 1, "only the .rules file is loaded");
+}

@@ -315,6 +315,15 @@ fn collect_recursive(
             if enabled {
                 out.push(path);
             }
+        } else if looks_like_a_rule_file(&path) {
+            // A `.json` corpus or a restored `.bak` next to the live rules is
+            // the classic "my rules loaded" false positive: nothing is read and
+            // the load still looks healthy. Say it out loud.
+            warnings.push(LoadWarning {
+                file: path.clone(),
+                line: 0,
+                message: "skipped: only *.rules /*.types /*.cgroups are loaded".to_string(),
+            });
         }
     }
     Ok(())
@@ -324,6 +333,20 @@ enum FileKind {
     Rules,
     Types,
     Cgroups,
+}
+
+/// Files a user plausibly believes are loaded although [`file_kind`] rejects
+/// them. Scoped deliberately: a README or an editor swap file in the rules
+/// directory is not a mistake, a `.json` corpus or a `.rules.bak` restore is.
+fn looks_like_a_rule_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.starts_with('.') {
+        return false;
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(ext, "json" | "jsonl" | "bak" | "old") || name.contains(".rules.")
 }
 
 fn file_kind(path: &Path) -> Option<FileKind> {
