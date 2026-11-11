@@ -17,8 +17,7 @@
 # (every bpf_* symbol undefined). Linking libbpf.so also gives security
 # updates through the package manager.
 #
-# Release note: `sha256sums` is pinned by the release wave once `v$pkgver` is
-# tagged (`makepkg` uses the local `$pkgbase-$pkgver.tar.gz` until then).
+# Release note: `sha256sums` is pinned to the GitHub archive of `v$pkgver`.
 
 pkgbase=aranicy
 pkgname=('aranicy' 'aranicy-collector')
@@ -30,7 +29,7 @@ url="https://github.com/ZhangDM-520/aranicy"
 license=('MIT')
 makedepends=('cargo' 'clang' 'llvm' 'libbpf' 'pkgconf')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('46a757291bdaece6dc0371be9d394270a7319a168483dfbd1c28d4d701471cd6')
 
 prepare() {
     cd "$pkgbase-$pkgver"
