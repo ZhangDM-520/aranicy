@@ -65,7 +65,7 @@ release_cgroups() (
     if [ "$left" = 0 ]; then
         rm -f "$record" 2>/dev/null || true
     else
-        echo "aranicy: cgroup cleanup incomplete; kept $record - a cgroup may still be throttled" >&2
+        echo "aranicy: cgroup cleanup incomplete; kept $record - a cgroup may still be throttled" >&2 || true
     fi
     return 0
 )

@@ -159,8 +159,21 @@ release them (`release_cgroups` in `contrib/aranicy.install` and
 the ledger while its directory exists. Measured on the host against real
 cgroupfs: a process inside a daemon-created cgroup is moved to `/` and the
 directory is removed, while a directory that cannot be emptied keeps its
-ledger entry for a later attempt. The commands and their output are in
-`.logs/action-2026-11-11-follow-up-wave.md` ("Review rounds").
+ledger entry for a later attempt. The commands (root, scratch record path, a
+uniquely named cgroup, so the live state directory was never touched):
+
+```
+sudo mkdir /sys/fs/cgroup/aranicy-hooktest-$$
+sudo sh -c 'echo $$ > /sys/fs/cgroup/aranicy-hooktest-$$/cgroup.procs; exec sleep 300' &
+printf '%s\n' aranicy-hooktest-$$ > $record
+sudo env ANANICY_CGROUP_MOUNT=/sys/fs/cgroup ANANICY_CGROUP_RECORD=$record \
+    bash -c '. contrib/aranicy.install; release_cgroups'
+cat /proc/<sleep-pid>/cgroup               # 0::/
+ls -d /sys/fs/cgroup/aranicy-hooktest-*    # no match: the directory is gone
+```
+
+A cgroup with a nested child (so `rmdir` must fail) keeps its ledger line and
+prints `aranicy: cgroup cleanup incomplete`.
 
 ## Limitations of this method
 

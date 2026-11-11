@@ -65,9 +65,10 @@ names go in this ADR and the score classifier stays.
 - The state file grows by two integers per entry (~24 bytes × 4096).
 - A run with `bias_shadow = false` records no *new* lean inputs; a snapshot
   restored from an earlier capture still carries them and their marker, so
-  turning the flag off does not destroy a capture. Replay reports "no captured
-  burst/hop inputs" when the marker is present but no entry still has fresh
-  inputs, and "not a capture" when there is no marker at all.
+  turning the flag off does not destroy a capture. Replay reports "captured,
+  but no entry has fresh burst/hop inputs" when the marker is present but no
+  entry still has fresh inputs, and "not a capture" when there is no marker at
+  all.
 - The live counters remain the only view of the comparison against `cand`;
   the replay compares against the persistent `class` (post-hysteresis) and its
   output says so.

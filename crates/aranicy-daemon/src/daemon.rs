@@ -1136,6 +1136,36 @@ mod tests {
         );
     }
 
+    /// The write is a rename, so it replaces the ledger path instead of
+    /// following it: an in-place `fs::write` would rewrite whatever the path
+    /// points at and could lose the names on a partial write (round 5).
+    #[test]
+    fn the_ledger_write_replaces_the_path_instead_of_following_it() {
+        let dir = TestDir::new("cgroup-record-atomic");
+        let mount = dir.path().join("cgroup2");
+        std::fs::create_dir_all(&mount).expect("mount dir");
+        std::fs::write(mount.join("cgroup.procs"), "").expect("root procs");
+        let state = dir.path().join("state").join("bias-state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let record = state.with_file_name("cgroups");
+        let real = dir.path().join("previous-ledger");
+        std::fs::write(&real, "games\n").expect("previous ledger");
+        std::os::unix::fs::symlink(&real, &record).expect("symlink");
+
+        let (manager, _) = CgroupManager::init_at(&mount, BTreeMap::new());
+        record_cgroups(state.to_str().expect("utf8"), &manager);
+        let meta = std::fs::symlink_metadata(&record).expect("ledger metadata");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "an atomic write replaces the path, it never writes through it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("previous ledger"),
+            "games\n",
+            "the previous file is not modified in place"
+        );
+    }
+
     /// An unreadable ledger may still name live directories, so it must be
     /// left alone rather than replaced by the (empty) set the daemon owns.
     /// A symlink to a directory gives a read error that is not `NotFound`
