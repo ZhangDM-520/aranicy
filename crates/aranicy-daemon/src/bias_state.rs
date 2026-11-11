@@ -118,6 +118,22 @@ pub struct BiasSnapshot {
     pub lean_capture: Option<LeanCapture>,
 }
 
+impl BiasSnapshot {
+    /// Date the snapshot at the moment it is written.
+    ///
+    /// `saved_at` is the replay's age reference: every entry's `lean_at` is
+    /// measured against it. A window close is *not* that moment — a daemon
+    /// that runs for days after its last shadow window (or with
+    /// `bias_shadow` off) would keep a `saved_at` from that window, and
+    /// `saved_at - lean_at` would stay ~0, so `replay.py` could never report a
+    /// stale cohort. Stamping here is the only place that knows the save time.
+    pub fn mark_saved(&mut self, now_secs: u64) {
+        if let Some(c) = self.lean_capture.as_mut() {
+            c.saved_at = now_secs;
+        }
+    }
+}
+
 /// Atomically persist `state` (write tmp file + rename). Missing parent
 /// directories are created: the state path lives under `/var/lib/aranicy/`
 /// which a non-systemd start may not have (ENOENT there once made every

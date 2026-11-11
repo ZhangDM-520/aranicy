@@ -34,7 +34,7 @@ ananicy-cpp parity); CRLF tolerated. Bad lines warn and are skipped.
 | `ionice` | 0…7 | level for best-effort/realtime |
 | `oom_score_adj` | −1000…1000 | `/proc/<pid>/oom_score_adj` |
 | `cgroup` | string | move into named cgroup (created from `*.cgroups`) |
-| `cpuset` | string | `0-3,8-11` or aliases `big-cores`, `little-cores`, `performance-cores`, `efficiency-cores`, `all-cores`, `llc-N`, `node-N`. `turbo-cores` and `x3d-cache`/`x3d-frequency` **parse** (lint parity) but **warn at load and are rejected at apply time**: no kernel exposes a turbo-core marker, and 3D V-Cache mode is host-controlled. A malformed explicit list (`0-4-9`, `1024`) warns at load too — a cpuset that cannot resolve is dropped at apply time, so the loader refuses to leave it silent |
+| `cpuset` | string | `0-3,8-11` or aliases `big-cores`, `little-cores`, `performance-cores`, `efficiency-cores`, `all-cores`, `llc-N`, `node-N`. `turbo-cores` and `x3d-cache`/`x3d-frequency` **parse** (lint parity) but **warn at load and are rejected at apply time**: no kernel exposes a turbo-core marker, and 3D V-Cache mode is host-controlled. A malformed explicit list (`0-4-9`, `1024`) warns at load too, and so does a well-formed one that names no CPU this host has online (`16-31` on a 12-CPU box: `sched_setaffinity` answers EINVAL) — a cpuset that cannot resolve is dropped at apply time, so the loader refuses to leave it silent |
 | `autogroup` | int | **superset**: writes the process autogroup nice (ananicy-cpp only reports) |
 | `bias` | bool | **superset**: `false` opts this name out of the learned axis (see the bias section); `true`/absent leaves it on |
 
@@ -377,11 +377,15 @@ nothing.
   restart is not reload. Before signalling, it checks
   the pidfile: the file must still be locked by a running daemon and that pid's
   executable must be `aranicy` — a leftover file names a recycled pid, and
-  SIGHUP terminates. A refusal says which check failed and never signals.
+  SIGHUP terminates. A refusal says which check failed and never signals;
+  identifying a root-run daemon needs root too, so an unprivileged `--reload`
+  is refused as a privilege problem, not as an unidentifiable process.
   It logs
   `reloaded {n} rules; bias reconfigured`, calls out a changed `bias_group.*`
   (history keys change) and warns
   `restart-only keys ignored: <sorted key list>` for any deferred edit,
-  `--config`, `--config-dir`.
+  `--config`, `--config-dir`. The re-plan line separates `released=N`
+  (dimensions actually reset on N processes) from `kept_cpuset=M` (affinity
+  left on M processes, ADR 0002).
 - Unit `aranicy.service`, `ExecReload=/usr/bin/aranicy --reload`,
   `Conflicts=ananicy-cpp.service` for drop-in cutover.

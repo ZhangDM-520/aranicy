@@ -16,6 +16,8 @@ Usage:
                                 [--keep-tests] [--json]
 
 The host's state file is root-owned: run with sudo (read-only) or pass a copy.
+Its own tests: `python3 -m unittest discover -s tools/replay-bias` (also run
+from `cargo test` via crates/aranicy-daemon/tests/replay_gate.rs).
 
 LEAN AXIS. When the snapshot carries a `lean_capture` marker the replay
 re-runs the two-axis verdict with the boundary the daemon actually used (the

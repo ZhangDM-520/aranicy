@@ -74,15 +74,28 @@ pub fn acquire(path: &Path) -> Result<PidFile, PidFileError> {
 
 impl Drop for PidFile {
     fn drop(&mut self) {
-        let _ = flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        // Unlink first, release the lock second (closing the fd does the
+        // release). The reverse order opens a window in which a starting
+        // daemon locks this inode and then has its path removed by us: two
+        // live daemons, one of them invisible to `--reload`.
         let _ = std::fs::remove_file(&self.path);
+        let _ = flock(self.file.as_raw_fd(), libc::LOCK_UN);
     }
 }
 
 /// Read the recorded pid without taking the lock (`--reload`).
 pub fn read_pid(path: &Path) -> Option<u32> {
-    let mut file = std::fs::File::open(path).ok()?;
-    read_pid_from(&mut file)
+    read_pid_at(path).ok().flatten()
+}
+
+/// [`read_pid`] with the failure kept: a pidfile that exists but cannot be
+/// read (mode 0600, a directory, EACCES) is not the same fact as "no daemon".
+fn read_pid_at(path: &Path) -> std::io::Result<Option<u32>> {
+    match std::fs::File::open(path) {
+        Ok(mut file) => Ok(read_pid_from(&mut file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn read_pid_from(file: &mut File) -> Option<u32> {
@@ -108,6 +121,10 @@ pub enum ReloadTargetError {
     NotAranicy { pid: u32, exe: String },
     /// `/proc/<pid>/exe` unreadable (the process is gone, or /proc hides it).
     Unreadable { pid: u32, why: String },
+    /// The file (or the link inside `/proc`) is only readable as root. Told
+    /// apart from [`Self::Unreadable`] so an unprivileged `--reload` says
+    /// what to do instead of implying the daemon is unidentifiable.
+    PermissionDenied { path: PathBuf, what: String },
 }
 
 impl std::fmt::Display for ReloadTargetError {
@@ -132,6 +149,12 @@ impl std::fmt::Display for ReloadTargetError {
                 f,
                 "cannot identify pid {pid} from the pidfile ({why}); refusing to signal it"
             ),
+            Self::PermissionDenied { path, what } => write!(
+                f,
+                "cannot read {what} ({}) without privileges; \"aranicy --reload\" has to run \
+                 as root to identify the daemon",
+                path.display()
+            ),
         }
     }
 }
@@ -140,10 +163,25 @@ impl std::fmt::Display for ReloadTargetError {
 /// hold its lock (a daemon, not a leftover file), and that pid's executable
 /// must be this one.
 pub fn reload_target(path: &Path) -> Result<u32, ReloadTargetError> {
-    let Some(pid) = read_pid(path) else {
-        return Err(ReloadTargetError::Missing {
-            path: path.to_path_buf(),
-        });
+    let pid = match read_pid_at(path) {
+        Ok(Some(pid)) => pid,
+        Ok(None) => {
+            return Err(ReloadTargetError::Missing {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(ReloadTargetError::PermissionDenied {
+                path: path.to_path_buf(),
+                what: "the pidfile".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(ReloadTargetError::Unreadable {
+                pid: 0,
+                why: format!("{} is unreadable ({e})", path.display()),
+            });
+        }
     };
     if !lock_is_held(path) {
         return Err(ReloadTargetError::Stale {
@@ -151,16 +189,25 @@ pub fn reload_target(path: &Path) -> Result<u32, ReloadTargetError> {
             path: path.to_path_buf(),
         });
     }
-    let Some(exe) = executable_name(pid) else {
-        return Err(ReloadTargetError::Unreadable {
-            pid,
-            why: format!("/proc/{pid}/exe is not readable"),
-        });
+    let exe = match executable_name(pid) {
+        Ok(name) => name,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(ReloadTargetError::PermissionDenied {
+                path: PathBuf::from(format!("/proc/{pid}/exe")),
+                what: "the daemon's executable link".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(ReloadTargetError::Unreadable {
+                pid,
+                why: format!("/proc/{pid}/exe is not readable ({e})"),
+            });
+        }
     };
     let ours = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_os_string()));
-    if ours.as_deref() != Some(exe.as_os_str()) {
+    if !same_binary(ours.as_deref(), exe.as_os_str()) {
         return Err(ReloadTargetError::NotAranicy {
             pid,
             exe: exe.to_string_lossy().into_owned(),
@@ -186,12 +233,32 @@ fn lock_is_held(path: &Path) -> bool {
 
 /// Basename of `/proc/<pid>/exe`, with the " (deleted)" suffix the kernel adds
 /// after an upgrade removed the running file.
-fn executable_name(pid: u32) -> Option<std::ffi::OsString> {
-    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let name = link.file_name()?.to_os_string();
+fn executable_name(pid: u32) -> std::io::Result<std::ffi::OsString> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    let name = link.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "the link has no file name")
+    })?;
+    Ok(strip_deleted(name.to_os_string()))
+}
+
+/// Do these name the same binary? Both sides may carry the kernel's
+/// `" (deleted)"` marker, so the comparison — not merely the link read — has
+/// to normalize it.
+fn same_binary(ours: Option<&std::ffi::OsStr>, theirs: &std::ffi::OsStr) -> bool {
+    match ours {
+        Some(o) => strip_deleted(o.to_os_string()) == strip_deleted(theirs.to_os_string()),
+        None => false,
+    }
+}
+
+/// Drop the kernel's `" (deleted)"` suffix. It appears on `/proc/<pid>/exe`
+/// after an upgrade unlinks the running binary, and on the caller's own
+/// `current_exe()` in the same situation — both sides have to agree, or a
+/// reload run from a replaced binary refuses its own daemon.
+fn strip_deleted(name: std::ffi::OsString) -> std::ffi::OsString {
     match name.to_string_lossy().strip_suffix(" (deleted)") {
-        Some(real) => Some(real.into()),
-        None => Some(name),
+        Some(real) => real.into(),
+        None => name,
     }
 }
 
@@ -264,6 +331,65 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The kernel marks an unlinked executable with `" (deleted)"`; the
+    /// caller's own `current_exe()` carries the same suffix after an upgrade.
+    /// Both sides must strip it, or `--reload` from the replaced binary
+    /// refuses its own daemon.
+    #[test]
+    fn both_sides_of_the_executable_comparison_strip_the_deleted_marker() {
+        use std::ffi::OsStr;
+        assert!(
+            same_binary(Some(OsStr::new("aranicy (deleted)")), OsStr::new("aranicy")),
+            "a reload run from a replaced binary must accept its daemon"
+        );
+        assert!(same_binary(Some(OsStr::new("aranicy")), OsStr::new("aranicy (deleted)")));
+        assert!(!same_binary(Some(OsStr::new("aranicy")), OsStr::new("sleep")));
+        assert!(!same_binary(None, OsStr::new("aranicy")), "unknown is never a match");
+    }
+
+    /// A pidfile that exists but needs privileges is not a missing one: the
+    /// two facts send the operator to different places.
+    #[test]
+    fn an_unreadable_pidfile_is_named_as_a_privilege_problem() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("perm");
+        let path = dir.join("aranicy.pid");
+        std::fs::write(&path, "1\n").expect("write pid");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let err = reload_target(&path).expect_err("unreadable");
+        assert!(
+            matches!(err, ReloadTargetError::PermissionDenied { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("as root"), "{err}");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The singleton survives its own release: the path is unlinked on drop,
+    /// and a second run can take a fresh file. (The *order* of the unlink and
+    /// the lock release is a race and cannot be pinned from outside; it is
+    /// fixed in `Drop` instead.)
+    #[test]
+    fn dropping_the_pidfile_unlinks_it_and_frees_the_singleton() {
+        let dir = scratch("drop");
+        let path = dir.join("aranicy.pid");
+        let held = acquire(&path).expect("lock");
+        assert!(
+            matches!(
+                acquire(&path),
+                Err(PidFileError::AlreadyRunning { .. })
+            ),
+            "a second daemon must be refused while the first runs"
+        );
+        drop(held);
+        assert!(!path.exists(), "drop removes the pidfile");
+        let again = acquire(&path).expect("a fresh run takes a fresh file");
+        drop(again);
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

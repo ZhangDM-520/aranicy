@@ -982,9 +982,30 @@ fn resolve_alias(name: &str) -> Result<Vec<u64>, String> {
 /// resolve against /sys topology.
 pub fn resolve_cpuset(value: &CpuSet) -> Result<Vec<u64>, String> {
     match value {
-        CpuSet::Explicit(s) => parse_cpu_list(s),
+        CpuSet::Explicit(s) => {
+            let mask = parse_cpu_list(s)?;
+            // Syntax alone is not resolvability: `0-31` on a 12-CPU host
+            // parses, and `sched_setaffinity` then answers EINVAL, so the rule
+            // would silently keep the inherited affinity (round-3 ivy-17 class:
+            // the loader must warn, not the apply path at 3 a.m.).
+            if let Ok(online) = online_cpus() {
+                if !mask_intersects(&mask, &online) {
+                    let n: u32 = online.iter().map(|w| w.count_ones()).sum();
+                    return Err(format!(
+                        "none of the listed CPUs is online on this host ({n} online)"
+                    ));
+                }
+            }
+            Ok(mask)
+        }
         CpuSet::Alias(s) => resolve_alias(s),
     }
+}
+
+/// Does the mask name at least one CPU the kernel currently has online?
+/// (A partial overlap is fine: the kernel intersects it with the online set.)
+fn mask_intersects(mask: &[u64], online: &[u64]) -> bool {
+    mask.iter().zip(online).any(|(a, b)| a & b != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1366,45 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("invalid name"), "{warnings:?}");
         let _ = fs::remove_dir_all(&mount);
+    }
+
+    /// A well-formed list that names no CPU this host has online fails at
+    /// apply time with EINVAL, so the loader has to refuse it: a `lint` that
+    /// passes a rule which can never take effect is the silence class AGENTS
+    /// records.
+    #[test]
+    fn an_explicit_cpuset_with_no_online_cpu_does_not_resolve() {
+        let online = online_cpus().expect("this host exposes its online CPUs");
+        let max_online = online
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| {
+                (*w != 0).then_some(i as u64 * 64 + 63 - u64::from(w.leading_zeros()))
+            })
+            .max()
+            .expect("at least one CPU");
+        // Pick a range entirely above the highest online CPU.
+        let lo = max_online + 1;
+        let hi = lo + 3;
+        assert!(hi < 1024, "this test assumes fewer than 1021 online CPUs");
+        let v = CpuSet::Explicit(std::sync::Arc::from(format!("{lo}-{hi}").as_str()));
+        let err = resolve_cpuset(&v).expect_err("no online CPU in the list");
+        assert!(err.contains("none of the listed CPUs is online"), "{err}");
+
+        // A list that reaches the online set still resolves.
+        let ok = CpuSet::Explicit(std::sync::Arc::from("0"));
+        if mask_intersects(&parse_cpu_list("0").unwrap(), &online) {
+            assert!(resolve_cpuset(&ok).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_mask_matches_only_on_shared_bits() {
+        assert!(mask_intersects(&[0b1], &[0b1]));
+        assert!(mask_intersects(&[0b1], &[0b11]), "partial overlap is enough");
+        assert!(!mask_intersects(&[0b10], &[0b1]), "no shared bit");
+        assert!(!mask_intersects(&[], &[0b1]));
+        assert!(!mask_intersects(&[0b1], &[]), "no online CPUs: nothing matches");
     }
 
     /// One list lives in `aranicy-model` so the loader and the apply path

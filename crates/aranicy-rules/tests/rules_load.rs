@@ -396,6 +396,22 @@ fn a_rules_directory_file_that_is_never_read_is_reported_not_ignored() {
     assert_eq!(rs.exact.len(), 1, "only the .rules file is loaded");
 }
 
+/// Matching is on the executable's basename, so a rule that spells a path is
+/// dead weight; `lint` has to say so rather than pass it silently.
+#[test]
+fn a_name_with_a_path_separator_is_reported_at_load() {
+    let f = Fixture::new("path-name");
+    f.write(
+        "10-a.rules",
+        "{\"name\": \"/usr/bin/foo\", \"nice\": 5}\n         {\"name\": \"foo\", \"nice\": 5}\n",
+    );
+    let rs = f.load_default();
+    let m = messages(&rs);
+    // Exactly one rule is wrong: the plain `foo` beside it must stay silent.
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(m[0].contains("path separator") && m[0].contains("/usr/bin/foo"), "{m:?}");
+}
+
 #[test]
 fn duplicate_names_and_undefined_cgroups_are_reported() {
     let f = Fixture::new("dup-cgroup");

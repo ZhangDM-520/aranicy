@@ -34,10 +34,15 @@ release_cgroups() (
         if [ -r "$dir/cgroup.procs" ]; then
             while IFS= read -r pid; do
                 [ -n "$pid" ] || continue
-                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || left=1
+                # A pid that exited between the read and the write is not a
+                # failure: the directory below is the arbiter.
+                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || true
             done < "$dir/cgroup.procs"
         fi
-        rmdir "$dir" 2>/dev/null || left=1
+        rmdir "$dir" 2>/dev/null || true
+        if [ -d "$dir" ]; then
+            left=1
+        fi
     done < "$record"
     # Keep the ledger when something is still pinned: a later run can retry,
     # and without the file those directories are unreachable forever.

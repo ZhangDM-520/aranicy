@@ -326,10 +326,12 @@ fn fill_released(desired: &mut Policy, old: &Policy) {
     desired.autogroup = desired.autogroup.or(rel.autogroup);
 }
 
-/// Dimensions the old rule set that the new corpus does not: the give-back
-/// set. `cpuset` counts even though it is not reset (no safe value), because
-/// the journal must show that a decision was owed.
-fn owed_dims(old: &Policy, new: Option<&Policy>) -> usize {
+/// Dimensions the old rule set that the new corpus does not *reset*: the
+/// give-back set. `cpuset` is excluded even though a deletion is still owed —
+/// there is no safe value to write back, so counting it as released would
+/// report a revert that never happened (it is reported separately, see
+/// [`Reconciled::kept_cpuset`]).
+fn revertable_dims(old: &Policy, new: Option<&Policy>) -> usize {
     let unset = |f: fn(&Policy) -> bool| !new.is_some_and(f);
     usize::from(old.nice.is_some() && unset(|p| p.nice.is_some()))
         + usize::from(old.latency_nice.is_some() && unset(|p| p.latency_nice.is_some()))
@@ -341,17 +343,28 @@ fn owed_dims(old: &Policy, new: Option<&Policy>) -> usize {
             old.oom_score_adj.is_some() && unset(|p| p.oom_score_adj.is_some()),
         )
         + usize::from(old.cgroup.is_some() && unset(|p| p.cgroup.is_some()))
-        + usize::from(old.cpuset.is_some() && unset(|p| p.cpuset.is_some()))
         + usize::from(old.autogroup.is_some() && unset(|p| p.autogroup.is_some()))
+}
+
+/// The old rule set gave the process a `cpuset` the new one does not. Nothing
+/// is written back (no safe value), but an operator reading the reload log
+/// must be able to see that this dimension was left in place on purpose.
+fn cpuset_dropped(old: &Policy, new: Option<&Policy>) -> bool {
+    old.cpuset.is_some() && !new.is_some_and(|p| p.cpuset.is_some())
 }
 
 /// What a reload owes one running process.
 pub struct Reconciled<'a> {
     /// `None` = nothing to do.
     pub plan: Option<Plan<'a>>,
-    /// The old tree set dimensions the new one does not — so the journal says
-    /// a decision was owed, even when the plan is a skip.
+    /// The old tree set dimensions the new one does not, and at least one of
+    /// them is actually reset — so the journal says a decision was owed, even
+    /// when the plan is a skip.
     pub released: bool,
+    /// A `cpuset` was dropped and deliberately left on the process: no safe
+    /// value exists to write back (ADR 0002). Counted apart so `released` never
+    /// reports a revert that did not happen.
+    pub kept_cpuset: bool,
 }
 
 /// Decide what a reload owes a process that is already running.
@@ -373,6 +386,7 @@ pub fn reconcile<'a>(
     let nothing = Reconciled {
         plan: None,
         released: false,
+        kept_cpuset: false,
     };
     if name.is_empty() || pid == 1 || pid == std::process::id() {
         return nothing;
@@ -383,7 +397,8 @@ pub fn reconcile<'a>(
     let comm = std::str::from_utf8(comm).unwrap_or(name);
     let old_policy = old.lookup(name).map(|(p, _)| &**p);
     let new_policy = new.lookup(name).map(|(p, _)| &**p);
-    let released = old_policy.is_some_and(|o| owed_dims(o, new_policy) > 0);
+    let released = old_policy.is_some_and(|o| revertable_dims(o, new_policy) > 0);
+    let kept_cpuset = old_policy.is_some_and(|o| cpuset_dropped(o, new_policy));
     let plan = match plan(name.as_bytes(), comm.as_bytes(), pid, new, bias, cfg) {
         Plan::Apply {
             mut policy,
@@ -415,7 +430,11 @@ pub fn reconcile<'a>(
         }),
         Plan::Skip { reason } => Some(Plan::Skip { reason }),
     };
-    Reconciled { plan, released }
+    Reconciled {
+        plan,
+        released,
+        kept_cpuset,
+    }
 }
 
 /// [`reconcile`] with the engine-lock protocol handled here.
@@ -1129,7 +1148,8 @@ mod tests {
         let new = rules_with("game", Some(-5));
         let r = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg);
         assert!(r.plan.is_some());
-        assert!(r.released, "ionice and cpuset were dropped from a live rule");
+        assert!(r.released, "ionice was dropped from a live rule");
+        assert!(r.kept_cpuset, "the cpuset is dropped but left in place");
 
         // Nothing removed: not a release.
         let same = rules_of(
@@ -1142,6 +1162,27 @@ mod tests {
         );
         let r = reconcile_locked(b"game", b"game", 4242, &same, &same, &engine, &cfg);
         assert!(!r.released, "an unchanged rule owes nothing");
+        assert!(!r.kept_cpuset);
+    }
+
+    /// A cpuset is the one dimension a deleted rule does not give back, so a
+    /// reload that only loses a cpuset must report the keep — and must not
+    /// report a release it did not perform.
+    #[test]
+    fn a_dropped_cpuset_alone_is_reported_as_kept_not_released() {
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+        let old = rules_of(
+            "game",
+            Policy {
+                cpuset: Some(aranicy_model::CpuSet::Alias(Arc::from("big-cores"))),
+                ..Policy::default()
+            },
+        );
+        let new = RuleSet::empty();
+        let r = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg);
+        assert!(!r.released, "nothing was reset");
+        assert!(r.kept_cpuset, "the affinity was left in place");
     }
 
     #[test]

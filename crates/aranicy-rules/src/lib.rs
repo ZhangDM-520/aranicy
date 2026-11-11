@@ -323,6 +323,20 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
             None => {}
         }
         if let Some(name) = &draft.name {
+            // Matching is on the executable's basename (`/proc/<pid>/exe`),
+            // so a rule that spells a path can never match: refuse to leave
+            // that silent, like the empty and wildcard names above.
+            if name.contains('/') {
+                resolve_warnings.push(LoadWarning {
+                    file: draft.file.clone(),
+                    line: draft.line,
+                    message: format!(
+                        "name {name:?} contains a path separator; rules match the \
+                         executable's basename (\"foo\", not \"/usr/bin/foo\"), so this \
+                         definition can never match"
+                    ),
+                });
+            }
             // Duplicate exact names: later load replaces outright. That is
             // ananicy-cpp parity, but silence is not: a corpus that grew a
             // second definition of the same name is a thing to be told.

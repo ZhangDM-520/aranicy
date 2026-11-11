@@ -226,10 +226,7 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
         handle.shutdown();
         let _ = handle.join();
         let _ = bias_thread.join(); // channel closes with the sampler thread
-        let snap = shared.bias.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
-        if let Err(e) = bias_state::save(&snap, std::path::Path::new(&bias_state_path)) {
-            tracing::warn!("bias: cannot save state: {e}");
-        }
+        save_bias_state(&shared.bias, &bias_state_path);
     }
     let _ = drift_thread.join();
     let _ = signal_thread.join();
@@ -256,11 +253,7 @@ fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>
                 };
                 log_changes(&changes);
                 if last_save.elapsed() >= std::time::Duration::from_secs(60) {
-                    let snap =
-                        shared.bias.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
-                    if let Err(e) = bias_state::save(&snap, std::path::Path::new(&state_path)) {
-                        tracing::warn!("bias: cannot save state: {e}");
-                    }
+                    save_bias_state(&shared.bias, &state_path);
                     last_save = std::time::Instant::now();
                 }
             }
@@ -273,6 +266,22 @@ fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+/// Persist the learned history, dating the lean capture at the save rather
+/// than at the last window that produced it (`BiasSnapshot::mark_saved`): the
+/// replay ages every entry against that stamp, so a snapshot taken days after
+/// its capture would otherwise pass a fresh-cohort check it cannot earn.
+fn save_bias_state(bias: &Mutex<BiasEngine>, path: &str) {
+    let mut snap = bias.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
+    snap.mark_saved(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    );
+    if let Err(e) = bias_state::save(&snap, std::path::Path::new(path)) {
+        tracing::warn!("bias: cannot save state: {e}");
     }
 }
 
@@ -713,6 +722,7 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
     let sink = Sink::new(&cfg, &shared.bias, Route::Reload);
     let mut planned = 0usize;
     let mut released = 0usize;
+    let mut kept_cpuset = 0usize;
     let mut released_names: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         if shared.shutdown.load(Ordering::Relaxed) {
@@ -740,6 +750,9 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
             &shared.bias,
             &cfg,
         );
+        if reconciled.kept_cpuset {
+            kept_cpuset += 1;
+        }
         if reconciled.released {
             released += 1;
             if released_names.len() < 8 {
@@ -756,10 +769,11 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
         decision::execute(plan, pid, &applier, &counters, &sink);
         planned += 1;
     }
-    if planned > 0 || released > 0 {
+    if planned > 0 || released > 0 || kept_cpuset > 0 {
         tracing::info!(
             processes = planned,
             released,
+            kept_cpuset,
             names = ?released_names,
             "re-planned live processes against the new corpus"
         );
@@ -1193,6 +1207,56 @@ mod tests {
         assert!(
             !record.with_extension("tmp").exists(),
             "no temporary file is left behind"
+        );
+    }
+
+    /// `saved_at` is the replay's age reference. A capture taken days before
+    /// the save must be dated at the *save*, or `replay.py` sees
+    /// `saved_at - lean_at == 0` and can never report a stale cohort.
+    #[test]
+    fn a_saved_snapshot_dates_its_capture_at_the_save() {
+        use crate::bias_state::{BiasSnapshot, Durable, EntrySnapshot, LeanCapture};
+        let dir = TestDir::new("bias-save-stamp");
+        let path = dir.path().join("state").join("bias-state");
+        // The defaults the marker must name to survive `restore`.
+        let (stage, hop, deadband) =
+            (crate::classify::STAGE_MIN_NS, crate::classify::HOP_MIN_HZ, 15);
+        let mut engine = BiasEngine::new(crate::bias::BiasConfig::default());
+        engine.restore(BiasSnapshot {
+            version: bias_state::BIAS_STATE_VERSION,
+            threshold_ema: None,
+            lean_capture: Some(LeanCapture {
+                stage_min_ns: stage,
+                hop_min_hz: hop,
+                deadband_pct: deadband,
+                saved_at: 100,
+            }),
+            entries: vec![EntrySnapshot {
+                name: "measured-long-ago".into(),
+                durable: Durable {
+                    confidence: 0.9,
+                    burst_ns: 1_000_000,
+                    hop_hz: 10,
+                    lean_at: 100,
+                    ..Durable::default()
+                },
+            }],
+        });
+
+        save_bias_state(&Mutex::new(engine), path.to_str().expect("utf8"));
+
+        let saved = bias_state::load(&path).expect("load").expect("a file");
+        let capture = saved.lean_capture.expect("the capture survives the save");
+        assert!(
+            capture.saved_at > 100 + 3_600,
+            "the save date, not the window's: saved_at={} lean_at=100",
+            capture.saved_at
+        );
+        let at = saved.entries[0].durable.lean_at;
+        assert!(
+            capture.saved_at - at > 3_600,
+            "an hour-old cohort is now detectable as stale (saved_at={} at={at})",
+            capture.saved_at
         );
     }
 

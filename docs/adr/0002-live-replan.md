@@ -44,8 +44,11 @@ On a successful reload the daemon runs one reconcile pass over `/proc`:
 `cpuset` is **not** released. There is no safe "unset": the process may be
 confined by its unit or a container, and widening affinity to every CPU is
 worse than leaving a stale set in place. An edit that changes `cpuset` still
-lands via (2); a deletion leaves the old affinity, which the journal line
-(`released=N`) and this ADR make discoverable.
+lands via (2); a deletion leaves the old affinity, which the journal line and
+this ADR make discoverable. The line counts the two facts apart —
+`released=N` is processes whose dimensions were actually reset, `kept_cpuset=M`
+is processes whose affinity was left in place — so neither number claims work
+the other did.
 
 ## Consequences and limits
 
