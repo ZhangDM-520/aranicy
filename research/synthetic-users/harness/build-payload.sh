@@ -36,6 +36,11 @@ mkdir -p "$WORK" "$OUT"
 log "exporting $SHORT"
 git -C "$ROOT" archive --prefix=aranicy-0.3.0/ "$COMMIT" | gzip > "$WORK/aranicy-0.3.0.tar.gz"
 git -C "$ROOT" show "$COMMIT:contrib/PKGBUILD" > "$WORK/PKGBUILD"
+# makepkg resolves `install=` beside the PKGBUILD, so a relocated PKGBUILD
+# needs them relocated too (a plain `cd contrib && makepkg` already has them).
+for f in aranicy.install aranicy-collector.install; do
+    git -C "$ROOT" show "$COMMIT:contrib/$f" > "$WORK/$f"
+done
 
 log "building packages (this is the packaging path a user would install)"
 ( cd "$WORK" && makepkg -f --nocheck >build.log 2>&1 ) || {

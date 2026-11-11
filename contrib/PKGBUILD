@@ -36,8 +36,6 @@ prepare() {
     cd "$pkgbase-$pkgver"
     cargo fetch --locked
     ( cd collector && cargo fetch --locked )
-    # makepkg resolves `install=` beside the PKGBUILD, not inside $srcdir.
-    cp contrib/aranicy.install contrib/aranicy-collector.install "$startdir/"
 }
 
 build() {
