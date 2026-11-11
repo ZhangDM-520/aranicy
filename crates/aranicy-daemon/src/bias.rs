@@ -965,14 +965,35 @@ impl BiasEngine {
     /// Restore persisted state (startup). Everything transient is rebuilt by
     /// [`Live::restore`]; aging resumes from each entry's `last_seen`, and
     /// frozen entries stay frozen until a matching row re-baselines them.
+    /// The capture marker is adopted only when it names this configuration's
+    /// boundary; otherwise the lean inputs are dropped with it.
     pub fn restore(&mut self, snapshot: BiasSnapshot) {
         self.threshold = snapshot.threshold_ema;
+        // The marker names the boundary the persisted lean inputs were
+        // measured with, so it is adopted as-is — not re-derived from the
+        // current config — and only while this daemon still runs that
+        // classifier. `bias_lean_*` are live keys and a restart is the other
+        // way (besides `reconfigure`) an edit takes effect; keeping old inputs
+        // would let the first new window stamp them with a marker naming a
+        // classifier that did not measure them, and the replay would score a
+        // mixed cohort as one capture. No marker = not a capture.
+        let b = self.cfg.boundary();
+        self.capture = snapshot.lean_capture.filter(|c| {
+            (c.stage_min_ns, c.hop_min_hz, c.deadband_pct)
+                == (b.stage_min_ns, b.hop_min_hz, b.deadband_pct)
+        });
+        let keep_inputs = self.capture.is_some();
         for es in snapshot.entries {
-            let durable = Durable {
+            let mut durable = Durable {
                 confidence: es.durable.confidence.clamp(0.0, 1.0),
                 bias: es.durable.bias.clamp(self.cfg.min_bias, self.cfg.max_bias),
                 ..es.durable
             };
+            if !keep_inputs {
+                durable.burst_ns = 0;
+                durable.hop_hz = 0;
+                durable.lean_at = 0;
+            }
             let live = Live::restore(&durable, &self.cfg);
             self.entries.insert(es.name, Entry { durable, live });
         }
@@ -2844,6 +2865,64 @@ mod tests {
             "a different classifier invalidates the capture"
         );
         assert!(snap.entries.iter().all(|e| e.durable.lean_at == 0));
+    }
+
+    /// A restart is the other path a live `bias_lean_*` edit takes: the
+    /// marker must survive `snapshot` → `restore` → `snapshot` without a new
+    /// window, and a restart under a different boundary must drop both the
+    /// marker and the inputs (one cohort, one classifier).
+    #[test]
+    fn a_restart_keeps_a_matching_capture_and_drops_a_stale_one() {
+        let mut eng = BiasEngine::new(BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        });
+        eng.ingest(&shadow_window(), ts(1));
+        eng.ingest(&[], ts(61));
+        let saved = eng.snapshot();
+        assert!(saved.lean_capture.is_some(), "precondition: a capture exists");
+
+        // Same boundary: the marker and the dated inputs come back.
+        let mut same = BiasEngine::new(BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        });
+        same.restore(saved.clone());
+        let round = same.snapshot();
+        assert_eq!(
+            round.lean_capture, saved.lean_capture,
+            "a matching restart keeps the capture marker"
+        );
+        assert_eq!(
+            round.entries, saved.entries,
+            "a matching restart keeps the dated lean inputs"
+        );
+
+        // Shadow off at restart: the capture belongs to a window that already
+        // happened, so it still survives.
+        let mut off = BiasEngine::new(BiasConfig::default());
+        off.restore(saved.clone());
+        assert!(
+            off.snapshot().lean_capture.is_some(),
+            "turning the shadow off across a restart keeps the capture"
+        );
+
+        // Different boundary at restart: no marker, no inputs.
+        let mut moved = BiasEngine::new(BiasConfig {
+            shadow: true,
+            lean_stage_min_ns: 32_000,
+            ..BiasConfig::default()
+        });
+        moved.restore(saved);
+        let snap = moved.snapshot();
+        assert!(
+            snap.lean_capture.is_none(),
+            "a restart under a new classifier must not re-stamp old inputs"
+        );
+        assert!(
+            snap.entries.iter().all(|e| e.durable.lean_at == 0),
+            "a restart under a new classifier must drop the stale inputs"
+        );
     }
 
     /// Switching the shadow off must not discard a capture that already

@@ -31,8 +31,10 @@ spinner at 3.9, both actuated `Bulk +3`) shows the cost of a wrong label.
    `deadband_pct`, `saved_at`). The anchors are live config keys; a replay
    that assumed the defaults would judge a classifier the daemon never ran.
    No marker = the daemon was not capturing, and the replay refuses to score
-   those entries. Entries older than `--max-lean-age` (default 1 h) are
-   reported as stale and excluded.
+   those entries. The marker is adopted at restart only when it names the
+   boundary the reloaded binary runs, so a `bias_lean_*` edit applied by a
+   restart drops the stale inputs instead of re-stamping them. Entries older
+   than `--max-lean-age` (default 1 h) are reported as stale and excluded.
 2. `tools/replay-bias/replay.py` re-runs the same arithmetic (mirrored
    constants) over a captured snapshot and reports agreement, disagreement and
    the concrete inverted names. It is the offline half of the gate.

@@ -58,6 +58,16 @@ the live value, so a lost quota is visible instead of implied:
 {"games": {"cpu_quota_pct": 50, "cpu_max": "max 100000", "cpu_quota_applied": false}}
 ```
 
+The directory is not a package file, so removing the package would otherwise
+leave it — and its `cpu.max` — throttling whatever still runs inside. The
+daemon records the cgroups it created for the loaded corpus in
+`<bias_state_path>`'s directory
+(default `/var/lib/aranicy/cgroups`); `contrib/aranicy.install`
+(`pacman -R`) and `contrib/install.sh --uninstall` move those processes back
+to the root cgroup and `rmdir` the directories. A cleanup that cannot move a
+process (or a name recorded under a different `bias_state_path`) leaves the
+directory behind; nothing else removes it short of a reboot.
+
 ## Matching and apply
 
 1. Exact `name` lookup (case-sensitive) wins outright.
@@ -246,8 +256,10 @@ silently live.
   the marker is what lets `tools/replay-bias/replay.py` re-run the verdict
   with the classifier the daemon actually ran. A snapshot without the marker
   is not a capture and is refused rather than scored; inputs older than
-  `--max-lean-age` (default 1 h) are reported as stale and excluded. A
-  changed boundary invalidates the capture (inputs and marker are dropped).
+  `--max-lean-age` (default 1 h) are reported as stale and excluded. The
+  marker survives a restart and turning `bias_shadow` off; a changed boundary
+  invalidates the capture (inputs and marker are dropped) on reload and at
+  restart alike.
   ADR 0003 holds the promotion gate.
 - Classification: per-sample score from weight-free sched stats against a
   population threshold (EWMA of the population mean score). BULK below and

@@ -13,8 +13,37 @@ pre_remove() {
     systemctl --quiet disable --now aranicy.service 2>/dev/null || true
 }
 
+# Cgroup directories are NOT package files: pacman cannot remove them, and the
+# `cpu.max` the daemon wrote keeps throttling whatever still runs inside after
+# the binary is gone (round-3 ivy-15). The daemon records the cgroups it
+# created in /var/lib/aranicy/cgroups; move survivors back to the root cgroup,
+# then remove the directories (a dir still holding a process cannot be rmdir'd,
+# so the move is what releases the quota as well).
+release_cgroups() (
+    mount=${ANANICY_CGROUP_MOUNT:-/sys/fs/cgroup}
+    record=${ANANICY_CGROUP_RECORD:-/var/lib/aranicy/cgroups}
+    [ -r "$record" ] || return 0
+    [ -w "$mount/cgroup.procs" ] || return 0
+    while IFS= read -r name; do
+        case "$name" in
+            ''|.|..|*/*) continue ;;
+        esac
+        dir="$mount/$name"
+        [ -d "$dir" ] || continue
+        if [ -r "$dir/cgroup.procs" ]; then
+            while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || true
+            done < "$dir/cgroup.procs"
+        fi
+        rmdir "$dir" 2>/dev/null || true
+    done < "$record"
+    rm -f "$record" 2>/dev/null || true
+)
+
 post_remove() {
     systemctl --quiet daemon-reload 2>/dev/null || true
+    release_cgroups
     # The learned history is derived state, not configuration: leaving it
     # behind means a later reinstall resurrects biases for a machine that has
     # since changed (and the nice values they were applied to are gone).

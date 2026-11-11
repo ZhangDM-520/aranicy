@@ -429,8 +429,9 @@ with test-thread names excluded (they are 300+ of 4096 live entries and score
   `lean_capture { stage_min_ns, hop_min_hz, deadband_pct, saved_at }`; the
   anchors are live config keys, so the replay uses the recorded ones and
   refuses a file with no marker. A capture survives turning the key **off**
-  (the marker names the boundary it was taken with), and a boundary change on
-  reload drops the inputs and the marker — the two must not mix classifiers.
+  (the marker names the boundary it was taken with) and a restart under the
+  same boundary; a boundary change — on reload **or** at restart — drops the
+  inputs and the marker, because the two must not mix classifiers.
   `tools/replay-bias/replay.py` re-runs the verdict offline with
   `--max-lean-age` (default 1 h) excluding stale entries, and treats
   `deadband_pct = 0` as a boundary, not as an absent value. ADR 0003 holds the

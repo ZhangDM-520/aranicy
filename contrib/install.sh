@@ -35,6 +35,33 @@ REPO_ROOT=$(dirname "$SCRIPT_DIR")
 log()  { echo "[aranicy-install] $*"; }
 run()  { if [ "$DRY" = 1 ]; then log "DRY-RUN: $*"; else log "+ $*"; "$@"; fi; }
 
+# The daemon's cgroup directories are not files this script installed, and the
+# `cpu.max` it wrote keeps throttling whatever still runs inside after the
+# binary is gone (round-3 ivy-15). The daemon records what it created in
+# /var/lib/aranicy/cgroups; move survivors to the root cgroup, then rmdir.
+# Same code as contrib/aranicy.install's post_remove (which cannot be sourced).
+release_cgroups() (
+    mount=${ANANICY_CGROUP_MOUNT:-/sys/fs/cgroup}
+    record=${ANANICY_CGROUP_RECORD:-/var/lib/aranicy/cgroups}
+    [ -r "$record" ] || return 0
+    [ -w "$mount/cgroup.procs" ] || return 0
+    while IFS= read -r name; do
+        case "$name" in
+            ''|.|..|*/*) continue ;;
+        esac
+        dir="$mount/$name"
+        [ -d "$dir" ] || continue
+        if [ -r "$dir/cgroup.procs" ]; then
+            while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || true
+            done < "$dir/cgroup.procs"
+        fi
+        rmdir "$dir" 2>/dev/null || true
+    done < "$record"
+    rm -f "$record" 2>/dev/null || true
+)
+
 usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
@@ -62,6 +89,11 @@ fi
 if [ "$UNINSTALL" = 1 ]; then
     log "uninstalling aranicy from $PREFIX (config and rules are kept)"
     run systemctl disable --now aranicy.service 2>/dev/null || true
+    if [ "$DRY" = 1 ]; then
+        log "DRY-RUN: release cgroups recorded in /var/lib/aranicy/cgroups"
+    else
+        release_cgroups
+    fi
     run rm -f "$BINDIR/aranicy" "$UNITDIR/aranicy.service"
     run systemctl daemon-reload
     log "uninstalled; /etc/ananicy.d left untouched"

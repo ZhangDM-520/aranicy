@@ -131,6 +131,7 @@ pub fn start(paths: Paths) -> anyhow::Result<()> {
     for w in cg_warnings {
         tracing::warn!("{w}");
     }
+    record_cgroups(&cfg.bias_state_path, &cgroups);
 
     // The collector owns every BPF program; aranicy is a pure client and no
     // longer needs CAP_BPF (see contrib/ananicy.service).
@@ -401,6 +402,32 @@ fn init_cgroups(defs: &BTreeMap<Arc<str>, CgroupDef>) -> (CgroupManager, Vec<Str
     }
 }
 
+/// Persist the cgroups this daemon manages, so an uninstall can release them.
+///
+/// A cgroup directory is not a package file: `pacman -R` cannot remove it, and
+/// the `cpu.max` written by [`CgroupManager`] keeps throttling whatever still
+/// runs inside long after the binary is gone (round-3 `ivy-15`).
+/// `contrib/aranicy.install` reads this list to move survivors out and `rmdir`
+/// the directories. Best-effort by design — a failed write costs only the
+/// cleanup, so it must never block a start or a reload.
+fn record_cgroups(state_path: &str, cgroups: &CgroupManager) {
+    let path = paths::cgroup_record_path(std::path::Path::new(state_path));
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("cgroup record: cannot create {}: {e}", dir.display());
+            return;
+        }
+    }
+    let body: String = cgroups
+        .created
+        .keys()
+        .map(|name| format!("{name}\n"))
+        .collect();
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::warn!("cgroup record: cannot write {}: {e}", path.display());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Signals
 // ---------------------------------------------------------------------------
@@ -455,6 +482,7 @@ fn reload(shared: &Arc<Shared>, paths: &Paths) {
             for w in warnings {
                 tracing::warn!("{w}");
             }
+            record_cgroups(&cfg.bias_state_path, &cgroups);
             for w in &cfg.warnings {
                 tracing::warn!("config: {w}");
             }
@@ -991,6 +1019,52 @@ mod tests {
         let (manager, warnings) = init_cgroups(&BTreeMap::new());
         // Empty defs must not fail even if creation is impossible.
         assert!(warnings.is_empty() || !manager.mount.as_os_str().is_empty());
+    }
+
+    /// The uninstall hook releases what the daemon records here, so the list
+    /// must name only cgroups that were really created and must shrink when a
+    /// reload removes them.
+    #[test]
+    fn the_cgroup_record_lists_created_names_and_clears_on_reload() {
+        let dir = TestDir::new("cgroup-record");
+        let mount = dir.path().join("cgroup2");
+        std::fs::create_dir_all(&mount).expect("mount dir");
+        let state = dir.path().join("state").join("bias-state");
+
+        let defs: BTreeMap<String, CgroupDef> = [
+            (
+                "games".to_string(),
+                CgroupDef {
+                    name: Arc::from("games"),
+                    cpu_quota_pct: None,
+                },
+            ),
+            (
+                "bad/name".to_string(),
+                CgroupDef {
+                    name: Arc::from("bad/name"),
+                    cpu_quota_pct: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let (manager, warnings) = CgroupManager::init_at(&mount, defs);
+        assert_eq!(warnings.len(), 1, "the invalid name is refused: {warnings:?}");
+        record_cgroups(state.to_str().expect("utf8"), &manager);
+        assert_eq!(
+            std::fs::read_to_string(state.with_file_name("cgroups")).expect("record"),
+            "games\n",
+            "only the created cgroup is recorded"
+        );
+
+        let (empty, _) = CgroupManager::init_at(&mount, BTreeMap::new());
+        record_cgroups(state.to_str().expect("utf8"), &empty);
+        assert_eq!(
+            std::fs::read_to_string(state.with_file_name("cgroups")).expect("record"),
+            "",
+            "a reload without cgroups clears the stale list"
+        );
     }
 
     #[test]

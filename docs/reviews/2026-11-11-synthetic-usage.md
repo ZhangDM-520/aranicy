@@ -150,7 +150,12 @@ a policy trade-off and stays documented as the trust model above.
 The cgroup boot failure is worth a note: the persona saw it as a race with
 boot; the VM shows the kernel did not offer `cpu.max` in the new cgroup until
 ~68 s into a 63 s userspace startup, so the retry is what makes it
-condition-independent.
+condition-independent. `ivy-15` — the uninstall half of that digest item —
+was *not* covered by `dd41fa2`: removing the package used to leave the cgroup
+and its quota behind, throttling whatever still ran inside. The daemon now
+records the directories it created and the removal hooks release them
+(`release_cgroups` in `contrib/aranicy.install` and
+`contrib/install.sh --uninstall`).
 
 ## Limitations of this method
 

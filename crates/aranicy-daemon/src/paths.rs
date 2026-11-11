@@ -60,6 +60,15 @@ pub fn pidfile_path() -> PathBuf {
     pidfile_path_in(Path::new(DEFAULT_RUN_DIR))
 }
 
+/// Record of the cgroups the daemon created, kept next to the persisted bias
+/// history: a cgroup directory is not a package file, so an uninstall must
+/// read this list to release what the daemon pinned (see
+/// `contrib/aranicy.install`). Default `/var/lib/aranicy/cgroups`; a custom
+/// `bias_state_path` moves it, and the package hook then finds nothing.
+pub fn cgroup_record_path(bias_state_path: &Path) -> PathBuf {
+    bias_state_path.with_file_name("cgroups")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +137,13 @@ mod tests {
             PathBuf::from("/run/aranicy.pid")
         );
         assert_eq!(pidfile_path(), PathBuf::from("/run/aranicy.pid"));
+    }
+
+    #[test]
+    fn the_cgroup_record_sits_next_to_the_bias_history() {
+        assert_eq!(
+            cgroup_record_path(Path::new("/var/lib/aranicy/bias-state")),
+            PathBuf::from("/var/lib/aranicy/cgroups")
+        );
     }
 }

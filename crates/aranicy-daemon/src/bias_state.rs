@@ -76,10 +76,12 @@ pub struct Durable {
     pub lean_at: u64,
 }
 
-/// The boundary and moment a lean capture was taken with. Present only when
-/// the daemon saved the state with `bias_shadow` on: the stage/hop anchors are
-/// live config keys, so an offline replay that assumed the defaults would
-/// describe a classifier the daemon never ran.
+/// The boundary and moment a lean capture was taken with. Present while the
+/// entries still carry the inputs of a shadow window *and* this daemon runs
+/// the classifier that measured them: the stage/hop anchors are live config
+/// keys, so an offline replay that assumed the defaults would describe a
+/// classifier the daemon never ran. Survives both turning `bias_shadow` off
+/// and a restart under the same boundary (ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LeanCapture {
@@ -110,8 +112,8 @@ pub struct BiasSnapshot {
     /// Population threshold T_us (userspace EWMA of mean score), if known.
     pub threshold_ema: Option<f64>,
     pub entries: Vec<EntrySnapshot>,
-    /// Present only when `bias_shadow` was on at save time; see
-    /// [`LeanCapture`]. Absent = the entries' lean inputs are not a capture.
+    /// Present while a shadow capture is still replayable (see
+    /// [`LeanCapture`]). Absent = the entries' lean inputs are not a capture.
     pub lean_capture: Option<LeanCapture>,
 }
 
