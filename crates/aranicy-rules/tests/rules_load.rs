@@ -449,3 +449,35 @@ fn unusable_and_malformed_cpusets_are_reported_at_load() {
         assert!(w.line > 0, "{w:?}");
     }
 }
+
+/// `"bias": false` is the per-name opt-out from the learned axis; it travels
+/// through types like every other policy field, and a non-boolean is a load
+/// error rather than a silent no-op.
+#[test]
+fn bias_opt_out_parses_inherits_and_type_checks() {
+    let fx = Fixture::new("bias-optout");
+    fx.write(
+        "a.types",
+        "{\"type\": \"pinned\", \"nice\": -5, \"bias\": false}\n",
+    );
+    fx.write(
+        "a.rules",
+        "{\"name\": \"game\", \"type\": \"pinned\"}\n\
+         {\"name\": \"tool\", \"bias\": true}\n\
+         {\"name\": \"bad\", \"bias\": \"no\"}\n",
+    );
+    let rs = fx.load_default();
+    let (game, _) = rs.lookup("game").unwrap();
+    assert_eq!(game.bias, Some(false));
+    assert_eq!(game.nice, Some(-5), "the rest of the type still inherits");
+    let (tool, _) = rs.lookup("tool").unwrap();
+    assert_eq!(tool.bias, Some(true));
+    assert!(rs.lookup("bad").is_none(), "a non-boolean bias rejects the line");
+    assert!(
+        messages(&rs)
+            .iter()
+            .any(|m| m.contains("bias: expected boolean")),
+        "{:?}",
+        rs.warnings
+    );
+}

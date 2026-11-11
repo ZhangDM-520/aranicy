@@ -53,6 +53,11 @@ pub struct Policy {
     pub cpuset: Option<CpuSet>,
     /// Autogroup nice (superset field; ananicy-cpp only reports it).
     pub autogroup: Option<i8>,
+    /// `bias: false` opts this name out of the learned axis: the rule pins the
+    /// process and no learned step is actuated for it. `None`/`true` leave the
+    /// learned axis enabled (the default). Learning itself continues — the
+    /// history is what the next corpus edit or `bias_protect` change acts on.
+    pub bias: Option<bool>,
 }
 
 /// Definition of a cgroup created at startup (`*.cgroups` file entry).

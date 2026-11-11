@@ -205,13 +205,20 @@ pub fn plan<'a>(
 
     let matched = rules.lookup(name);
     let base = matched.as_ref().map_or(0, |(p, _)| p.nice.unwrap_or(0));
+    // `"bias": false` on the matched rule is the per-name opt-out: the corpus
+    // pins the process and the learner may not actuate on it. It follows the
+    // rule's identity (the executable), where `bias_protect` is a global comm
+    // prefix list — either one silences the axis.
+    let rule_opted_out = matched
+        .as_ref()
+        .is_some_and(|(p, _)| p.bias == Some(false));
     // The learned axis is a bet on the workload. PID 1 and the core system
     // services are not a workload: losing the journal or the session manager
     // loses the machine, and nothing in the rules asked for it. An explicit
     // rule still applies to them — the operator asked for that by name.
     let (target, applied) = if !cfg.bias_enable {
         (base, None)
-    } else if bias_may_apply(cfg, name, comm, pid) {
+    } else if !rule_opted_out && bias_may_apply(cfg, name, comm, pid) {
         (bias.target_nice(comm, base), bias.applied_nice(comm))
     } else {
         // No new bias, but a claim recorded before this name was protected
@@ -594,11 +601,16 @@ mod tests {
     }
 
     fn rules_with(name: &str, nice: Option<i8>) -> RuleSet {
+        rules_with_bias(name, nice, None)
+    }
+
+    fn rules_with_bias(name: &str, nice: Option<i8>, bias: Option<bool>) -> RuleSet {
         let mut rules = RuleSet::empty();
         rules.exact.insert(
             Arc::from(name),
             Arc::new(Policy {
                 nice,
+                bias,
                 ..Policy::default()
             }),
         );
@@ -710,6 +722,61 @@ mod tests {
         assert!(outcome.applied_any);
         assert_eq!(fake.applied.get(), Some(3), "bias-only nice must reach apply");
         assert_eq!(counters.snapshot().matched, 1);
+    }
+
+    #[test]
+    fn a_rule_can_opt_a_name_out_of_the_learned_axis() {
+        // The operator pinned the game at -5 and said "leave it there": the
+        // learned +3 must not spend itself on a closed loop the corpus owns.
+        let rules = rules_with_bias("game", Some(-5), Some(false));
+        let engine = Mutex::new(engine_with("game", 3));
+        let cfg = Config::default();
+
+        let plan = plan_locked(b"game", b"game", 4242, &rules, &engine, &cfg);
+        let Plan::Apply {
+            policy, target, base, ..
+        } = &plan
+        else {
+            panic!("the rule still applies, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(-5), "the pinned value, not -5 + 3");
+        assert_eq!((*target, *base), (-5, -5));
+    }
+
+    #[test]
+    fn the_opt_out_unwinds_a_claim_recorded_before_the_rule() {
+        // A name learned to +3 before the corpus pinned it must come back.
+        let rules = rules_with_bias("game", None, Some(false));
+        let engine = Mutex::new(engine_with("game", 3));
+        engine.lock().unwrap().note_applied("game", Some(3));
+        let cfg = Config::default();
+
+        let plan = plan_locked(b"game", b"game", 4242, &rules, &engine, &cfg);
+        let Plan::Apply { policy, target, .. } = &plan else {
+            panic!("a stale claim under an opted-out rule must be corrected, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(0), "back to the rule's base");
+        assert_eq!(*target, 0);
+    }
+
+    #[test]
+    fn the_opt_out_is_per_name_and_true_leaves_the_axis_on() {
+        let mut rules = rules_with_bias("game", Some(-5), Some(false));
+        rules.exact.insert(
+            Arc::from("build"),
+            Arc::new(Policy {
+                bias: Some(true),
+                ..Policy::default()
+            }),
+        );
+        let engine = Mutex::new(engine_with("build", 3));
+        let cfg = Config::default();
+
+        let plan = plan_locked(b"build", b"build", 4243, &rules, &engine, &cfg);
+        let Plan::Apply { policy, .. } = &plan else {
+            panic!("bias: true must behave like an absent key, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(3), "the learned axis still applies");
     }
 
     #[test]

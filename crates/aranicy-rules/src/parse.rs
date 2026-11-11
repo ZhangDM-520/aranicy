@@ -23,6 +23,7 @@ pub(crate) struct PartialPolicy {
     pub cgroup: Option<Option<Arc<str>>>,
     pub cpuset: Option<Option<CpuSet>>,
     pub autogroup: Option<Option<i8>>,
+    pub bias: Option<Option<bool>>,
 }
 
 impl PartialPolicy {
@@ -41,6 +42,7 @@ impl PartialPolicy {
             cgroup: over.cgroup.clone().or(base.cgroup.clone()).flatten(),
             cpuset: over.cpuset.clone().or(base.cpuset.clone()).flatten(),
             autogroup: over.autogroup.or(base.autogroup).flatten(),
+            bias: over.bias.or(base.bias).flatten(),
         }
     }
 
@@ -168,6 +170,7 @@ pub(crate) const POLICY_KEYS: &[&str] = &[
     "cgroup",
     "cpuset",
     "autogroup",
+    "bias",
     "cmdlines",
 ];
 
@@ -220,6 +223,15 @@ pub(crate) fn parse_policy_fields(
                 p.cpuset = match str_field(value, "cpuset")? {
                     None => Some(None),
                     Some(s) => Some(Some(parse_cpuset(s))),
+                }
+            }
+            "bias" => {
+                p.bias = match value {
+                    Value::Null => Some(None),
+                    Value::Bool(b) => Some(Some(*b)),
+                    other => {
+                        return Err(format!("bias: expected boolean, got {}", type_name(other)))
+                    }
                 }
             }
             // Python-fork legacy: accepted, ignored, noted once per object.

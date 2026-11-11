@@ -36,6 +36,7 @@ ananicy-cpp parity); CRLF tolerated. Bad lines warn and are skipped.
 | `cgroup` | string | move into named cgroup (created from `*.cgroups`) |
 | `cpuset` | string | `0-3,8-11` or aliases `big-cores`, `little-cores`, `performance-cores`, `efficiency-cores`, `all-cores`, `llc-N`, `node-N`. `turbo-cores` and `x3d-cache`/`x3d-frequency` **parse** (lint parity) but **warn at load and are rejected at apply time**: no kernel exposes a turbo-core marker, and 3D V-Cache mode is host-controlled. A malformed explicit list (`0-4-9`, `1024`) warns at load too — a cpuset that cannot resolve is dropped at apply time, so the loader refuses to leave it silent |
 | `autogroup` | int | **superset**: writes the process autogroup nice (ananicy-cpp only reports) |
+| `bias` | bool | **superset**: `false` opts this name out of the learned axis (see the bias section); `true`/absent leaves it on |
 
 Cgroup definitions: `{"cgroup": name, "CPUQuota": N}` — N = percent of *all*
 CPUs (v2 `cpu.max`, period fixed at the kernel's 100 ms, i.e. quota =

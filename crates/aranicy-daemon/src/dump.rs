@@ -72,6 +72,9 @@ fn policy_into(map: &mut Map<String, Value>, p: &Policy) {
     if let Some(v) = p.autogroup {
         put(map, "autogroup", json!(v));
     }
+    if let Some(v) = p.bias {
+        put(map, "bias", json!(v));
+    }
 }
 
 /// The resolved policy as a JSON object (absent fields omitted).
@@ -362,6 +365,16 @@ mod tests {
         assert_eq!(re["pattern"], json!("ba.*"));
         assert_eq!(re["nice"], json!(-5));
         assert_eq!(re["cpuset"], json!({ "kind": "alias", "value": "big-cores" }));
+    }
+
+    #[test]
+    fn policy_json_renders_the_bias_opt_out() {
+        let p = Policy {
+            bias: Some(false),
+            ..Policy::default()
+        };
+        assert_eq!(policy_json(&p)["bias"], json!(false));
+        assert!(policy_json(&Policy::default()).get("bias").is_none());
     }
 
     #[test]
