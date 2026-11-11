@@ -14,31 +14,37 @@ set -euo pipefail
 
 [ $# -gt 0 ] || { echo "usage: $0 <dir>..." >&2; exit 2; }
 
-# Tokens that appear in this repo's memory, docs, source layout or tooling and
-# would only be visible to someone who had access to them. Matched
-# case-sensitively: `JOURNAL` is a filename, `journalctl` is a user's tool.
+# The split is measured, not assumed: a token belongs in HARD only if it
+# appears NOWHERE in the shipped package (README, docs/, units). Anything the
+# package documents (crates/, bias_shadow, aranicy_wire, ...) is a legitimate
+# quote and only warns. Check with:
+#   grep -lE '<token>' README.md docs/*.md contrib/*.service
+# Matched case-sensitively: `JOURNAL` is a filename, `journalctl` a user's tool.
 HARD=(
     'AGENTS\.md'
     'JOURNAL'
     'scratchpad'
-    'crates/'
-    'bias_shadow'
-    'attack_min_util'
-    'synthetic-users'
-    'aranicy_wire'
-    'SAMPLE_CAP'
     'plan_locked'
-    'v0\.3\.0 socket'
-    '/home/zhangdm'
-    'ZhangDM-520'
+    'synthetic-users'
     'persona (card|brief)'
-    'clean-room guarantee'
+    '/home/zhangdm'
 )
+
 
 # Vocabulary that could plausibly leak a design hint but might also be a user's
 # own words. Reported, never fatal.
 SOFT=(
-    'scx_stats'   # appears in the shipped README, so quoting the package is fine
+    'clean-room'   # the shipped README calls itself one
+    # Present in the shipped documentation, so quoting the package is not a
+    # leak: COMPATIBILITY.md/BENCHMARKS.md ship under /usr/share/doc/aranicy
+    # and name these on purpose.
+    'crates/'
+    'bias_shadow'
+    'attack_min_util'
+    'aranicy_wire'
+    'SAMPLE_CAP'
+    'ZhangDM-520'
+    'scx_stats'
     'bias engine'
     'shadow classif'
     'classifier'
@@ -46,6 +52,7 @@ SOFT=(
     'harness'
     'subagent'
 )
+
 
 files=0
 hard_hits=0
