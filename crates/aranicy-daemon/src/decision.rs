@@ -357,13 +357,12 @@ fn cpuset_dropped(old: &Policy, new: Option<&Policy>) -> bool {
 pub struct Reconciled<'a> {
     /// `None` = nothing to do.
     pub plan: Option<Plan<'a>>,
-    /// The old tree set dimensions the new one does not, and at least one of
-    /// them is actually reset — so the journal says a decision was owed, even
-    /// when the plan is a skip.
+    /// The process was re-planned and at least one dimension the old tree set
+    /// is reset by that plan. False for a process the pass could not reach.
     pub released: bool,
-    /// A `cpuset` was dropped and deliberately left on the process: no safe
-    /// value exists to write back (ADR 0002). Counted apart so `released` never
-    /// reports a revert that did not happen.
+    /// The process was re-planned and a `cpuset` was dropped but deliberately
+    /// left in place: no safe value exists to write back (ADR 0002). Counted
+    /// apart so `released` never reports a revert that did not happen.
     pub kept_cpuset: bool,
 }
 
@@ -397,8 +396,6 @@ pub fn reconcile<'a>(
     let comm = std::str::from_utf8(comm).unwrap_or(name);
     let old_policy = old.lookup(name).map(|(p, _)| &**p);
     let new_policy = new.lookup(name).map(|(p, _)| &**p);
-    let released = old_policy.is_some_and(|o| revertable_dims(o, new_policy) > 0);
-    let kept_cpuset = old_policy.is_some_and(|o| cpuset_dropped(o, new_policy));
     let plan = match plan(name.as_bytes(), comm.as_bytes(), pid, new, bias, cfg) {
         Plan::Apply {
             mut policy,
@@ -430,10 +427,14 @@ pub fn reconcile<'a>(
         }),
         Plan::Skip { reason } => Some(Plan::Skip { reason }),
     };
+    // A skip (the process vanished, or /proc hid it) issues no syscall, so
+    // it must not be counted as a revert: the journal's `released` is what an
+    // operator reads as "this was put back".
+    let executed = matches!(plan, Some(Plan::Apply { .. }));
     Reconciled {
         plan,
-        released,
-        kept_cpuset,
+        released: executed && old_policy.is_some_and(|o| revertable_dims(o, new_policy) > 0),
+        kept_cpuset: executed && old_policy.is_some_and(|o| cpuset_dropped(o, new_policy)),
     }
 }
 
@@ -1183,6 +1184,26 @@ mod tests {
         let r = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg);
         assert!(!r.released, "nothing was reset");
         assert!(r.kept_cpuset, "the affinity was left in place");
+    }
+
+    /// A process the pass cannot identify (no match name) issues no syscall,
+    /// so it must not inflate the re-plan line's `released`/`kept_cpuset`.
+    #[test]
+    fn an_unidentifiable_process_is_not_counted_as_a_revert() {
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+        let old = rules_of(
+            "game",
+            Policy {
+                nice: Some(-5),
+                cpuset: Some(aranicy_model::CpuSet::Alias(Arc::from("big-cores"))),
+                ..Policy::default()
+            },
+        );
+        let r = reconcile_locked(&[0xff, 0xfe], b"", 4242, &old, &old, &engine, &cfg);
+        assert!(r.plan.is_none(), "nothing can be planned for it");
+        assert!(!r.released, "no dimension was reset");
+        assert!(!r.kept_cpuset, "nothing was kept on it either");
     }
 
     #[test]

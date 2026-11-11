@@ -1147,11 +1147,15 @@ impl BiasEngine {
         }
         if self.cfg.shadow {
             let b = self.cfg.boundary();
+            // `saved_at` is the *save* date, stamped by
+            // `BiasSnapshot::mark_saved` on the way to disk; a window close
+            // does not know it, and filling it here is what made the replay's
+            // age check compare two window stamps (always ~0).
             self.capture = Some(crate::bias_state::LeanCapture {
                 stage_min_ns: b.stage_min_ns,
                 hop_min_hz: b.hop_min_hz,
                 deadband_pct: b.deadband_pct,
-                saved_at: close_t,
+                saved_at: 0,
             });
         }
         self.pop_score_sum = 0;

@@ -89,7 +89,9 @@ pub struct LeanCapture {
     pub stage_min_ns: u64,
     pub hop_min_hz: u64,
     pub deadband_pct: u64,
-    /// Unix seconds of the save.
+    /// Unix seconds of the save; `0` = not stamped. Written only by
+    /// [`BiasSnapshot::mark_saved`]: a caller that saves a snapshot without it
+    /// gets no age reference, which the replay treats as "cannot age this".
     pub saved_at: u64,
 }
 

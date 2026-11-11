@@ -17,12 +17,44 @@ code confirms.
 | LOW-5 | "Rules with path separators in `\"name\"` never match but pass lint cleanly" | accept | loader warns with `file:line`; pin `a_name_with_a_path_separator_is_reported_at_load` |
 | LOW-6 | "`PidFile::drop` unlocks before unlinking pidfile (pre-existing)" | accept | unlink first, the fd close releases the lock; pin `dropping_the_pidfile_unlinks_it_and_frees_the_singleton` (the ordering itself is a race and is not pinnable from outside — stated in the test) |
 | NIT-1 | "`owed_dims` counts un-revertable `cpuset` in `released` telemetry" | accept | `released` now counts only dimensions actually reset; `kept_cpuset` counts the deliberate keep, and the reload line logs both; pin `a_dropped_cpuset_alone_is_reported_as_kept_not_released` |
-| NIT-2 | "`tools/replay-bias/replay.py` has no test automation" | accept | `tools/replay-bias/test_replay.py` (8 stdlib tests) plus `crates/aranicy-daemon/tests/replay_gate.rs`, which runs it from `cargo test` and skips loudly where `python3` is absent |
+| NIT-2 | "`tools/replay-bias/replay.py` has no test automation" | accept | `tools/replay-bias/test_replay.py` (9 stdlib tests) plus `crates/aranicy-daemon/tests/replay_gate.rs`, which runs it from `cargo test` (returns without checking where `python3` is absent; `cargo test` captures the note) |
 
 Two documentation gaps the report raised inside its answers (not filed as
 findings) are also closed: the cpuset row in `docs/COMPATIBILITY.md` now says
 a well-formed list naming no online CPU warns at load, and the reload section
 names the privilege requirement and the `released` / `kept_cpuset` split.
+
+## Round 7 (post-fix re-review) reopened one closure
+
+The Spec axis of round 7 found that LOW-4 was *not* delivered at load: the
+loader's `CpuSet::Explicit` arm only parsed syntax, so the host resolver was
+unreachable for exactly the values the finding was about —
+`aranicy lint` still exited 0 for `"cpuset": "24-27"` on a 24-CPU host. Fixed
+by routing a well-formed explicit list through the same
+`host_cpuset_warning` the alias arm uses, with a loader-level pin
+(`a_well_formed_explicit_cpuset_is_checked_against_the_host`, mutation-probed
+red) and an end-to-end check:
+
+```
+$ ./target/debug/aranicy lint --config-dir <tmp>   # {"cpuset": "24-27"} + {"cpuset": "0-3"}
+warning: .../10-a.rules:1: cpuset "24-27" cannot be resolved on this host
+         (none of the listed CPUs is online on this host (24 online)); ...
+lint: warnings found
+exit=1
+```
+
+Round 7 also recorded three non-blocking items, all closed:
+
+- an all-stale cohort reported `disagreement_pct: 0.0`, which literally meets
+  ADR 0003's "< 10 % of decided entries" while scoring nothing — now `null`
+  plus `gate_cohort_ok` (ADR's 200-entry minimum) and a human line saying the
+  cohort is not a measurement;
+- `close_window` still wrote `saved_at` with the window-close meaning — now
+  `0` (unstamped), so `mark_saved` is the single writer and the field's
+  contract holds structurally;
+- `released` could count a process the pass never reached — now gated on the
+  plan being an `Apply` that issues syscalls, and the doc wording says
+  "re-planned processes".
 
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes

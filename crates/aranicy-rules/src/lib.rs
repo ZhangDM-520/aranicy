@@ -60,6 +60,30 @@ impl Default for LoadOptions {
     }
 }
 
+/// The host-dependent half of the cpuset check (`LoadOptions::cpuset_check`):
+/// `None` when this corpus is not being resolved against a host (a pure parse
+/// test) or when the value resolves here.
+fn host_cpuset_warning(
+    file: &std::path::Path,
+    line: usize,
+    cs: &CpuSet,
+    opts: &LoadOptions,
+) -> Option<LoadWarning> {
+    let check = opts.cpuset_check?;
+    match check(cs) {
+        Ok(()) => None,
+        Err(e) => Some(LoadWarning {
+            file: file.to_path_buf(),
+            line,
+            message: format!(
+                "cpuset {} cannot be resolved on this host ({e}); this rule's cpuset \
+                 will be rejected at apply time",
+                cpuset_label(cs)
+            ),
+        }),
+    }
+}
+
 fn cpuset_label(cs: &CpuSet) -> String {
     match cs {
         CpuSet::Alias(a) => format!("alias \"{a}\""),
@@ -290,36 +314,29 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
                     ),
                 });
             }
-            Some(CpuSet::Explicit(list)) => {
-                if let Err(e) = aranicy_model::parse_cpu_list(list) {
-                    resolve_warnings.push(LoadWarning {
+            // Syntax first, then the host: a well-formed list can still name
+            // no CPU this machine has online, which `sched_setaffinity`
+            // answers with EINVAL — the same silent no-op as an unusable
+            // alias, so it needs the same warning.
+            Some(cs @ CpuSet::Explicit(list)) => {
+                match aranicy_model::parse_cpu_list(list) {
+                    Err(e) => resolve_warnings.push(LoadWarning {
                         file: draft.file.clone(),
                         line: draft.line,
                         message: format!(
                             "invalid cpuset \"{list}\" ({e}); this rule's cpuset will be \
                              rejected at apply time"
                         ),
-                    });
+                    }),
+                    Ok(_) => resolve_warnings
+                        .extend(host_cpuset_warning(&draft.file, draft.line, cs, opts)),
                 }
             }
-            // Everything else (a known alias, a well-formed list) can only be
-            // judged against this host's topology — the caller's resolver is
-            // the only thing that knows whether it resolves here.
-            Some(cs) => {
-                if let Some(check) = opts.cpuset_check {
-                    if let Err(e) = check(cs) {
-                        resolve_warnings.push(LoadWarning {
-                            file: draft.file.clone(),
-                            line: draft.line,
-                            message: format!(
-                                "cpuset {} cannot be resolved on this host ({e}); this \
-                                 rule's cpuset will be rejected at apply time",
-                                cpuset_label(cs)
-                            ),
-                        });
-                    }
-                }
-            }
+            // Aliases can only be judged against this host's topology — the
+            // caller's resolver is the only thing that knows whether one
+            // resolves here.
+            Some(cs) => resolve_warnings
+                .extend(host_cpuset_warning(&draft.file, draft.line, cs, opts)),
             None => {}
         }
         if let Some(name) = &draft.name {

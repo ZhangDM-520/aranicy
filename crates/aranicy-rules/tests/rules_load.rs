@@ -396,6 +396,32 @@ fn a_rules_directory_file_that_is_never_read_is_reported_not_ignored() {
     assert_eq!(rs.exact.len(), 1, "only the .rules file is loaded");
 }
 
+/// The host half of the cpuset check must reach a *well-formed* explicit list
+/// too: `16-31` on a 12-CPU host parses, and `sched_setaffinity` then answers
+/// EINVAL, so the loader is the only place that can say so.
+#[test]
+fn a_well_formed_explicit_cpuset_is_checked_against_the_host() {
+    let f = Fixture::new("cpuset-explicit-host");
+    f.write(
+        "10-a.rules",
+        "{\"name\": \"foo\", \"cpuset\": \"24-27\"}\n",
+    );
+    let opts = LoadOptions {
+        cpuset_check: Some(|cs: &CpuSet| match cs {
+            CpuSet::Explicit(_) => Err("none of the listed CPUs is online on this host".to_string()),
+            _ => Ok(()),
+        }),
+        ..LoadOptions::default()
+    };
+    let rs = f.load(opts);
+    let m = messages(&rs);
+    assert!(
+        m.iter().any(|x| x.contains("cannot be resolved on this host")
+            && x.contains("24-27")),
+        "{m:?}"
+    );
+}
+
 /// Matching is on the executable's basename, so a rule that spells a path is
 /// dead weight; `lint` has to say so rather than pass it silently.
 #[test]

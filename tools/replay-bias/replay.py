@@ -49,6 +49,9 @@ BURST_FLOOR_NS = 1_464  # cake handoff floor
 # with an underscore that was cut mid-identifier.
 TASK_COMM_LEN = 15
 
+# ADR 0003 promotion gate: a cohort smaller than this is not a measurement.
+MIN_GATE_COHORT = 200
+
 
 def looks_like_test(name: str) -> bool:
     if "::" in name or "tests:" in name:
@@ -158,7 +161,11 @@ def lean_report(cohort, capture, max_age_s):
         "agree": agree,
         "disagree": disagree,
         "unilateral": unilateral,
-        "disagreement_pct": round(100 * disagree / decided, 1) if decided else 0.0,
+        # `None` when nothing was decided: a 0.0 would literally satisfy
+        # ADR 0003's "< 10 % of decided entries" on a cohort that scored
+        # nothing at all (every entry stale, or no evidence).
+        "disagreement_pct": round(100 * disagree / decided, 1) if decided else None,
+        "gate_cohort_ok": decided >= MIN_GATE_COHORT,
         "examples": examples,
     }
 
@@ -293,6 +300,12 @@ def main() -> int:
                 f"(stale {lean['stale']}, no evidence {lean['no_evidence']})."
             )
         else:
+            if not lean["gate_cohort_ok"]:
+                print(
+                    f"  lean axis: {lean['cohort_with_lean_inputs']} decided entries is "
+                    f"below the gate's {MIN_GATE_COHORT} — a ratio here is not a "
+                    "promotion measurement (ADR 0003)."
+                )
             print(
                 "  lean boundary: stage {} ns, hop {} Hz, deadband {}% (recorded)"
                 .format(

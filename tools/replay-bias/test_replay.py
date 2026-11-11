@@ -56,6 +56,8 @@ class LeanAxis(unittest.TestCase):
         self.assertEqual(r["agree"], 2)
         self.assertEqual(r["disagree"], 0)
         self.assertEqual(r["stale"], 0)
+        self.assertEqual(r["disagreement_pct"], 0.0)
+        self.assertFalse(r["gate_cohort_ok"], "2 entries is not 200")
 
     def test_a_disagreement_names_the_entry(self):
         cohort = [entry("odd", "bulk", 90, burst=1_500, hop=4_000, at=1_000)]
@@ -80,6 +82,16 @@ class LeanAxis(unittest.TestCase):
         r = replay.lean_report(cohort, marker(2_000), 3_600)
         self.assertEqual(r["no_evidence"], 1)
         self.assertEqual(r["cohort_with_lean_inputs"], 0)
+
+    def test_an_all_stale_cohort_is_not_a_gate_measurement(self):
+        # A 0.0 % ratio on a cohort that scored nothing would satisfy ADR
+        # 0003's "< 10 % of decided entries" literally, so the tool must say
+        # the cohort is empty instead.
+        cohort = [entry("old", "bulk", 90, burst=5_000_000, hop=1, at=1_000)]
+        r = replay.lean_report(cohort, marker(1_000 + 7_200), 3_600)
+        self.assertEqual(r["stale"], 1)
+        self.assertIsNone(r["disagreement_pct"], "no decided entries, no ratio")
+        self.assertFalse(r["gate_cohort_ok"])
 
     def test_a_deadband_of_zero_is_a_boundary_not_an_absent_value(self):
         # A 0% deadband scores every non-zero verdict; substituting 15 would

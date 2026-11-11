@@ -46,9 +46,10 @@ confined by its unit or a container, and widening affinity to every CPU is
 worse than leaving a stale set in place. An edit that changes `cpuset` still
 lands via (2); a deletion leaves the old affinity, which the journal line and
 this ADR make discoverable. The line counts the two facts apart —
-`released=N` is processes whose dimensions were actually reset, `kept_cpuset=M`
-is processes whose affinity was left in place — so neither number claims work
-the other did.
+`released=N` is re-planned processes whose dimensions were reset, and
+`kept_cpuset=M` is re-planned processes whose affinity was left in place — so
+neither number claims work the other did, and a process the pass could not
+reach (`/proc` hid it, or it exited) counts in neither.
 
 ## Consequences and limits
 

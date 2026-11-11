@@ -1,6 +1,8 @@
 //! The ADR 0003 replay gate ships its own stdlib test suite; run it from the
-//! Rust gate so it cannot rot. Skipped, with a message, where `python3` is
-//! absent: the replay is a development tool, not part of the daemon.
+//! Rust gate so it cannot rot. Where `python3` is absent the test returns
+//! without checking anything (the replay is a development tool, not part of
+//! the daemon) and `cargo test` captures the note — run it with `--nocapture`
+//! to see why a box reported green.
 
 #[test]
 fn the_replay_gate_passes_its_own_suite() {
