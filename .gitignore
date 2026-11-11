@@ -8,3 +8,7 @@ collector/target
 # benchmark generator (built by `gcc -O2 -o tools/storm/storm …`, see BENCHMARKS)
 tools/storm/storm
 __pycache__/
+
+# synthetic-user harness: cloud image cache, VM disks, keys, raw runs
+research/synthetic-users/.cache/
+research/synthetic-users/runs/*/transcripts/
