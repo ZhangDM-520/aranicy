@@ -24,9 +24,15 @@ spinner at 3.9, both actuated `Bulk +3`) shows the cost of a wrong label.
 
 ## Decision
 
-1. The snapshot now records the lean inputs — `burst_ns` and `hop_hz`, the
-   window means the verdict is computed from — when `bias_shadow` is on
-   (`Durable`, so they survive a restart and need no second projection).
+1. The snapshot now records the lean inputs — `burst_ns`, `hop_hz` and the
+   `lean_at` second they were written — when `bias_shadow` is on (`Durable`,
+   so they survive a restart and need no second projection), plus a top-level
+   `lean_capture` naming the boundary in force (`stage_min_ns`, `hop_min_hz`,
+   `deadband_pct`, `saved_at`). The anchors are live config keys; a replay
+   that assumed the defaults would judge a classifier the daemon never ran.
+   No marker = the daemon was not capturing, and the replay refuses to score
+   those entries. Entries older than `--max-lean-age` (default 1 h) are
+   reported as stale and excluded.
 2. `tools/replay-bias/replay.py` re-runs the same arithmetic (mirrored
    constants) over a captured snapshot and reports agreement, disagreement and
    the concrete inverted names. It is the offline half of the gate.
@@ -69,6 +75,11 @@ before the capture was read. 84 entries, 38 with lean inputs, 26 decided:
 `sshd-session` (lean +0.86, burst 306 µs at 264 hops/s) and `sudo` (+0.26,
 294 µs at 385 hops/s) — interactive one-shots pushed just past the burst
 anchor by the saturation itself.
+
+The capture predates the `lean_capture` marker added with this ADR (the file
+has raw `burst_ns`/`hop_hz` but no boundary record), so those numbers were
+read with the boundary that was in force — the defaults — by hand. A capture
+taken today carries its boundary and refuses to be scored without one.
 
 Verdict: **gate not met, promotion stays blocked.** 26 decided entries is not
 a population, the load is the exact confound the quiet-host rule exists to

@@ -970,6 +970,7 @@ mod tests {
         engine.restore(BiasSnapshot {
             version: bias_state::BIAS_STATE_VERSION,
             threshold_ema: None,
+            lean_capture: None,
             entries: vec![EntrySnapshot {
                 name: "gone".into(),
                 durable: Durable {

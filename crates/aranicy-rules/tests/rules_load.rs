@@ -296,6 +296,7 @@ fn load_options_gate_file_kinds() {
         rule_load: false,
         type_load: true,
         cgroup_load: true,
+        cpuset_check: None,
     });
     assert!(rs.exact.is_empty());
     assert_eq!(rs.types.len(), 1);
@@ -480,4 +481,42 @@ fn bias_opt_out_parses_inherits_and_type_checks() {
         "{:?}",
         rs.warnings
     );
+}
+
+/// A host-dependent alias resolves or it does not — only the caller's
+/// resolver knows. The loader must surface its refusal with file:line, and
+/// must not invent one when no resolver is supplied.
+#[test]
+fn the_host_cpuset_check_is_what_reports_a_host_dependent_alias() {
+    fn uniform_box(cs: &aranicy_model::CpuSet) -> Result<(), String> {
+        match cs {
+            aranicy_model::CpuSet::Alias(a) if &**a == "big-cores" => {
+                Err("no big/little asymmetry".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+    let fx = Fixture::new("cpuset-host");
+    fx.write(
+        "a.rules",
+        "{\"name\": \"tar\", \"cpuset\": \"big-cores\"}\n\
+         {\"name\": \"ok\", \"cpuset\": \"0-1\"}\n",
+    );
+    let rs = fx.load(LoadOptions {
+        cpuset_check: Some(uniform_box),
+        ..LoadOptions::default()
+    });
+    assert_eq!(rs.warnings.len(), 1, "{:?}", rs.warnings);
+    let w = &rs.warnings[0];
+    assert!(w.file.ends_with("a.rules") && w.line == 1, "{w:?}");
+    assert!(
+        w.message.contains("big-cores") && w.message.contains("cannot be resolved on this host"),
+        "{}",
+        w.message
+    );
+
+    // Without a resolver the static checks stand alone: no invented warning.
+    let fx2 = Fixture::new("cpuset-nohost");
+    fx2.write("a.rules", "{\"name\": \"tar\", \"cpuset\": \"big-cores\"}\n");
+    assert!(fx2.load_default().warnings.is_empty());
 }

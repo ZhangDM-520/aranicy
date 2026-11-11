@@ -140,10 +140,30 @@ pub fn cgroups_json(rs: &RuleSet) -> Value {
     cgroups_json_at(rs, mount.as_deref())
 }
 
+/// Does the live value match the quota for *either* CPU count the two
+/// processes could legitimately have used? The daemon sizes the quota with
+/// `available_parallelism` (affinity-aware), while this dump may run under a
+/// different affinity (`taskset -c 0 aranicy dump cgroups`), so comparing
+/// against one count reports a false "not applied".
+fn quota_matches(live: &str, pct: u8, ncpu: [usize; 2]) -> bool {
+    ncpu.iter()
+        .any(|n| live == aranicy_apply::expected_cpu_max(pct, (*n).max(1)))
+}
+
+fn online_cpus() -> usize {
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if n > 0 {
+        n as usize
+    } else {
+        1
+    }
+}
+
 fn cgroups_json_at(rs: &RuleSet, mount: Option<&std::path::Path>) -> Value {
-    let ncpu = std::thread::available_parallelism()
+    let affinity_ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    let ncpu = [affinity_ncpu, online_cpus()];
     let map: Map<String, Value> = rs
         .cgroups
         .iter()
@@ -152,9 +172,9 @@ fn cgroups_json_at(rs: &RuleSet, mount: Option<&std::path::Path>) -> Value {
                 .map(|m| m.join(name.as_ref()).join("cpu.max"))
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|s| s.trim().to_string());
-            let applied = def.cpu_quota_pct.map(|pct| {
-                live.as_deref() == Some(aranicy_apply::expected_cpu_max(pct, ncpu).as_str())
-            });
+            let applied = def
+                .cpu_quota_pct
+                .map(|pct| live.as_deref().is_some_and(|v| quota_matches(v, pct, ncpu)));
             (
                 name.to_string(),
                 json!({
@@ -391,6 +411,17 @@ mod tests {
         assert_eq!(v["games"]["cpu_quota_applied"], json!(false));
     }
 
+    /// The daemon and this process can legitimately count different CPUs
+    /// (affinity vs online); a value matching either must read as applied.
+    #[test]
+    fn a_quota_matches_either_cpu_count() {
+        let for_online = aranicy_apply::expected_cpu_max(50, 12);
+        assert!(quota_matches(&for_online, 50, [1, 12]));
+        assert!(quota_matches(&for_online, 50, [12, 1]));
+        assert!(!quota_matches(&for_online, 50, [2, 4]));
+        assert!(!quota_matches("max 100000", 50, [1, 12]));
+    }
+
     /// The dump must not claim a quota the cgroup does not have: after the
     /// boot race the declaration is 50% while `cpu.max` is still `max`.
     #[test]
@@ -435,6 +466,7 @@ mod tests {
         let snap = BiasSnapshot {
             version: BIAS_STATE_VERSION,
             threshold_ema: Some(1234.5),
+            lean_capture: None,
             entries: vec![EntrySnapshot {
                 name: "bulk".into(),
                 durable: crate::bias_state::Durable {

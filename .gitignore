@@ -12,3 +12,6 @@ __pycache__/
 # synthetic-user harness: cloud image cache, VM disks, keys, raw runs
 research/synthetic-users/.cache/
 research/synthetic-users/runs/*/transcripts/
+
+# crate-local test scratch (scratch_dir fallback when CARGO_TARGET_TMPDIR is unset)
+crates/*/target/

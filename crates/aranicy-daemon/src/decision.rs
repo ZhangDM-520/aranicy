@@ -310,7 +310,13 @@ fn release_policy(old: &Policy) -> Policy {
 fn fill_released(desired: &mut Policy, old: &Policy) {
     let rel = release_policy(old);
     desired.nice = desired.nice.or(rel.nice);
-    desired.latency_nice = desired.latency_nice.or(rel.latency_nice);
+    // `latency_nice` falls back to `nice` at apply time, so a plan that
+    // carries a nice already has a latency value — filling the reset 0 here
+    // would replace the fallback (a `nice: -5` rule would become latency 0
+    // on every no-op reload).
+    if desired.latency_nice.is_none() && desired.nice.is_none() {
+        desired.latency_nice = rel.latency_nice;
+    }
     desired.sched = desired.sched.or(rel.sched);
     desired.rtprio = desired.rtprio.or(rel.rtprio);
     desired.ioclass = desired.ioclass.or(rel.ioclass);
@@ -739,6 +745,7 @@ mod tests {
         engine.restore(BiasSnapshot {
             version: 1,
             threshold_ema: None,
+            lean_capture: None,
             entries: vec![EntrySnapshot {
                 name: comm.to_string(),
                 durable: crate::bias_state::Durable {
@@ -962,6 +969,28 @@ mod tests {
         assert_eq!(policy.autogroup, Some(0));
         assert!(policy.sched.is_none(), "the old rule set no scheduler");
         assert!(policy.cpuset.is_none());
+    }
+
+    /// `latency_nice` falls back to `nice` at apply time. A no-op reload of a
+    /// `nice`-only rule must not fill the release's 0 into that fallback:
+    /// the process would move from latency −5 to 0 and stay there.
+    #[test]
+    fn a_reload_does_not_replace_the_latency_fallback_with_zero() {
+        let old = rules_with("game", Some(-5));
+        let new = rules_with("game", Some(-5));
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+
+        let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .expect("a matched process is re-planned");
+        let Plan::Apply { policy, .. } = &plan else {
+            panic!("expected an apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(-5));
+        assert_eq!(
+            policy.latency_nice, None,
+            "absent latency_nice must keep falling back to the planned nice"
+        );
     }
 
     /// `kaz-8` is also "the field was deleted, the rule stayed": the old

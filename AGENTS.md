@@ -411,7 +411,9 @@ with test-thread names excluded (they are 300+ of 4096 live entries and score
 - Shadow never actuates: `close_window` returns a verdict, `bias.rs` compares
   it against the *pre-hysteresis* `cand`, and only the counters and two log
   lines change. `shadow_off_changes_nothing` pins identical `Change` vectors
-  and `BiasSnapshot`s for a 10-window run.
+  for a 10-window run, and identical `BiasSnapshot`s **after zeroing the
+  capture fields** — the lean inputs are the one durable difference, by
+  design (ADR 0003).
 - Counters: `windows` = name-windows with a lean verdict (the flip-gate
   denominator), `disagreements` = both sides Some and different,
   `unilateral` = exactly one side Some. Per-name logging is throttled to one
@@ -422,11 +424,14 @@ with test-thread names excluded (they are 300+ of 4096 live entries and score
   what the ADR's flip gate exists to adjudicate. Do not "fix" the population
   boundary from this number alone.
 - The config key is reconfigurable on reload; pre-images live at
-  `/var/lib/aranicy/ananicy.conf.pre-shadow-*`. The snapshot now records
-  `burst_ns`/`hop_hz` per entry when the key is on, and
-  `tools/replay-bias/replay.py` re-runs the verdict offline (ADR 0003: the
-  promotion gate is a quiet-host capture; the live host's config has the flag
-  off as of 2026-11-11 19:30).
+  `/var/lib/aranicy/ananicy.conf.pre-shadow-*`. With the key on the snapshot
+  records `burst_ns`/`hop_hz`/`lean_at` per entry **and** a top-level
+  `lean_capture { stage_min_ns, hop_min_hz, deadband_pct, saved_at }`; the
+  anchors are live config keys, so the replay uses the recorded ones and
+  refuses a file with no marker. `tools/replay-bias/replay.py` re-runs the
+  verdict offline with `--max-lean-age` (default 1 h) excluding stale
+  entries. ADR 0003 holds the promotion gate (a quiet-host capture); the live
+  host's config has the flag off as of 2026-11-11 19:30.
 - `runs`/`sleeps` (per-window counts, additive on the wire) exist for exact
   offline replay; the live shadow still uses the per-row means. A missing
   field is 0 = no evidence on the lean axis only.
@@ -438,5 +443,10 @@ with test-thread names excluded (they are 300+ of 4096 live entries and score
 - Classification → target: `Bulk` → +3; `Responsive` + share-starved → −1; else 0.
 - Polarity reminder: LOW score = bulk (candidate when window mean < threshold_ema × (1 − deadband)).
 - Persisted state (`/var/lib/aranicy/bias-state`) keeps name/score_ema/
-  sample_count_ewma/class/bias/last_seen/confidence/frozen — NOT target/want
-  stamps; a restart re-stamps wants at the first slew pass.
+  sample_count_ewma/class/bias/last_seen/confidence/frozen, the shadow
+  capture (`burst_ns`/`hop_hz`/`lean_at` + top-level `lean_capture`) — NOT
+  target/want stamps; a restart re-stamps wants at the first slew pass.
+  Additive diagnostic fields do **not** bump `BIAS_STATE_VERSION`: a rollback
+  then drops the capture but keeps the history, whereas a bump would make the
+  old build refuse the file and rewrite it empty (`bias_state.rs` module
+  docs).

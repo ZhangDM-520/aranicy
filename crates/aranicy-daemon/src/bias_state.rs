@@ -11,6 +11,12 @@
 //! rewritten without its new fields — a silent downgrade. `load` therefore
 //! refuses anything above [`BIAS_STATE_VERSION`]; the caller logs it and
 //! starts with empty history.
+//!
+//! Additive *diagnostic* fields (`burst_ns`/`hop_hz`/`lean_at`) do not bump the
+//! version on purpose: a rollback to an older build then keeps the whole bias
+//! history and silently drops the capture, whereas a version bump would make
+//! the older build refuse the file and rewrite it empty — losing every learned
+//! bias. The capture is cheap to retake; the history is not.
 
 #![allow(dead_code)] // save/load are wired into daemon.rs by the caller
 
@@ -64,6 +70,24 @@ pub struct Durable {
     /// trusting the live counters (ADR 0003).
     pub burst_ns: u64,
     pub hop_hz: u64,
+    /// Unix seconds those two were written; `0` = never. Ages the capture:
+    /// entries written long before the snapshot are not evidence about the
+    /// population the snapshot describes.
+    pub lean_at: u64,
+}
+
+/// The boundary and moment a lean capture was taken with. Present only when
+/// the daemon saved the state with `bias_shadow` on: the stage/hop anchors are
+/// live config keys, so an offline replay that assumed the defaults would
+/// describe a classifier the daemon never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LeanCapture {
+    pub stage_min_ns: u64,
+    pub hop_min_hz: u64,
+    pub deadband_pct: u64,
+    /// Unix seconds of the save.
+    pub saved_at: u64,
 }
 
 /// One persisted per-name history entry. `Durable` is flattened so the
@@ -86,6 +110,9 @@ pub struct BiasSnapshot {
     /// Population threshold T_us (userspace EWMA of mean score), if known.
     pub threshold_ema: Option<f64>,
     pub entries: Vec<EntrySnapshot>,
+    /// Present only when `bias_shadow` was on at save time; see
+    /// [`LeanCapture`]. Absent = the entries' lean inputs are not a capture.
+    pub lean_capture: Option<LeanCapture>,
 }
 
 /// Atomically persist `state` (write tmp file + rename). Missing parent
@@ -182,6 +209,7 @@ mod tests {
                     },
                 },
             ],
+            ..Default::default()
         }
     }
 

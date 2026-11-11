@@ -144,7 +144,7 @@ a policy trade-off and stays documented as the trust model above.
 | `--reload` trusts the pidfile | `4e9f09a` | VM: pid 1 in the file → refused as stale; a live `sleep` pid → refused as "not aranicy"; the clean reload still signals |
 | `cpuset` names unvalidated | `96fe3ad` | VM: `turbo-cores` and `0-4-9` warn with file:line, `lint` exits 1 |
 | per-name bias opt-out | `1c2ff18` | VM A/B: `burn` (`"bias": false`, nice 5) learned bias 3 and stayed at 5; the unruled control went 0 → 3 |
-| live re-plan on reload | `ea6172f`, `4998e00` | VM: ionice 7→3 landed on reload, a deleted field reset to none, a deleted rule reset nice and ionice (`released=1`) |
+| live re-plan on reload | `ea6172f`, `4998e00` | VM: ionice 7→3 landed on reload, a deleted field reset to none, a deleted rule reset its ioclass/ionice and — for a name the learner has no evidence on — nice (`released=1`). A name the learner *does* know keeps the learner's nice by design (ADR 0002); only the rule's dimensions are given back |
 | two-axis classifier promotion | `21e7cd4` | ADR 0003: lean inputs persisted, offline replay implemented, first capture 24/2 (7.7 %) on a *saturated* 2 vCPU box — gate not met |
 
 The cgroup boot failure is worth a note: the persona saw it as a race with

@@ -536,6 +536,7 @@ impl Entry {
             // the recorded population is the only evidence the gate accepts.
             self.durable.burst_ns = window.0;
             self.durable.hop_hz = window.1;
+            self.durable.lean_at = close_t;
             Some(window)
         } else {
             None
@@ -933,9 +934,21 @@ impl BiasEngine {
 
     /// Serializable state for persistence (see `bias_state::save`).
     pub fn snapshot(&self) -> BiasSnapshot {
+        // The lean anchors are live config keys; record the ones in force so
+        // the offline replay judges with the daemon's boundary, not a guess.
+        let lean_capture = self.cfg.shadow.then(|| {
+            let b = self.cfg.boundary();
+            crate::bias_state::LeanCapture {
+                stage_min_ns: b.stage_min_ns,
+                hop_min_hz: b.hop_min_hz,
+                deadband_pct: b.deadband_pct,
+                saved_at: unix_secs(SystemTime::now()),
+            }
+        });
         BiasSnapshot {
             version: BIAS_STATE_VERSION,
             threshold_ema: self.threshold,
+            lean_capture,
             entries: self
                 .entries
                 .iter()
@@ -1813,6 +1826,7 @@ mod tests {
             version: BIAS_STATE_VERSION,
             threshold_ema: None,
             entries,
+            ..Default::default()
         });
         eng.ingest(&[], ts(1)); // wants stamp here: flood releases mature at 301
 
@@ -1926,6 +1940,7 @@ mod tests {
             version: BIAS_STATE_VERSION,
             threshold_ema: None,
             entries: vec![entry("aaa_zombie", 0.0), entry("zzz_live", 0.5)],
+            ..Default::default()
         });
 
         // The first pass stamps both attack wants; the second is past
@@ -2180,6 +2195,7 @@ mod tests {
         let snap = crate::bias_state::BiasSnapshot {
             version: crate::bias_state::BIAS_STATE_VERSION,
             threshold_ema: None,
+            lean_capture: None,
             entries: vec![crate::bias_state::EntrySnapshot {
                 name: "app".into(),
                 durable: crate::bias_state::Durable {
@@ -2728,7 +2744,9 @@ mod tests {
             for e in &mut s.entries {
                 e.durable.burst_ns = 0;
                 e.durable.hop_hz = 0;
+                e.durable.lean_at = 0;
             }
+            s.lean_capture = None;
             s
         }
         assert_eq!(
@@ -2743,6 +2761,22 @@ mod tests {
         assert!(
             off_snap.entries.iter().all(|e| e.durable.burst_ns == 0),
             "shadow-off must record nothing"
+        );
+        // The capture marker is the replay's licence: absent when the daemon
+        // never ran the shadow classifier, and it names the boundary in force
+        // (the anchors are live config keys).
+        assert!(off_snap.lean_capture.is_none());
+        let capture = on_snap.lean_capture.expect("shadow-on records the capture");
+        let cfg = BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        };
+        let b = cfg.boundary();
+        assert_eq!((capture.stage_min_ns, capture.hop_min_hz), (b.stage_min_ns, b.hop_min_hz));
+        assert_eq!(capture.deadband_pct, b.deadband_pct);
+        assert!(
+            on_snap.entries.iter().any(|e| e.durable.lean_at > 0),
+            "the capture dates its entries"
         );
         // ...and the off run really did compute nothing.
         assert_eq!(off_snap.version, BIAS_STATE_VERSION);

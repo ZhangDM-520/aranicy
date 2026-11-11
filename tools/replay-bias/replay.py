@@ -17,6 +17,12 @@ Usage:
 
 The host's state file is root-owned: run with sudo (read-only) or pass a copy.
 
+LEAN AXIS. When the snapshot carries a `lean_capture` marker the replay
+re-runs the two-axis verdict with the boundary the daemon actually used (the
+anchors are live config keys), excludes inputs older than `--max-lean-age`,
+and reports agreement/disagreement plus the inverted names. A snapshot with
+no marker is not a capture and is not scored.
+
 TEST-THREAD POLLUTION. `cargo test` names its threads after the test path, and
 libtest truncates that to TASK_COMM_LEN-1, so the history fills with entries
 like `a_pass_ages_wh` / `bias::tests:`. They classify BULK at scores ~200 and
@@ -70,16 +76,16 @@ def sweep(bulk, responsive, deadband_pct):
     return best_hard, best_band
 
 
-def lean_value(burst_ns, hop_hz):
+def lean_value(burst_ns, hop_hz, stage_min_ns, hop_min_hz):
     """Mirror of `classify::lean`: positive = bulk, negative = responsive."""
     if burst_ns == 0:
         return None
-    burst = max(burst_ns, BURST_FLOOR_NS) / STAGE_MIN_NS
-    rate = max(hop_hz, HOP_MIN_HZ) / HOP_MIN_HZ
+    burst = max(burst_ns, BURST_FLOOR_NS) / stage_min_ns
+    rate = max(hop_hz, hop_min_hz) / hop_min_hz
     return math.log2(burst) - math.log2(rate)
 
 
-def lean_report(cohort, deadband_pct):
+def lean_report(cohort, capture, max_age_s):
     """Re-run the two-axis verdict over a captured population.
 
     The stored `class` is the *actuated* (post-hysteresis) label, so a
@@ -87,15 +93,29 @@ def lean_report(cohort, deadband_pct):
     but not the same denominator: live compares against the pre-hysteresis
     `cand`, some of which is `None` (deadband) and shows up as unilateral.
     """
+    # The boundary is the one the daemon ran with, recorded in the snapshot:
+    # `bias_lean_stage_min_ns`, `bias_lean_hop_hz` and `bias_deadband_pct` are
+    # live config keys, so the defaults are only a fallback for old files.
+    stage = capture.get("stage_min_ns") or STAGE_MIN_NS
+    hop_min = capture.get("hop_min_hz") or HOP_MIN_HZ
+    deadband_pct = capture.get("deadband_pct") or 15
+    saved_at = capture.get("saved_at") or 0
     deadband = math.log2(1 + deadband_pct / 100)
-    agree = disagree = unilateral = no_evidence = 0
+    agree = disagree = unilateral = no_evidence = stale = 0
     examples = []
     for e in cohort:
         burst = e.get("burst_ns", 0)
         hop = e.get("hop_hz", 0)
-        value = lean_value(burst, hop)
+        value = lean_value(burst, hop, stage, hop_min)
         if value is None:
             no_evidence += 1
+            continue
+        at = e.get("lean_at", 0)
+        if saved_at and at == 0:
+            no_evidence += 1
+            continue
+        if saved_at and at and saved_at - at > max_age_s:
+            stale += 1
             continue
         if abs(value) <= deadband:
             continue
@@ -121,6 +141,14 @@ def lean_report(cohort, deadband_pct):
             unilateral += 1
     decided = agree + disagree + unilateral
     return {
+        "boundary": {
+            "stage_min_ns": stage,
+            "hop_min_hz": hop_min,
+            "deadband_pct": deadband_pct,
+            "saved_at": saved_at,
+        },
+        "max_age_s": max_age_s,
+        "stale": stale,
         "cohort_with_lean_inputs": decided,
         "no_evidence": no_evidence,
         "agree": agree,
@@ -150,6 +178,12 @@ def main() -> int:
         help="exit 1 when the anchor violates more labels than this",
     )
     ap.add_argument("--keep-tests", action="store_true", help="do not filter test threads")
+    ap.add_argument(
+        "--max-lean-age",
+        type=int,
+        default=3600,
+        help="exclude lean inputs older than N seconds before the save (default 3600)",
+    )
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
 
@@ -177,7 +211,8 @@ def main() -> int:
     viol_resp = sum(1 for x in resp if x <= lo)
     viol = viol_bulk + viol_resp
     best_hard, best_band = sweep(bulk, resp, args.deadband_pct)
-    lean = lean_report(cohort, args.deadband_pct)
+    capture = raw.get("lean_capture")
+    lean = lean_report(cohort, capture, args.max_lean_age) if capture else None
 
     report = {
         "snapshot": args.snapshot,
@@ -242,16 +277,30 @@ def main() -> int:
             "  note: labels came from the population boundary, so 'best' recovers T; "
             "this is a compatibility check, not accuracy."
         )
-        if lean["cohort_with_lean_inputs"] == 0:
+        if lean is None:
             print(
-                "  lean axis: no captured burst/hop inputs — run with "
-                "bias_shadow = true so the snapshot records them (ADR 0003)."
+                "  lean axis: the snapshot carries no capture marker — the daemon "
+                "was not saving with bias_shadow = true, so its entries are not a "
+                "capture (ADR 0003)."
+            )
+        elif lean["cohort_with_lean_inputs"] == 0:
+            print(
+                "  lean axis: captured, but no entry has fresh burst/hop inputs "
+                f"(stale {lean['stale']}, no evidence {lean['no_evidence']})."
             )
         else:
             print(
+                "  lean boundary: stage {} ns, hop {} Hz, deadband {}% (recorded)"
+                .format(
+                    lean["boundary"]["stage_min_ns"],
+                    lean["boundary"]["hop_min_hz"],
+                    lean["boundary"]["deadband_pct"],
+                )
+            )
+            print(
                 f"  lean axis: {lean['agree']} agree / {lean['disagree']} disagree "
                 f"({lean['disagreement_pct']}%) / {lean['unilateral']} unilateral; "
-                f"{lean['no_evidence']} without runtime evidence"
+                f"{lean['no_evidence']} without evidence, {lean['stale']} stale"
             )
             for ex in lean["examples"]:
                 print(

@@ -29,12 +29,16 @@ On a successful reload the daemon runs one reconcile pass over `/proc`:
    only thing an edit to a non-`nice` dimension can reach. No comparison with
    live state: re-applying is cheaper and more honest than a per-dimension
    read-back that would need its own drift policy.
-3. **No longer matched, but matched by the tree being replaced** → apply what
-   the old rule must give back: `nice`/`latency_nice` 0, `sched` normal,
+3. **No longer matched, but matched by the tree being replaced** — or matched
+   by both trees while the new rule no longer declares a field the old one
+   did ("the field was deleted, the rule stayed" is the same edit from the
+   operator's seat) → apply what the old rule must give back: `nice`/`latency_nice` 0, `sched` normal,
    `rtprio` 0, `ioclass` none, `ionice` 0, `oom_score_adj` 0, `cgroup` root,
-   `autogroup` 0 — each only when the old rule actually set it. A `nice` the
-   learner now wants survives (the release fills the gaps in that plan, it does
-   not overwrite it).
+   `autogroup` 0 — each only when the old rule actually set it and the new
+   plan does not. A `nice` the learner now wants survives (the release fills
+   the gaps in that plan, it does not overwrite it), and `latency_nice` is
+   never filled when the plan carries a `nice` — the documented fallback is
+   the value in force, so filling 0 would silently retune a `nice`-only rule.
 4. Everything else is left alone.
 
 `cpuset` is **not** released. There is no safe "unset": the process may be

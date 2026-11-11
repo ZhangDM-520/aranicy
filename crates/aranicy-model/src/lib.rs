@@ -68,6 +68,14 @@ pub struct CgroupDef {
     pub cpu_quota_pct: Option<u8>,
 }
 
+/// Aliases that parse for ananicy-cpp lint parity but that **no** kernel
+/// exposes: the apply path rejects them, so the loader warns about them.
+/// One list, because two copies drift (the loader used to warn about a
+/// different set than the one apply rejected).
+pub fn cpuset_alias_unusable(name: &str) -> bool {
+    matches!(name, "turbo-cores" | "x3d-cache" | "x3d-frequency")
+}
+
 /// CPU indices are limited to 0..=1023 (glibc `CPU_SETSIZE`).
 pub const MAX_CPUS: usize = 1024;
 

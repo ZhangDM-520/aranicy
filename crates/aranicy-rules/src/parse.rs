@@ -142,11 +142,6 @@ fn is_alias_name(s: &str) -> bool {
         })
 }
 
-/// Aliases that parse for ananicy-cpp lint parity but that no kernel exposes;
-/// the apply path rejects them, so the loader warns (docs/COMPATIBILITY.md).
-pub(crate) fn cpuset_alias_unusable(s: &str) -> bool {
-    matches!(s, "turbo-cores" | "x3d-cache" | "x3d-frequency")
-}
 
 fn parse_cpuset(s: &str) -> CpuSet {
     if is_alias_name(s) {

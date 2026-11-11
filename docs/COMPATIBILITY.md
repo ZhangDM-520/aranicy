@@ -343,9 +343,11 @@ nothing.
 - `--reload` reloads config **and rules** (superset: ananicy-cpp reloads
   config only), reconfigures the bias engine and re-plans every **running**
   process against the new corpus (ADR 0002): a rule edit reaches all its
-  dimensions, not just `nice`, and a deleted rule's dimensions are reset
-  (`cpuset` excepted — there is no safe value to restore). A daemon that
-  *starts* with an edited corpus does not reconcile; restart is not reload. Before signalling, it checks
+  dimensions, not just `nice`, and a deleted rule — or a field deleted from a
+  rule that stayed — gives its dimensions back (`cpuset` excepted: there is no
+  safe value to restore). A `nice` the learner has evidence for survives the
+  release. A daemon that *starts* with an edited corpus does not reconcile;
+  restart is not reload. Before signalling, it checks
   the pidfile: the file must still be locked by a running daemon and that pid's
   executable must be `aranicy` — a leftover file names a recycled pid, and
   SIGHUP terminates. A refusal says which check failed and never signals.

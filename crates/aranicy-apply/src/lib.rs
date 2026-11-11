@@ -1319,6 +1319,33 @@ mod tests {
         let _ = fs::remove_dir_all(&mount);
     }
 
+    /// One list lives in `aranicy-model` so the loader and the apply path
+    /// agree; this pins the apply side to it, so adding a name there without a
+    /// rejection here (or the reverse) is red.
+    #[test]
+    fn every_unusable_alias_is_rejected_at_apply_time() {
+        for name in [
+            "turbo-cores",
+            "x3d-cache",
+            "x3d-frequency",
+            "warp-cores",
+            "big-cores",
+        ] {
+            let v = CpuSet::Alias(name.into());
+            assert!(
+                resolve_cpuset(&v).is_err(),
+                "{name} must not resolve to a mask"
+            );
+            if aranicy_model::cpuset_alias_unusable(name) {
+                let msg = resolve_cpuset(&v).unwrap_err();
+                assert!(
+                    msg.contains("unsupported") || msg.contains("not usable"),
+                    "{name}: {msg}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn unknown_alias_is_an_error_not_a_panic() {
         let v = CpuSet::Alias("warp-cores".into());

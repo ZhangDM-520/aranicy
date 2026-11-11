@@ -30,12 +30,23 @@ use std::sync::Arc;
 
 mod parse;
 
+/// Host-dependent cpuset resolution: `Ok` when the value maps to CPUs on this
+/// host, `Err(reason)` otherwise.
+pub type CpusetCheck = fn(&aranicy_model::CpuSet) -> Result<(), String>;
+
 /// Which file kinds to load (ananicy.conf gates).
 #[derive(Debug, Clone, Copy)]
 pub struct LoadOptions {
     pub rule_load: bool,
     pub type_load: bool,
     pub cgroup_load: bool,
+    /// Host-dependent cpuset resolution. The sysfs topology reads live in
+    /// `aranicy-apply`, so the loader takes them as a function: `None` means
+    /// static checks only, and the daemon passes `resolve_cpuset` so `lint`
+    /// warns about an alias *this host* cannot resolve (`big-cores` on a
+    /// uniform box, an out-of-range `node-N`), not just the aliases no host
+    /// can.
+    pub cpuset_check: Option<CpusetCheck>,
 }
 
 impl Default for LoadOptions {
@@ -44,7 +55,15 @@ impl Default for LoadOptions {
             rule_load: true,
             type_load: true,
             cgroup_load: true,
+            cpuset_check: None,
         }
+    }
+}
+
+fn cpuset_label(cs: &CpuSet) -> String {
+    match cs {
+        CpuSet::Alias(a) => format!("alias \"{a}\""),
+        CpuSet::Explicit(s) => format!("\"{s}\""),
     }
 }
 
@@ -261,7 +280,7 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
         // keeps its affinity and the rejection is only counted. Say it at
         // load, where the corpus author sees it (round-3 ivy-17).
         match policy.cpuset.as_ref() {
-            Some(CpuSet::Alias(alias)) if parse::cpuset_alias_unusable(alias) => {
+            Some(CpuSet::Alias(alias)) if aranicy_model::cpuset_alias_unusable(alias) => {
                 resolve_warnings.push(LoadWarning {
                     file: draft.file.clone(),
                     line: draft.line,
@@ -283,7 +302,25 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
                     });
                 }
             }
-            _ => {}
+            // Everything else (a known alias, a well-formed list) can only be
+            // judged against this host's topology — the caller's resolver is
+            // the only thing that knows whether it resolves here.
+            Some(cs) => {
+                if let Some(check) = opts.cpuset_check {
+                    if let Err(e) = check(cs) {
+                        resolve_warnings.push(LoadWarning {
+                            file: draft.file.clone(),
+                            line: draft.line,
+                            message: format!(
+                                "cpuset {} cannot be resolved on this host ({e}); this \
+                                 rule's cpuset will be rejected at apply time",
+                                cpuset_label(cs)
+                            ),
+                        });
+                    }
+                }
+            }
+            None => {}
         }
         if let Some(name) = &draft.name {
             // Duplicate exact names: later load replaces outright. That is
