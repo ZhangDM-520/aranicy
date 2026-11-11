@@ -394,3 +394,23 @@ fn a_rules_directory_file_that_is_never_read_is_reported_not_ignored() {
     assert_eq!(skipped, vec!["60-b.json", "70-c.rules.bak"], "{skipped:?}");
     assert_eq!(rs.exact.len(), 1, "only the .rules file is loaded");
 }
+
+#[test]
+fn duplicate_names_and_undefined_cgroups_are_reported() {
+    let f = Fixture::new("dup-cgroup");
+    f.write(
+        "10-a.rules",
+        "{\"name\": \"zz\", \"nice\": 15}\n\
+         {\"name\": \"cgrule\", \"cgroup\": \"nope\"}\n",
+    );
+    f.write("90-z.rules", "{\"name\": \"zz\", \"nice\": 2}\n");
+    let rs = f.load_default();
+    let m = messages(&rs);
+    assert!(
+        m.iter().any(|x| x.contains("duplicate name \"zz\"")),
+        "{m:?}"
+    );
+    assert!(m.iter().any(|x| x.contains("unknown cgroup \"nope\"")), "{m:?}");
+    // Parity is unchanged: the later definition still wins.
+    assert_eq!(rs.lookup("zz").unwrap().0.nice, Some(2));
+}

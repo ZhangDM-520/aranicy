@@ -242,9 +242,35 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
             },
         };
         let policy = Arc::new(parse::PartialPolicy::merge(&base, &draft.partial));
+        // A rule naming a cgroup nobody defined is a silent no-op at apply
+        // time (the assignment fails and is counted, not logged): say it at
+        // load, where a corpus author will see it.
+        if let Some(cg) = policy.cgroup.as_deref() {
+            if !out.cgroups.contains_key(cg) {
+                resolve_warnings.push(LoadWarning {
+                    file: draft.file.clone(),
+                    line: draft.line,
+                    message: format!(
+                        "unknown cgroup {:?} referenced; the assignment will fail at apply time",
+                        cg
+                    ),
+                });
+            }
+        }
         if let Some(name) = &draft.name {
-            // Duplicate exact names: later load replaces outright.
-            out.exact.insert(name.clone(), policy.clone());
+            // Duplicate exact names: later load replaces outright. That is
+            // ananicy-cpp parity, but silence is not: a corpus that grew a
+            // second definition of the same name is a thing to be told.
+            if out.exact.insert(name.clone(), policy.clone()).is_some() {
+                resolve_warnings.push(LoadWarning {
+                    file: draft.file.clone(),
+                    line: draft.line,
+                    message: format!(
+                        "duplicate name {:?}; this definition replaces the earlier one",
+                        name
+                    ),
+                });
+            }
         }
         if let (Some(pattern), Some(re)) = (&draft.pattern, &draft.regex) {
             // Both exact and regex registration when the rule has both keys.

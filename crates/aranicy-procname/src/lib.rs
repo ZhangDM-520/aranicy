@@ -248,7 +248,10 @@ impl ProcResolver {
         }
         let n = comm.len().min(NAME_CAP);
         buf[..n].copy_from_slice(&comm[..n]);
-        compact_basename(buf, n)
+        // Comm is already a task name, and a kernel thread's comm contains a
+        // `/` (`kworker/0:1-events`); running basename over it would report a
+        // name the task does not have.
+        n
     }
 }
 
@@ -545,6 +548,15 @@ mod tests {
             b"sleep",
             "identity must be the executed file, not the string argv[0] chose"
         );
+    }
+
+    #[test]
+    fn a_comm_with_a_slash_keeps_it() {
+        // Kernel threads: `kworker/0:1-events`. Basename must not run on the
+        // comm fallback, or the reported name is one the task does not have.
+        let mut buf = [0u8; NAME_CAP];
+        let n = derive_name(u32::MAX - 1, b"kworker/0:1-events", &mut buf);
+        assert_eq!(&buf[..n], b"kworker/0:1-events");
     }
 
     #[test]

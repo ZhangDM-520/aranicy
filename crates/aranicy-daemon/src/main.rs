@@ -117,6 +117,15 @@ fn lint(paths: &paths::Paths) -> anyhow::Result<()> {
         eprintln!("warning: {}:{}: {}", w.file.display(), w.line, w.message);
         warned = true;
     }
+    // A green lint over an empty corpus is the worst answer this command can
+    // give: it is the state every fresh install starts in.
+    if cfg.rule_load && load::rule_count(&rules) == 0 {
+        eprintln!(
+            "warning: 0 rules loaded from {}: this corpus will apply nothing",
+            paths.config_dir.display()
+        );
+        warned = true;
+    }
     if warned {
         eprintln!("lint: warnings found");
         std::process::exit(1);
@@ -133,7 +142,15 @@ fn lint(paths: &paths::Paths) -> anyhow::Result<()> {
 /// Dry-run matcher: never applies anything, no root required.
 fn match_test(name: &str, paths: &paths::Paths) -> anyhow::Result<()> {
     let (_cfg, rules) = load::load_all(paths)?;
-    let name = procname::normalize_cli_name(name);
+    // Look the argument up as given first: a rule may legitimately name a task
+    // whose comm contains a slash (`kworker/0:1-events`), and stripping to the
+    // basename would report a name the task does not have. Path arguments
+    // (`/usr/bin/foo`) still work through the basename fallback.
+    let name = if rules.lookup(name).is_some() {
+        name
+    } else {
+        procname::normalize_cli_name(name)
+    };
     match rules.lookup(name) {
         Some((policy, kind)) => {
             let kind = match kind {

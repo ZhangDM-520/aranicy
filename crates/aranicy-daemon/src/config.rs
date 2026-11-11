@@ -195,6 +195,7 @@ config_key_table! {
 /// `comm` is capped at 15 bytes, hence the prefix rule and the short entries.
 pub const DEFAULT_BIAS_PROTECT: &[&str] = &[
     "systemd",
+    "aranicy",
     "dbus-broker",
     "dbus-daemon",
     "sshd",

@@ -135,8 +135,19 @@ fn eff_nice_for(rule_nice: Option<i8>, target: i8, applied: Option<i8>) -> Optio
 /// PID 1 is handled above (it is never a target at all); this is the name
 /// axis: [`Config::bias_protect`], matched as a comm prefix because `comm` is
 /// capped at 15 bytes.
-fn bias_may_apply(cfg: &Config, comm: &str) -> bool {
-    !cfg.bias_protect.iter().any(|p| comm.starts_with(p.as_str()))
+fn bias_may_apply(cfg: &Config, name: &str, comm: &str, pid: u32) -> bool {
+    // The daemon's own process is where the policy is executed, not where it
+    // is applied: biasing it fights the unit's `Nice=` (measured: the unit's
+    // -5 became +3 under load) and there is no way to notice from outside.
+    if pid == std::process::id() {
+        return false;
+    }
+    // Both identities, because rules match the executable while the history
+    // is keyed by comm: a protected name reached through a differently named
+    // entry point must still be protected.
+    !cfg.bias_protect
+        .iter()
+        .any(|p| name.starts_with(p.as_str()) || comm.starts_with(p.as_str()))
 }
 
 /// Decide for one process seen at `pid`.
@@ -190,7 +201,7 @@ pub fn plan<'a>(
     // rule still applies to them — the operator asked for that by name.
     let (target, applied) = if !cfg.bias_enable {
         (base, None)
-    } else if bias_may_apply(cfg, comm) {
+    } else if bias_may_apply(cfg, name, comm, pid) {
         (bias.target_nice(comm, base), bias.applied_nice(comm))
     } else {
         // No new bias, but a claim recorded before this name was protected
@@ -759,6 +770,50 @@ mod tests {
         assert_eq!(fork(rules_with("init", Some(19)), "init"), (Some(0), 0));
         // Nor is a rule that raises priority.
         assert_eq!(fork(rules_with("init", Some(-20)), "init"), (Some(0), 0));
+    }
+
+    #[test]
+    fn the_daemon_never_biases_its_own_process() {
+        let rules = RuleSet::empty();
+        let engine = Mutex::new(engine_with("aranicy", 3));
+        let cfg = Config::default();
+
+        let plan = plan_locked(
+            b"aranicy",
+            b"aranicy",
+            std::process::id(),
+            &rules,
+            &engine,
+            &cfg,
+        );
+        assert_eq!(
+            plan,
+            Plan::Skip {
+                reason: Skip::NoRule
+            },
+            "the unit's Nice= must survive: the daemon is not its own workload"
+        );
+    }
+
+    #[test]
+    fn protection_follows_the_protected_name_not_only_the_comm() {
+        let rules = RuleSet::empty();
+        // The history is keyed by the launcher's comm; the rule identity is
+        // the game's executable. Protection must cover both.
+        let engine = Mutex::new(engine_with("launcher", 3));
+        let cfg = Config {
+            bias_protect: vec!["game".into()],
+            ..Config::default()
+        };
+
+        let plan = plan_locked(b"game", b"launcher", 4242, &rules, &engine, &cfg);
+        assert_eq!(
+            plan,
+            Plan::Skip {
+                reason: Skip::NoRule
+            },
+            "a renaming entry point must not smuggle the bias past the list"
+        );
     }
 
     #[test]

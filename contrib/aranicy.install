@@ -13,4 +13,9 @@ pre_remove() {
 
 post_remove() {
     systemctl --quiet daemon-reload 2>/dev/null || true
+    # The learned history is derived state, not configuration: leaving it
+    # behind means a later reinstall resurrects biases for a machine that has
+    # since changed (and the nice values they were applied to are gone).
+    rm -f /var/lib/aranicy/bias-state 2>/dev/null || true
+    rmdir /var/lib/aranicy 2>/dev/null || true
 }

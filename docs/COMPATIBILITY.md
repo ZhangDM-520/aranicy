@@ -38,7 +38,8 @@ ananicy-cpp parity); CRLF tolerated. Bad lines warn and are skipped.
 | `autogroup` | int | **superset**: writes the process autogroup nice (ananicy-cpp only reports) |
 
 Cgroup definitions: `{"cgroup": name, "CPUQuota": N}` — N = percent of *all*
-CPUs (v2 `cpu.max`, period 1 s). Duplicates: later-loaded `name` replaces
+CPUs (v2 `cpu.max`, period fixed at the kernel's 100 ms, i.e. quota =
+`N/100 × ncpu × 100000` us). Duplicates: later-loaded `name` replaces
 outright. Load order: sorted file paths (deterministic superset over
 ananicy-cpp's OS order).
 

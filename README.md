@@ -13,8 +13,12 @@ with algorithmic amplifiers waiting at higher rates — see
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)). The measured Rust candidate
 (`JohnRTitor/ananicy-rs`) is worse on this kernel: its netlink build spins a
 full core at idle and its eBPF path never delivers events. aranicy is a
-clean-room rewrite with a hard performance budget: **≤ 5% of one core at
-2 000 execs/s**.
+clean-room rewrite with a hard performance budget for **what the package
+installs — the daemon *and* its collector**: measured **12.3% of one core at
+2 000 execs/s** (6.1 + 6.2) on the benchmark host, against ananicy-cpp's
+13.7% for one process. The 2.28% and 24.4 k instructions-per-exec figures in
+BENCHMARKS.md describe the retired single-process architecture and are kept
+for comparison only.
 
 ## Design in one paragraph
 

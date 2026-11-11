@@ -72,8 +72,11 @@ package_aranicy() {
     # The README makes compatibility and performance claims; the documents
     # that substantiate them have to travel with it, or a packaged user has
     # three dead links and no way to check anything.
-    install -Dm644 docs/COMPATIBILITY.md "$pkgdir/usr/share/doc/aranicy/COMPATIBILITY.md"
-    install -Dm644 docs/BENCHMARKS.md "$pkgdir/usr/share/doc/aranicy/BENCHMARKS.md"
+    # Under docs/ so the README's relative links (docs/…) still resolve in the
+    # installed tree - the first packaged build shipped them as siblings and
+    # every link stayed dead.
+    install -Dm644 docs/COMPATIBILITY.md "$pkgdir/usr/share/doc/aranicy/docs/COMPATIBILITY.md"
+    install -Dm644 docs/BENCHMARKS.md "$pkgdir/usr/share/doc/aranicy/docs/BENCHMARKS.md"
 }
 
 package_aranicy-collector() {
