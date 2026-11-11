@@ -123,15 +123,42 @@ pub fn types_json(rs: &RuleSet) -> Value {
     Value::Object(map)
 }
 
-/// `{ "<cgroup>": {"cpu_quota_pct": N|null}, ... }`.
+/// `{ "<cgroup>": {"cpu_quota_pct": N|null, "cpu_max": "…"|null,
+/// "cpu_quota_applied": bool|null}, ... }`.
+///
+/// `cpu_quota_pct` is the corpus declaration; `cpu_max` is read from the live
+/// cgroup2 mount. They are different facts and they diverge — after a boot
+/// that starts the daemon before the `cpu` controller is enabled the quota is
+/// declared, missing, and this dump used to report only the declaration
+/// (round-3 ren-13). `cpu_quota_applied` compares the two; `null` means no
+/// quota is declared.
 pub fn cgroups_json(rs: &RuleSet) -> Value {
+    let mount = aranicy_apply::cgroup2_mount().ok();
+    cgroups_json_at(rs, mount.as_deref())
+}
+
+fn cgroups_json_at(rs: &RuleSet, mount: Option<&std::path::Path>) -> Value {
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let map: Map<String, Value> = rs
         .cgroups
         .iter()
         .map(|(name, def)| {
+            let live = mount
+                .map(|m| m.join(name.as_ref()).join("cpu.max"))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string());
+            let applied = def.cpu_quota_pct.map(|pct| {
+                live.as_deref() == Some(aranicy_apply::expected_cpu_max(pct, ncpu).as_str())
+            });
             (
                 name.to_string(),
-                json!({ "cpu_quota_pct": def.cpu_quota_pct }),
+                json!({
+                    "cpu_quota_pct": def.cpu_quota_pct,
+                    "cpu_max": live,
+                    "cpu_quota_applied": applied,
+                }),
             )
         })
         .collect();
@@ -345,8 +372,36 @@ mod tests {
 
     #[test]
     fn cgroups_dump_shape_for_synthetic_ruleset() {
-        let v = cgroups_json(&synthetic_ruleset());
+        let v = cgroups_json_at(&synthetic_ruleset(), None);
         assert_eq!(v["games"]["cpu_quota_pct"], json!(50));
+        assert_eq!(v["games"]["cpu_max"], Value::Null);
+        assert_eq!(v["games"]["cpu_quota_applied"], json!(false));
+    }
+
+    /// The dump must not claim a quota the cgroup does not have: after the
+    /// boot race the declaration is 50% while `cpu.max` is still `max`.
+    #[test]
+    fn cgroups_dump_reports_the_live_quota_not_the_declaration() {
+        let mount = scratch_dir("cgroups_live");
+        let cg = mount.join("games");
+        std::fs::create_dir_all(&cg).expect("cgroup dir");
+        let ncpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        std::fs::write(cg.join("cpu.max"), "max 100000").expect("write cpu.max");
+        let v = cgroups_json_at(&synthetic_ruleset(), Some(&mount));
+        assert_eq!(v["games"]["cpu_max"], json!("max 100000"));
+        assert_eq!(
+            v["games"]["cpu_quota_applied"],
+            json!(false),
+            "declared but not applied"
+        );
+
+        std::fs::write(cg.join("cpu.max"), aranicy_apply::expected_cpu_max(50, ncpu))
+            .expect("write cpu.max");
+        let v = cgroups_json_at(&synthetic_ruleset(), Some(&mount));
+        assert_eq!(v["games"]["cpu_quota_applied"], json!(true));
+        let _ = std::fs::remove_dir_all(&mount);
     }
 
     #[test]

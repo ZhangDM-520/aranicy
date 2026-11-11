@@ -43,6 +43,20 @@ CPUs (v2 `cpu.max`, period fixed at the kernel's 100 ms, i.e. quota =
 outright. Load order: sorted file paths (deterministic superset over
 ananicy-cpp's OS order).
 
+The cgroup directory is created at start and the quota is written to
+`cpu.max`. If that write cannot land — an early-boot start runs before the
+kernel offers `cpu.max` in a cgroup whose parent has not enabled the `cpu`
+controller, and cgroupfs answers **EACCES**, not ENOENT — the directory is
+kept, processes still move into it, and the write is retried every 5 s until
+it succeeds (`CPUQuota applied after retry` in the journal). A definition that
+cannot be created is a warning naming that definition; it no longer costs the
+others their cgroup. `aranicy dump cgroups` reports the declaration **and**
+the live value, so a lost quota is visible instead of implied:
+
+```json
+{"games": {"cpu_quota_pct": 50, "cpu_max": "max 100000", "cpu_quota_applied": false}}
+```
+
 ## Matching and apply
 
 1. Exact `name` lookup (case-sensitive) wins outright.

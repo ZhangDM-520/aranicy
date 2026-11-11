@@ -31,6 +31,7 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// Which policy dimensions are enabled (ananicy.conf `apply_*` gates).
 #[derive(Debug, Clone, Copy)]
@@ -626,55 +627,161 @@ fn unescape_mount_field(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The cgroup2 mount (`/proc/self/mounts` lookup), for read-only callers such
+/// as `dump cgroups`, which runs as its own process and has no manager.
+pub fn cgroup2_mount() -> io::Result<PathBuf> {
+    find_cgroup2_mount()
+}
+
+/// `cpu.max` as `CPUQuota` should leave it (`"<quota> 100000"`), for compare
+/// against the live file. Public so `dump` renders the same number the daemon
+/// would write instead of re-deriving the formula.
+pub fn expected_cpu_max(pct: u8, ncpu: usize) -> String {
+    format!("{} 100000", cpu_quota_micros(pct, ncpu))
+}
+
+fn write_quota(dir: &Path, pct: u8, ncpu: usize) -> io::Result<()> {
+    let micros = cpu_quota_micros(pct, ncpu);
+    let mut val = StackPath::new();
+    if !format_cpu_max(micros, &mut val) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cpu.max value overflow",
+        ));
+    }
+    fs::write(dir.join("cpu.max"), val.as_bytes())
+}
+
+/// One retry pass over quota writes that did not land.
+#[derive(Debug, Default)]
+pub struct PendingQuota {
+    /// `(cgroup, pct)` writes that landed this pass.
+    pub applied: Vec<(String, u8)>,
+    /// Names still not writable, with the last error.
+    pub failing: Vec<(String, String)>,
+}
+
 /// cgroup v2 manager. Path convention (ananicy-cpp parity):
 /// `<cgroup2-mount>/<name>`; membership write goes to `cgroup.procs`, quota to
 /// `cpu.max` (`"<max> 100000"` with quota = pct × ncpu × 1s / 100).
 pub struct CgroupManager {
     pub mount: PathBuf,
     pub created: BTreeMap<String, CgroupDef>,
+    /// Quotas whose `cpu.max` write did not land yet. cgroupfs answers
+    /// **EACCES** (not ENOENT) when a controller file does not exist in the
+    /// cgroup, which is what an early-boot start sees before the `cpu`
+    /// controller is enabled at the cgroup root; the write is retried by
+    /// [`Self::apply_pending`], never dropped (measured: round-3 ren-13 —
+    /// `cpu.max` stayed `max 100000` until a manual reload).
+    pending_quota: Mutex<BTreeMap<String, u8>>,
+    ncpu: usize,
 }
 
 impl CgroupManager {
     /// Probe the cgroup v2 mount; create the definitions from `*.cgroups`.
     ///
     /// Each map key is the cgroup name (the `CgroupDef.name` mirror is only
-    /// data). Names are rejected when empty or containing path separators —
-    /// an empty name would put `cpu.max` on the root cgroup. `cpu.max` is
-    /// written only for defs with a quota; `available_parallelism` supplies
-    /// ncpu. `AlreadyExists` is tolerated (re-init is idempotent).
-    pub fn init(defs: BTreeMap<String, CgroupDef>) -> io::Result<Self> {
+    /// data). `cpu.max` is written only for defs with a quota;
+    /// `available_parallelism` supplies ncpu. `AlreadyExists` is tolerated
+    /// (re-init is idempotent).
+    pub fn init(defs: BTreeMap<String, CgroupDef>) -> io::Result<(Self, Vec<String>)> {
         let mount = find_cgroup2_mount()?;
+        Ok(Self::init_at(&mount, defs))
+    }
+
+    /// Degenerate manager for a host without a cgroup2 mount: assignments fail
+    /// cleanly, nothing is reported as created.
+    pub fn unavailable() -> Self {
+        Self {
+            mount: PathBuf::from("/dev/null"),
+            created: BTreeMap::new(),
+            pending_quota: Mutex::new(BTreeMap::new()),
+            ncpu: 1,
+        }
+    }
+
+    /// Create `defs` under `mount`. The mount probe is split out so tests can
+    /// use a scratch directory. A definition that cannot be created is a
+    /// warning, never a failure of the batch: one bad name must not cost the
+    /// others their cgroup.
+    ///
+    /// A quota write that cannot land is *not* a creation failure either — the
+    /// directory exists and processes can move into it — so it is recorded as
+    /// pending and retried.
+    pub fn init_at(mount: &Path, defs: BTreeMap<String, CgroupDef>) -> (Self, Vec<String>) {
         let ncpu = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let mut created = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let mut pending = BTreeMap::new();
         for (name, def) in defs {
             if !valid_cgroup_name(&name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid cgroup name (empty, '.'/'..' or path separator)",
+                warnings.push(format!(
+                    "cgroup {name:?}: invalid name (empty, '.'/'..' or path separator)"
                 ));
+                continue;
             }
             let dir = mount.join(&name);
             match fs::create_dir(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    warnings.push(format!("cgroup {name:?} not created: {e}"));
+                    continue;
+                }
             }
             if let Some(pct) = def.cpu_quota_pct {
-                let micros = cpu_quota_micros(pct, ncpu);
-                let mut val = StackPath::new();
-                if !format_cpu_max(micros, &mut val) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "cpu.max value overflow",
+                if let Err(e) = write_quota(&dir, pct, ncpu) {
+                    warnings.push(format!(
+                        "cgroup {name:?}: CPUQuota {pct}% not applied yet: {e} (retrying)"
                     ));
+                    pending.insert(name.clone(), pct);
                 }
-                fs::write(dir.join("cpu.max"), val.as_bytes())?;
             }
             created.insert(name, def);
         }
-        Ok(Self { mount, created })
+        (
+            Self {
+                mount: mount.to_path_buf(),
+                created,
+                pending_quota: Mutex::new(pending),
+                ncpu,
+            },
+            warnings,
+        )
+    }
+
+    /// Number of quota writes still owed (0 when everything landed).
+    pub fn pending(&self) -> usize {
+        self.pending_quota
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Retry every quota write that did not land. Idempotent and cheap; the
+    /// daemon runs it on a short cadence until the set drains.
+    pub fn apply_pending(&self) -> PendingQuota {
+        let mut guard = self
+            .pending_quota
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut out = PendingQuota::default();
+        let mut done = Vec::new();
+        for (name, pct) in guard.iter() {
+            match write_quota(&self.mount.join(name), *pct, self.ncpu) {
+                Ok(()) => {
+                    out.applied.push((name.clone(), *pct));
+                    done.push(name.clone());
+                }
+                Err(e) => out.failing.push((name.clone(), e.to_string())),
+            }
+        }
+        for name in done {
+            guard.remove(&name);
+        }
+        out
     }
 
     /// Move `pid` into `name` ("" = root cgroup).
@@ -1177,6 +1284,100 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    fn scratch_dir(tag: &str) -> PathBuf {
+        // Tests must not touch /tmp; use the package-local target/ tree.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("apply_test_{}_{}", std::process::id(), tag));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn one_cgroup(name: &str, pct: Option<u8>) -> BTreeMap<String, CgroupDef> {
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            name.to_string(),
+            CgroupDef {
+                name: name.into(),
+                cpu_quota_pct: pct,
+            },
+        );
+        defs
+    }
+
+    #[test]
+    fn a_quota_that_cannot_land_is_pending_not_a_creation_failure() {
+        // The boot shape: the directory is creatable, `cpu.max` is not (in the
+        // kernel that is EACCES for a controller file that does not exist yet;
+        // here a directory of that name gives the same "write fails" shape).
+        let mount = scratch_dir("pending_quota");
+        let dir = mount.join("cg");
+        fs::create_dir(&dir).expect("cgroup dir");
+        fs::create_dir(dir.join("cpu.max")).expect("block the quota file");
+
+        let (manager, warnings) = CgroupManager::init_at(&mount, one_cgroup("cg", Some(50)));
+        assert!(manager.created.contains_key("cg"), "directory exists");
+        assert_eq!(manager.pending(), 1, "the quota is owed");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("CPUQuota") && warnings[0].contains("retrying"),
+            "quota failure must say so, not claim the cgroup was not created: {}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].contains("not created"),
+            "the directory was created: {}",
+            warnings[0]
+        );
+
+        // Still blocked: the pass reports, keeps the debt, and stays usable.
+        let out = manager.apply_pending();
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failing.len(), 1);
+        assert_eq!(manager.pending(), 1);
+
+        // Controller available now (what a later reload sees).
+        fs::remove_dir(dir.join("cpu.max")).expect("unblock");
+        let out = manager.apply_pending();
+        assert_eq!(out.applied, vec![("cg".to_string(), 50)]);
+        assert!(out.failing.is_empty());
+        assert_eq!(manager.pending(), 0);
+        let written = fs::read_to_string(dir.join("cpu.max")).expect("cpu.max");
+        let ncpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(written, format!("{} 100000", 50 * ncpu * 1000));
+        let _ = fs::remove_dir_all(&mount);
+    }
+
+    #[test]
+    fn one_bad_cgroup_name_does_not_sink_the_batch() {
+        let mount = scratch_dir("bad_name");
+        let mut defs = one_cgroup("good", Some(10));
+        defs.insert(
+            "../evil".to_string(),
+            CgroupDef {
+                name: "../evil".into(),
+                cpu_quota_pct: None,
+            },
+        );
+        defs.insert(
+            "also-good".to_string(),
+            CgroupDef {
+                name: "also-good".into(),
+                cpu_quota_pct: None,
+            },
+        );
+        let (manager, warnings) = CgroupManager::init_at(&mount, defs);
+        assert_eq!(manager.created.len(), 2, "{:?}", manager.created.keys());
+        assert_eq!(manager.pending(), 0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("invalid name"), "{warnings:?}");
+        assert!(!mount.join("../evil").exists());
+        let _ = fs::remove_dir_all(&mount);
+    }
+
     #[test]
     fn parse_cpu_list_ranges_to_bits() {
         // "0-3,8-11" -> bits 0..3 and 8..11 = 0x0f0f
@@ -1353,7 +1554,8 @@ mod tests {
             ..Default::default()
         };
         let caps = probe_capabilities();
-        let cgroups = CgroupManager::init(BTreeMap::new()).expect("cgroup2 mount");
+        let (cgroups, _warnings) =
+            CgroupManager::init(BTreeMap::new()).expect("cgroup2 mount");
         let report = apply_policy(pid, &policy, &ApplyOptions::default(), &caps, &cgroups);
 
         assert_eq!(report.nice, ActionOutcome::Applied, "nice outcome");
@@ -1386,7 +1588,8 @@ mod tests {
             ..Default::default()
         };
         let caps = probe_capabilities();
-        let cgroups = CgroupManager::init(BTreeMap::new()).expect("cgroup2 mount");
+        let (cgroups, _warnings) =
+            CgroupManager::init(BTreeMap::new()).expect("cgroup2 mount");
         let report = apply_policy(pid, &policy, &ApplyOptions::default(), &caps, &cgroups);
 
         assert_eq!(report.oom_score_adj, ActionOutcome::Applied, "oom outcome");

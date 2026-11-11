@@ -80,6 +80,11 @@ impl Shared {
         let _guard = self.drift_m.lock().unwrap_or_else(PoisonError::into_inner);
         self.drift_cv.notify_all();
     }
+    /// Wake the drift loop without shutting it down (reload swapped state).
+    fn nudge(&self) {
+        let _guard = self.drift_m.lock().unwrap_or_else(PoisonError::into_inner);
+        self.drift_cv.notify_all();
+    }
 }
 
 /// Run the daemon (root only). Returns `Err` for startup failures.
@@ -382,35 +387,17 @@ fn init_cgroups(defs: &BTreeMap<Arc<str>, CgroupDef>) -> (CgroupManager, Vec<Str
         .iter()
         .map(|(name, def)| (name.to_string(), def.clone()))
         .collect();
-    match CgroupManager::init(defs.clone()) {
-        Ok(manager) => (manager, Vec::new()),
-        Err(whole) => {
-            // Isolate the failing definition(s): each one gets its own init.
-            let mut warnings = Vec::new();
-            let mut ok = BTreeMap::new();
-            for (name, def) in defs {
-                let mut one = BTreeMap::new();
-                one.insert(name.clone(), def.clone());
-                match CgroupManager::init(one) {
-                    Ok(_) => {
-                        ok.insert(name, def);
-                    }
-                    Err(e) => warnings.push(format!("cgroup {name:?} not created: {e}")),
-                }
-            }
-            if warnings.is_empty() {
-                warnings.push(format!("batch cgroup creation failed: {whole}"));
-            }
-            let manager = CgroupManager::init(ok).unwrap_or_else(|e| {
-                warnings.push(format!("cgroup manager unavailable: {e}"));
-                // Degenerate mount point: assigns fail cleanly as errors.
-                CgroupManager {
-                    mount: std::path::PathBuf::from("/dev/null"),
-                    created: BTreeMap::new(),
-                }
-            });
-            (manager, warnings)
-        }
+    // Per-definition failures (bad name, uncreatable dir, quota that cannot be
+    // written yet) are warnings from inside the manager; only a missing
+    // cgroup2 mount is fatal here.
+    match CgroupManager::init(defs) {
+        Ok(pair) => pair,
+        Err(e) => (
+            CgroupManager::unavailable(),
+            vec![format!(
+                "cgroup manager unavailable: {e}; cgroup actions will fail"
+            )],
+        ),
     }
 }
 
@@ -493,6 +480,9 @@ fn reload(shared: &Arc<Shared>, paths: &Paths) {
             *shared.config.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(cfg);
             *shared.rules.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rules);
             *shared.cgroups.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(cgroups);
+            // A freshly built manager may owe quota writes; the drift loop is
+            // where they are retried, so let it out of an unbounded wait.
+            shared.nudge();
             tracing::info!("reloaded {n} rules; bias reconfigured");
             if groups_changed {
                 tracing::info!(
@@ -621,20 +611,27 @@ fn maybe_summary(shared: &Shared, source: &EventClient, state: &mut SummaryState
 // ---------------------------------------------------------------------------
 
 fn drift_loop(shared: &Shared) {
+    let mut retry = CgroupRetry::new();
     loop {
+        // Owed quota writes first: on a boot start the cgroup exists before
+        // the kernel offers `cpu.max`, and nothing else would ever write it.
+        retry.run(shared);
         let freq = shared.config().check_freq;
+        let pending = shared.cgroups().pending() > 0;
         let mut guard = shared.drift_m.lock().unwrap_or_else(PoisonError::into_inner);
-        if freq == 0 {
+        if freq == 0 && !pending {
             guard = shared
                 .drift_cv
                 .wait_while(guard, |_| !shared.shutdown.load(Ordering::Acquire))
                 .unwrap_or_else(PoisonError::into_inner);
         } else {
+            // A pending quota shortens the wait: the retry is what resolves it.
+            let secs = if pending { CGROUP_RETRY_SECS } else { freq };
             let (g, _timeout) = shared
                 .drift_cv
                 .wait_timeout_while(
                     guard,
-                    Duration::from_secs(freq),
+                    Duration::from_secs(secs),
                     |_| !shared.shutdown.load(Ordering::Acquire),
                 )
                 .unwrap_or_else(PoisonError::into_inner);
@@ -646,6 +643,52 @@ fn drift_loop(shared: &Shared) {
         }
         if freq > 0 {
             drift_scan(shared);
+        }
+    }
+}
+
+/// How often a quota write that did not land is retried. Short on purpose: the
+/// boot race it exists for resolves as soon as the `cpu` controller is enabled
+/// at the cgroup root, and a missing quota is a CPU-budget bug, not cosmetics.
+const CGROUP_RETRY_SECS: u64 = 5;
+/// An unresolved quota must not spam the journal on every retry.
+const CGROUP_WARN_SECS: u64 = 600;
+
+struct CgroupRetry {
+    last_warn: Option<Instant>,
+}
+
+impl CgroupRetry {
+    fn new() -> Self {
+        Self { last_warn: None }
+    }
+
+    /// Retry owed `cpu.max` writes; a no-op once the set has drained.
+    fn run(&mut self, shared: &Shared) {
+        let cgroups = shared.cgroups();
+        if cgroups.pending() == 0 {
+            return;
+        }
+        let out = cgroups.apply_pending();
+        for (name, pct) in &out.applied {
+            tracing::info!(cgroup = %name, pct, "CPUQuota applied after retry");
+        }
+        if out.failing.is_empty() {
+            return;
+        }
+        let due = self
+            .last_warn
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(CGROUP_WARN_SECS));
+        if due {
+            self.last_warn = Some(Instant::now());
+            let names: Vec<&str> = out.failing.iter().map(|(n, _)| n.as_str()).collect();
+            let (_, err) = &out.failing[0];
+            tracing::warn!(
+                cgroups = ?names,
+                error = %err,
+                retry_secs = CGROUP_RETRY_SECS,
+                "CPUQuota still not applied; will retry"
+            );
         }
     }
 }
