@@ -23,7 +23,7 @@
 //!   was per-event recompilation in ananicy-cpp).
 //! * `cmdlines` (Python-fork legacy) is accepted and ignored (lint note).
 
-use aranicy_model::{CgroupDef, Policy};
+use aranicy_model::{CgroupDef, CpuSet, Policy};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -256,6 +256,34 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
                     ),
                 });
             }
+        }
+        // A cpuset that cannot resolve is dropped at apply time: the process
+        // keeps its affinity and the rejection is only counted. Say it at
+        // load, where the corpus author sees it (round-3 ivy-17).
+        match policy.cpuset.as_ref() {
+            Some(CpuSet::Alias(alias)) if parse::cpuset_alias_unusable(alias) => {
+                resolve_warnings.push(LoadWarning {
+                    file: draft.file.clone(),
+                    line: draft.line,
+                    message: format!(
+                        "cpuset alias \"{alias}\" is not usable on any host; this rule's \
+                         cpuset will be rejected at apply time"
+                    ),
+                });
+            }
+            Some(CpuSet::Explicit(list)) => {
+                if let Err(e) = aranicy_model::parse_cpu_list(list) {
+                    resolve_warnings.push(LoadWarning {
+                        file: draft.file.clone(),
+                        line: draft.line,
+                        message: format!(
+                            "invalid cpuset \"{list}\" ({e}); this rule's cpuset will be \
+                             rejected at apply time"
+                        ),
+                    });
+                }
+            }
+            _ => {}
         }
         if let Some(name) = &draft.name {
             // Duplicate exact names: later load replaces outright. That is

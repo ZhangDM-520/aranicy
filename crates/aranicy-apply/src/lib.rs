@@ -24,7 +24,9 @@
 //! ([`StackPath`]). Alias cpuset resolution reads sysfs and may allocate (it
 //! is expected to be cached daemon-side across events).
 
-use aranicy_model::{CgroupDef, CpuSet, IoClass, Policy, SchedPolicy};
+use aranicy_model::{
+    parse_cpu_list, set_cpu, CgroupDef, CpuSet, IoClass, Policy, SchedPolicy, MAX_CPUS,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -811,67 +813,6 @@ impl CgroupManager {
 // cpuset parsing and alias resolution
 // ---------------------------------------------------------------------------
 
-/// CPU mask: bit `cpu % 64` of word `cpu / 64` (cpu_set_t layout). CPU
-/// indices are limited to 0..=1023 (glibc CPU_SETSIZE).
-const MAX_CPUS: usize = 1024;
-
-fn set_cpu(mask: &mut Vec<u64>, cpu: usize) {
-    let word = cpu / 64;
-    if mask.len() <= word {
-        mask.resize(word + 1, 0);
-    }
-    mask[word] |= 1 << (cpu % 64);
-}
-
-/// Parse `"0-3,8-11"` / `"0,2,4"` into a cpu_set_t-layout mask. Empty items
-/// (trailing/double commas) are tolerated; anything else must be `N` or
-/// `A-B` with A ≤ B < 1024.
-fn parse_cpu_list(s: &str) -> Result<Vec<u64>, String> {
-    let mut mask = Vec::new();
-    let mut seen = false;
-    for item in s.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        seen = true;
-        match item.split_once('-') {
-            Some((lo, hi)) => {
-                let lo: usize = lo
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("invalid cpu range '{item}'"))?;
-                let hi: usize = hi
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("invalid cpu range '{item}'"))?;
-                if lo > hi {
-                    return Err(format!("invalid cpu range '{item}': start above end"));
-                }
-                if hi >= MAX_CPUS {
-                    return Err(format!("cpu index {hi} out of range 0..={}", MAX_CPUS - 1));
-                }
-                for cpu in lo..=hi {
-                    set_cpu(&mut mask, cpu);
-                }
-            }
-            None => {
-                let cpu: usize = item
-                    .parse()
-                    .map_err(|_| format!("invalid cpu index '{item}'"))?;
-                if cpu >= MAX_CPUS {
-                    return Err(format!("cpu index {cpu} out of range 0..={}", MAX_CPUS - 1));
-                }
-                set_cpu(&mut mask, cpu);
-            }
-        }
-    }
-    if !seen {
-        return Err("empty cpu list".to_string());
-    }
-    Ok(mask)
-}
-
 fn read_cpu_list_file(path: &Path, what: &str) -> Result<Vec<u64>, String> {
     let data = fs::read_to_string(path)
         .map_err(|e| format!("{what}: cannot read {}: {e}", path.display()))?;
@@ -1376,30 +1317,6 @@ mod tests {
         assert!(warnings[0].contains("invalid name"), "{warnings:?}");
         assert!(!mount.join("../evil").exists());
         let _ = fs::remove_dir_all(&mount);
-    }
-
-    #[test]
-    fn parse_cpu_list_ranges_to_bits() {
-        // "0-3,8-11" -> bits 0..3 and 8..11 = 0x0f0f
-        assert_eq!(parse_cpu_list("0-3,8-11").unwrap(), vec![0x0f0f]);
-        assert_eq!(parse_cpu_list("0,2,4").unwrap(), vec![0x15]);
-        // Words beyond the first follow cpu_set_t layout.
-        assert_eq!(parse_cpu_list("64-65").unwrap(), vec![0, 0b11]);
-    }
-
-    #[test]
-    fn parse_cpu_list_errors() {
-        assert!(parse_cpu_list("").is_err());
-        assert!(parse_cpu_list("a").is_err());
-        assert!(parse_cpu_list("4-2").is_err());
-        assert!(parse_cpu_list("1024").is_err());
-        assert!(parse_cpu_list("0-1024").is_err());
-    }
-
-    #[test]
-    fn explicit_cpuset_resolves_without_sysfs() {
-        let v = CpuSet::Explicit("0-3,8-11".into());
-        assert_eq!(resolve_cpuset(&v).unwrap(), vec![0x0f0f]);
     }
 
     #[test]

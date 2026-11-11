@@ -414,3 +414,38 @@ fn duplicate_names_and_undefined_cgroups_are_reported() {
     // Parity is unchanged: the later definition still wins.
     assert_eq!(rs.lookup("zz").unwrap().0.nice, Some(2));
 }
+
+/// A cpuset that cannot resolve is dropped silently at apply time (the
+/// process keeps its affinity), so the loader must reject it — the documented
+/// not-usable aliases and malformed explicit lists, with file:line.
+#[test]
+fn unusable_and_malformed_cpusets_are_reported_at_load() {
+    let fx = Fixture::new("cpuset-warn");
+    fx.write(
+        "a.rules",
+        "{\"name\": \"tar\", \"cpuset\": \"turbo-cores\"}\n\
+         {\"name\": \"xz\", \"cpuset\": \"0-4-9\"}\n\
+         {\"name\": \"ok\", \"cpuset\": \"0-3,8\"}\n\
+         {\"name\": \"big\", \"cpuset\": \"big-cores\"}\n\
+         {\"name\": \"amd\", \"cpuset\": \"x3d-cache\"}\n",
+    );
+    let rs = fx.load_default();
+    let msgs = messages(&rs);
+    assert_eq!(msgs.len(), 3, "{msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m.contains("turbo-cores") && m.contains("not usable")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("0-4-9") && m.contains("invalid cpuset")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("x3d-cache") && m.contains("not usable")),
+        "{msgs:?}"
+    );
+    for w in &rs.warnings {
+        assert!(w.file.ends_with("a.rules"), "{w:?}");
+        assert!(w.line > 0, "{w:?}");
+    }
+}
