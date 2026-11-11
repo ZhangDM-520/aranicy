@@ -94,9 +94,11 @@ class LeanAxis(unittest.TestCase):
         self.assertFalse(r["gate_cohort_ok"])
 
     def test_a_deadband_of_zero_is_a_boundary_not_an_absent_value(self):
-        # A 0% deadband scores every non-zero verdict; substituting 15 would
-        # silently narrow the cohort the operator asked for.
-        # lean = +1.0 (twice the burst anchor), which only a 0% band keeps.
+        # What this pins is the *echo*: `deadband_pct` is read with an
+        # explicit membership test, so 0 survives as 0 instead of falling back
+        # to the 15 default (which would silently re-score the capture under a
+        # boundary the daemon never ran). The decision band itself is not
+        # asserted here — lean = +1.0 is outside any plausible band.
         cohort = [entry("marginal", "bulk", 90, burst=128_000, hop=100, at=1_000)]
         r = replay.lean_report(cohort, marker(1_100, deadband=0), 3_600)
         self.assertEqual(r["boundary"]["deadband_pct"], 0)

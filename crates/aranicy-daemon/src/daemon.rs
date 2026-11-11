@@ -245,27 +245,42 @@ fn bias_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<sampler::Batch>
     let mut last_save = std::time::Instant::now();
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(batch) => {
-                let now = std::time::SystemTime::now();
-                let changes = {
-                    let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
-                    bias_pass(&mut engine, &batch, now)
-                };
-                log_changes(&changes);
-                if last_save.elapsed() >= std::time::Duration::from_secs(60) {
-                    save_bias_state(&shared.bias, &state_path);
-                    last_save = std::time::Instant::now();
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                let changes = {
-                    let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
-                    engine.tick(std::time::SystemTime::now())
-                };
-                log_changes(&changes);
-            }
+            Ok(batch) => bias_step(shared, Some(&batch), &state_path, &mut last_save),
+            Err(RecvTimeoutError::Timeout) => bias_step(shared, None, &state_path, &mut last_save),
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+/// One iteration: a delivered window, or an idle tick when `batch` is `None`.
+///
+/// Both arms owe the debounced save. Aging runs on the idle arm, so a
+/// collector that stays down for days would otherwise leave a state file
+/// whose `saved_at` is the last pre-outage save — and the replay would score
+/// that cohort as fresh.
+fn bias_step(
+    shared: &Arc<Shared>,
+    batch: Option<&[aranicy_wire::Sample]>,
+    state_path: &str,
+    last_save: &mut std::time::Instant,
+) {
+    let changes = {
+        let mut engine = shared.bias.lock().unwrap_or_else(PoisonError::into_inner);
+        match batch {
+            Some(rows) => bias_pass(&mut engine, rows, std::time::SystemTime::now()),
+            None => engine.tick(std::time::SystemTime::now()),
+        }
+    };
+    log_changes(&changes);
+    save_if_due(&shared.bias, state_path, last_save);
+}
+
+/// The debounced state write: at most one per minute, on a delivered batch
+/// *or* on an idle tick (both arms of the bias loop call it).
+fn save_if_due(bias: &Mutex<BiasEngine>, path: &str, last_save: &mut std::time::Instant) {
+    if last_save.elapsed() >= std::time::Duration::from_secs(60) {
+        save_bias_state(bias, path);
+        *last_save = std::time::Instant::now();
     }
 }
 
@@ -1258,6 +1273,58 @@ mod tests {
             "an hour-old cohort is now detectable as stale (saved_at={} at={at})",
             capture.saved_at
         );
+    }
+
+    /// A dead stream must still persist: the idle arm ages bias without a
+    /// batch, and a save tied to batches would freeze `saved_at` at the last
+    /// pre-outage minute. This drives the loop's own iteration, not the
+    /// helper, so an arm that forgets to save is red.
+    #[test]
+    fn an_idle_tick_saves_on_the_same_debounce_as_a_batch() {
+        use crate::bias_state::{BiasSnapshot, Durable, EntrySnapshot, LeanCapture};
+        let dir = TestDir::new("bias-idle-save");
+        let path = dir.path().join("state").join("bias-state");
+        let mut engine = BiasEngine::new(crate::bias::BiasConfig::default());
+        engine.restore(BiasSnapshot {
+            version: bias_state::BIAS_STATE_VERSION,
+            threshold_ema: None,
+            lean_capture: Some(LeanCapture {
+                stage_min_ns: crate::classify::STAGE_MIN_NS,
+                hop_min_hz: crate::classify::HOP_MIN_HZ,
+                deadband_pct: 15,
+                saved_at: 0,
+            }),
+            entries: vec![EntrySnapshot {
+                name: "quiet".into(),
+                durable: Durable {
+                    confidence: 0.9,
+                    burst_ns: 1_000_000,
+                    hop_hz: 10,
+                    lean_at: 100,
+                    ..Durable::default()
+                },
+            }],
+        });
+        let cfg = Config {
+            bias_state_path: path.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let shared = test_shared(cfg, RuleSet::empty());
+        *shared.bias.lock().unwrap_or_else(PoisonError::into_inner) = engine;
+        let state = path.to_str().expect("utf8");
+
+        // Not yet due: nothing is written.
+        let mut last = std::time::Instant::now();
+        bias_step(&shared, None, state, &mut last);
+        assert!(!path.exists(), "a fresh save is not due yet");
+
+        // Due, on the *idle* arm: written, dated now, clock reset.
+        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        bias_step(&shared, None, state, &mut last);
+        let saved = bias_state::load(&path).expect("load").expect("a file");
+        let capture = saved.lean_capture.expect("capture");
+        assert!(capture.saved_at > 100, "dated at the save: {}", capture.saved_at);
+        assert!(last.elapsed() < std::time::Duration::from_secs(60));
     }
 
     #[test]

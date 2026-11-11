@@ -91,10 +91,20 @@ pub fn read_pid(path: &Path) -> Option<u32> {
 /// [`read_pid`] with the failure kept: a pidfile that exists but cannot be
 /// read (mode 0600, a directory, EACCES) is not the same fact as "no daemon".
 fn read_pid_at(path: &Path) -> std::io::Result<Option<u32>> {
-    match std::fs::File::open(path) {
-        Ok(mut file) => Ok(read_pid_from(&mut file)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // A directory opens fine and fails on the read; so does a truncated file.
+    // Either way the path is not a pidfile, which is a different fact from
+    // "no daemon is running".
+    match read_pid_from(&mut file) {
+        Some(pid) => Ok(Some(pid)),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("no pid in {}", path.display()),
+        )),
     }
 }
 
@@ -125,6 +135,10 @@ pub enum ReloadTargetError {
     /// apart from [`Self::Unreadable`] so an unprivileged `--reload` says
     /// what to do instead of implying the daemon is unidentifiable.
     PermissionDenied { path: PathBuf, what: String },
+    /// The path exists but is not a pidfile (a directory, an empty or
+    /// truncated file). Not "missing": nothing about a daemon can be inferred
+    /// from it.
+    PidfileUnreadable { path: PathBuf, why: String },
 }
 
 impl std::fmt::Display for ReloadTargetError {
@@ -148,6 +162,11 @@ impl std::fmt::Display for ReloadTargetError {
             Self::Unreadable { pid, why } => write!(
                 f,
                 "cannot identify pid {pid} from the pidfile ({why}); refusing to signal it"
+            ),
+            Self::PidfileUnreadable { path, why } => write!(
+                f,
+                "{} is not a usable pidfile ({why}); refusing to signal anything",
+                path.display()
             ),
             Self::PermissionDenied { path, what } => write!(
                 f,
@@ -177,9 +196,9 @@ pub fn reload_target(path: &Path) -> Result<u32, ReloadTargetError> {
             });
         }
         Err(e) => {
-            return Err(ReloadTargetError::Unreadable {
-                pid: 0,
-                why: format!("{} is unreadable ({e})", path.display()),
+            return Err(ReloadTargetError::PidfileUnreadable {
+                path: path.to_path_buf(),
+                why: e.to_string(),
             });
         }
     };
@@ -355,6 +374,11 @@ mod tests {
     #[test]
     fn an_unreadable_pidfile_is_named_as_a_privilege_problem() {
         use std::os::unix::fs::PermissionsExt;
+        // Root ignores the mode, so the refusal it sees is a different (and
+        // correct) one: the pid is not locked.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let dir = scratch("perm");
         let path = dir.join("aranicy.pid");
         std::fs::write(&path, "1\n").expect("write pid");
@@ -366,6 +390,30 @@ mod tests {
         );
         assert!(err.to_string().contains("as root"), "{err}");
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that exists but is not a pidfile (a directory, an empty file) is
+    /// not "no daemon": the operator is sent to a different place.
+    #[test]
+    fn a_path_that_is_not_a_pidfile_is_named_as_such() {
+        let dir = scratch("notpidfile");
+        let as_dir = dir.join("dir.pid");
+        std::fs::create_dir(&as_dir).expect("dir pidfile");
+        let err = reload_target(&as_dir).expect_err("directory");
+        assert!(
+            matches!(err, ReloadTargetError::PidfileUnreadable { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("not a usable pidfile"), "{err}");
+
+        let empty = dir.join("empty.pid");
+        std::fs::write(&empty, "").expect("empty pidfile");
+        let err = reload_target(&empty).expect_err("empty");
+        assert!(
+            matches!(err, ReloadTargetError::PidfileUnreadable { .. }),
+            "{err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

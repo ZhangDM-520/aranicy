@@ -56,6 +56,31 @@ Round 7 also recorded three non-blocking items, all closed:
   plan being an `Apply` that issues syscalls, and the doc wording says
   "re-planned processes".
 
+## Round 7 (Standards axis) added one LOW and three NITs, all closed
+
+- LOW: `saved_at` froze when the sampler stream was down — the debounced save
+  ran only in the delivered-batch arm, so a collector that stayed down left a
+  state file dated at the last pre-outage minute (the MED-1 failure mode in
+  the one window where no save happens). The loop iteration is now a function
+  (`bias_step`) that both arms call, and it owes the save; pin
+  `an_idle_tick_saves_on_the_same_debounce_as_a_batch` drives the iteration
+  itself (mutation: save only when a batch arrives → red).
+- NIT: a directory (or an empty file) at the pidfile path was reported as
+  "no running daemon" — now `ReloadTargetError::PidfileUnreadable`, pin
+  `a_path_that_is_not_a_pidfile_is_named_as_such`.
+- NIT: the permission test would fail on a root runner (root ignores the
+  mode) — the test now returns early as root, which is the outcome its
+  comment describes.
+- NIT: the `name`-with-`/` warning's rationale named the wrong mechanism and
+  the behaviour was undocumented — the message now says the match key is a
+  basename and the only separator-bearing comm is a kernel thread, and
+  `COMPATIBILITY.md`'s `name` row documents the warning and `lint` exit.
+
+Also closed from the same report's answer to Q2: a cgroup that disappears
+between the `-r` test and the `done <` redirect could abort
+`install.sh --uninstall` under `set -e`; the read loop is guarded now, and the
+two hook copies are byte-identical (checked).
+
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes
 already placed in a cgroup, and that drift remains nice-only. Both are

@@ -340,17 +340,19 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
             None => {}
         }
         if let Some(name) = &draft.name {
-            // Matching is on the executable's basename (`/proc/<pid>/exe`),
-            // so a rule that spells a path can never match: refuse to leave
-            // that silent, like the empty and wildcard names above.
+            // The match key is a basename (exe, then argv[0]) or a kernel
+            // comm. A comm may carry a separator (`kworker/0:1-events`), but
+            // kernel threads are never touched, so a name with one can only
+            // ever describe a target this daemon refuses to act on.
             if name.contains('/') {
                 resolve_warnings.push(LoadWarning {
                     file: draft.file.clone(),
                     line: draft.line,
                     message: format!(
-                        "name {name:?} contains a path separator; rules match the \
-                         executable's basename (\"foo\", not \"/usr/bin/foo\"), so this \
-                         definition can never match"
+                        "name {name:?} contains a path separator; the match key is the \
+                         executable's basename (\"foo\", not \"/usr/bin/foo\") and the one \
+                         comm shape that carries one is a kernel thread, which is never \
+                         touched — this definition can never apply"
                     ),
                 });
             }

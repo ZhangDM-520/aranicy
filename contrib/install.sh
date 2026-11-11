@@ -53,12 +53,16 @@ release_cgroups() (
         dir="$mount/$name"
         [ -d "$dir" ] || continue
         if [ -r "$dir/cgroup.procs" ]; then
-            while IFS= read -r pid; do
-                [ -n "$pid" ] || continue
-                # A pid that exited between the read and the write is not a
-                # failure: the directory below is the arbiter.
-                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || true
-            done < "$dir/cgroup.procs"
+            # The redirect can fail if the cgroup went away in between; that is
+            # the directory-absent case below, not an error to abort on.
+            {
+                while IFS= read -r pid; do
+                    [ -n "$pid" ] || continue
+                    # A pid that exited between the read and the write is not a
+                    # failure: the directory below is the arbiter.
+                    echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || true
+                done < "$dir/cgroup.procs"
+            } || true
         fi
         rmdir "$dir" 2>/dev/null || true
         if [ -d "$dir" ]; then
