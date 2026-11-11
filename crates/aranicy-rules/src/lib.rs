@@ -16,11 +16,12 @@
 //!   explicit `null` suppresses the type value (RFC 7396 merge_patch
 //!   semantics). The result is flattened into [`arany_model::Policy`] once,
 //!   at load.
-//! * Match key: exact `name` == `basename(argv[0])` (exe basename fallback),
-//!   case-sensitive. Only when no exact rule matches is `name_regex` tried —
-//!   unanchored substring semantics, first match in load order wins. Regexes
-//!   are compiled ONCE at load (Phase 0 root cause #1 in docs/BENCHMARKS.md
-//!   was per-event recompilation in ananicy-cpp).
+//! * Match key: exact `name` == `basename(/proc/<pid>/exe)` (then
+//!   `basename(argv[0])`, then the comm), case-sensitive. Only when no exact
+//!   rule matches is `name_regex` tried — unanchored substring semantics,
+//!   first match in load order wins. Regexes are compiled ONCE at load
+//!   (Phase 0 root cause #1 in docs/BENCHMARKS.md was per-event recompilation
+//!   in ananicy-cpp).
 //! * `cmdlines` (Python-fork legacy) is accepted and ignored (lint note).
 
 use aranicy_model::{CgroupDef, CpuSet, Policy};
@@ -341,9 +342,10 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
         }
         if let Some(name) = &draft.name {
             // The match key is a basename (exe, then argv[0]) or a comm. A comm
-            // may carry a separator (`kworker/0:1-events`), but kernel threads
-            // are never touched, so a name with one can only ever describe a
-            // target this daemon refuses to act on.
+            // is the key only when neither of those yields a basename, so a
+            // separator-bearing key comes from the kernel-thread shape (never
+            // touched), a zombie, or a task that hides both; the name is dead
+            // weight for every process whose exe or argv[0] is readable.
             //
             // Only when the rule has no *compiled* `name_regex`: with one, the
             // exact key is dead but the definition may still apply through the
@@ -359,10 +361,10 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
                     file: draft.file.clone(),
                     line: draft.line,
                     message: format!(
-                        "name {name:?} contains a path separator; the match key is the \
-                         executable's basename (\"foo\", not \"/usr/bin/foo\") and the one \
-                         comm shape that carries one is a kernel thread, which is never \
-                         touched — this definition can never apply"
+                        "name {name:?} contains a path separator; a match key is a basename \
+                         (\"foo\", not \"/usr/bin/foo\") and comm is the key only when neither \
+                         exe nor argv[0] yields one, so only a task whose comm is exactly \
+                         this string and that yields neither can match this rule"
                     ),
                 });
             }

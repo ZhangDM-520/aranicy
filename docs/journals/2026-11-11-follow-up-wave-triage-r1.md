@@ -115,8 +115,8 @@ and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
   gate it claims;
 - the `comm`-carries-a-separator sentence was broader than the truth (a
   userspace `comm` can contain `/` via `prctl`; it is the key only when `exe`
-  and `argv[0]` both yield no basename) — **corrected in round 12**, in the
-  `name` row and in the `lint` message;
+  and `argv[0]` both yield no basename) — **closed in two halves**: the `name`
+  row in round 12's follow-up, the `lint` message in round 13's;
 - the privilege pin returns early on a root runner instead of asserting the
   `Stale` outcome root actually gets;
 - `PidFile::drop` unlinks by path without comparing the inode it locked, so an
@@ -149,7 +149,8 @@ same doc item. All four are fixed:
 `deferred: 8 items at round 9` — the round-8 list less the `name_regex` item
 this round addressed. The round-8 section is 7 bullets but 9 distinct items;
 counted as items, `name_regex` re-deferred by round 10 put the set back to 9,
-and round 12 closed the `comm` sentence, so 8 are open at this head.
+and the `comm` sentence stayed open until round 13's follow-up finished its
+second half, leaving 8 open at this head.
 
 ## Round 10: the regex-death warning was unsound and is reverted
 
@@ -189,13 +190,36 @@ the `comm` sentence as open after the row fixed it. The both-dead pin's
 message claimed the pattern matched no key while the rule's own path key is
 registered.
 
-All are corrected here: the row now scopes the claim to "matches no normal
-process" and names the shapes that can still present a separator (kernel
-thread, zombie, a non-dumpable task without `CAP_SYS_PTRACE`), the
-`name_regex` row says the rule's other fields apply when another key matches,
-the ledger marks the `comm` item closed and counts 8, and the pin asserts both
-that no basename matches and that the path key does. The `lint` message now
-states the same condition as the row.
+All are addressed here: the row is rescoped, the `name_regex` row says the
+rule's other fields apply when another key matches, the ledger records the
+`comm` item, and the pin asserts both that no basename matches and that the
+path key does. Two of these did not land as intended: the `lint`-message
+rewrite was lost when a mutation probe restored the source with
+`git checkout --`, and the row's parenthetical named shapes more narrowly
+than `derive_name` reaches (see round 13).
+
+## Round 13: the message fix was lost, and the row was narrower than the code
+
+Round 13 reviewed round 12's follow-up: FIX-FIRST on both axes (Standards one
+HIGH, one MEDIUM, two LOW; Spec one MEDIUM, one LOW). The HIGH is mine. The
+`lint` message and the comment above it were rewritten, then discarded by the
+`git checkout --` that restored `lib.rs` after a mutation probe, so the commit
+shipped the corrected contract row beside the old message that told a corpus
+author a separator name "can never apply". The row was also narrower than
+`derive_name`: `comm` is the key when neither `exe` nor `argv[0]` *yields a
+basename* — a non-dumpable task makes both unreadable together, so an empty
+`argv[0]` is not required — and a zombie's `exe` link fails rather than being
+empty.
+
+Fixed here: the message and its comment state the condition the row states (a
+basename from `exe` or `argv[0]`, or the raw `comm` when neither yields one),
+the row says a separator name "matches no basename key" and names the
+kernel-thread, zombie and hidden-both shapes, the pin's comment no longer
+claims the rule is dead for every process and the test now refuses a message
+that claims impossibility, and the module brief's key order (`exe`, then
+`argv[0]`, then comm) matches the code. The ledger records the `comm` item's
+two halves by round, which is what round 12 should have done once the row
+landed.
 
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes

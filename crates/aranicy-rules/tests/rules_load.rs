@@ -436,6 +436,10 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
     // Exactly one rule is wrong: the plain `foo` beside it must stay silent.
     assert_eq!(m.len(), 1, "{m:?}");
     assert!(m[0].contains("path separator") && m[0].contains("/usr/bin/foo"), "{m:?}");
+    // `comm` is the key whenever neither `exe` nor `argv[0]` yields a
+    // basename, so the separator shapes include a zombie and a task that
+    // hides both; the message must not claim impossibility.
+    assert!(!m[0].contains("never apply"), "{m:?}");
 
     // A rule that also carries a regex still applies through it, so its dead
     // exact key is not a lint failure.
@@ -486,10 +490,10 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
 
     // The recorded limit: no *basename* key can match this rule (the exact key
     // is a path, the pattern needs one), so it is dead weight for every process
-    // the daemon acts on — yet a pattern's reach is undecidable from its text,
-    // so it loads silently. The rule itself is registered: a key carrying a
-    // separator would match it. Keep this pin honest if a language check ever
-    // replaces the limit.
+    // whose `exe` or `argv[0]` is readable — yet a pattern's reach is
+    // undecidable from its text, so it loads silently. The rule itself is
+    // registered: a key carrying a separator would match it. Keep this pin
+    // honest if a language check ever replaces the limit.
     let f = Fixture::new("path-name-both-dead");
     f.write(
         "10-a.rules",
