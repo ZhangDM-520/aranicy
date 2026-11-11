@@ -424,9 +424,17 @@ fn ledger_safe(name: &str) -> bool {
 /// quota) on disk, and the hook needs that name, so the previous entries are
 /// kept while their directory still exists. Only directories this daemon
 /// created are added — a definition naming a cgroup somebody else made is
-/// managed but never evacuated on uninstall. Best-effort by design: a failed
-/// write costs only the cleanup, so it must never block a start or a reload.
+/// managed but never evacuated on uninstall. A failure writing the ledger is
+/// reported and leaves the previous one in place: it is the only list of
+/// directories that still hold a quota, so losing it is not recoverable
+/// (`owned` is empty for a directory that already exists).
 fn record_cgroups(state_path: &str, cgroups: &CgroupManager) {
+    // No real cgroup2 mount (the probe failed, so `mount` is a placeholder):
+    // the existence filter below would read every recorded name as gone and
+    // erase the ledger a later uninstall still needs.
+    if !cgroups.mount.join("cgroup.procs").exists() {
+        return;
+    }
     let path = paths::cgroup_record_path(std::path::Path::new(state_path));
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -434,7 +442,20 @@ fn record_cgroups(state_path: &str, cgroups: &CgroupManager) {
             return;
         }
     }
-    let previous = std::fs::read_to_string(&path).unwrap_or_default();
+    // Absence means "nothing recorded yet"; any other read error means the
+    // ledger may still name live directories, so it must not be replaced by a
+    // short one.
+    let previous = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            tracing::warn!(
+                "cgroup record: cannot read {}: {e}; leaving it in place",
+                path.display()
+            );
+            return;
+        }
+    };
     let mut ledger: BTreeSet<String> = previous
         .lines()
         .filter(|name| ledger_safe(name) && cgroups.mount.join(name).is_dir())
@@ -442,8 +463,14 @@ fn record_cgroups(state_path: &str, cgroups: &CgroupManager) {
         .collect();
     ledger.extend(cgroups.owned.iter().cloned());
     let body: String = ledger.iter().map(|name| format!("{name}\n")).collect();
-    if let Err(e) = std::fs::write(&path, body) {
+    // Truncate-in-place then fail would lose every surviving name, so write a
+    // sibling and rename (the same reason `bias_state::save` does).
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
         tracing::warn!("cgroup record: cannot write {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1049,6 +1076,8 @@ mod tests {
         let dir = TestDir::new("cgroup-record");
         let mount = dir.path().join("cgroup2");
         std::fs::create_dir_all(&mount).expect("mount dir");
+        // The mount probe: a real cgroup2 root always carries this file.
+        std::fs::write(mount.join("cgroup.procs"), "").expect("root procs");
         let state = dir.path().join("state").join("bias-state");
         let record = state.with_file_name("cgroups");
         let read = || std::fs::read_to_string(&record).expect("record");
@@ -1083,6 +1112,58 @@ mod tests {
         std::fs::remove_dir(mount.join("games")).expect("remove cgroup");
         record_cgroups(state.to_str().expect("utf8"), &empty);
         assert_eq!(read(), "", "a removed directory is pruned from the ledger");
+        assert!(
+            !record.with_extension("tmp").exists(),
+            "the write is atomic: no temporary file survives"
+        );
+    }
+
+    /// Without a cgroup2 mount the existence test would read every name as
+    /// gone; the ledger must survive for the host that mounts it later.
+    #[test]
+    fn a_missing_cgroup_mount_does_not_erase_the_ledger() {
+        let dir = TestDir::new("cgroup-record-nomount");
+        let state = dir.path().join("state").join("bias-state");
+        let record = state.with_file_name("cgroups");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(&record, "games\n").expect("ledger");
+
+        record_cgroups(state.to_str().expect("utf8"), &CgroupManager::unavailable());
+        assert_eq!(
+            std::fs::read_to_string(&record).expect("record"),
+            "games\n",
+            "a placeholder mount leaves the ledger untouched"
+        );
+    }
+
+    /// An unreadable ledger may still name live directories, so it must be
+    /// left alone rather than replaced by the (empty) set the daemon owns.
+    /// A symlink to a directory gives a read error that is not `NotFound`
+    /// while still being replaceable by a rename, so the assertion fails if
+    /// the write path is taken.
+    #[test]
+    fn an_unreadable_ledger_is_not_replaced() {
+        let dir = TestDir::new("cgroup-record-readerr");
+        let mount = dir.path().join("cgroup2");
+        std::fs::create_dir_all(&mount).expect("mount dir");
+        std::fs::write(mount.join("cgroup.procs"), "").expect("root procs");
+        let state = dir.path().join("state").join("bias-state");
+        let record = state.with_file_name("cgroups");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::create_dir_all(dir.path().join("elsewhere")).expect("target dir");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &record).expect("symlink");
+
+        let (manager, _) = CgroupManager::init_at(&mount, BTreeMap::new());
+        record_cgroups(state.to_str().expect("utf8"), &manager);
+        let meta = std::fs::symlink_metadata(&record).expect("ledger metadata");
+        assert!(
+            meta.file_type().is_symlink(),
+            "an unreadable ledger is left untouched"
+        );
+        assert!(
+            !record.with_extension("tmp").exists(),
+            "no temporary file is left behind"
+        );
     }
 
     #[test]

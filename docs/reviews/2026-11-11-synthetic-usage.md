@@ -159,7 +159,8 @@ release them (`release_cgroups` in `contrib/aranicy.install` and
 the ledger while its directory exists. Measured on the host against real
 cgroupfs: a process inside a daemon-created cgroup is moved to `/` and the
 directory is removed, while a directory that cannot be emptied keeps its
-ledger entry for a later attempt.
+ledger entry for a later attempt. The commands and their output are in
+`.logs/action-2026-11-11-follow-up-wave.md` ("Review rounds").
 
 ## Limitations of this method
 

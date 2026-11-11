@@ -30,9 +30,9 @@ spinner at 3.9, both actuated `Bulk +3`) shows the cost of a wrong label.
    `lean_capture` naming the boundary in force (`stage_min_ns`, `hop_min_hz`,
    `deadband_pct`, `saved_at`). The anchors are live config keys; a replay
    that assumed the defaults would judge a classifier the daemon never ran.
-   No marker = those entries are not a capture (the shadow never ran, or the
-   file predates the marker), and the replay refuses to score them. The marker
-   is adopted at restart only when it names the
+   No marker = those entries are not a capture (the shadow never ran, the
+   file predates the marker, or a boundary change discarded the capture), and
+   the replay refuses to score them. The marker is adopted at restart only when it names the
    boundary the reloaded binary runs, so a `bias_lean_*` edit applied by a
    restart drops the stale inputs instead of re-stamping them. Entries older
    than `--max-lean-age` (default 1 h) are reported as stale and excluded.
@@ -66,7 +66,8 @@ names go in this ADR and the score classifier stays.
 - A run with `bias_shadow = false` records no *new* lean inputs; a snapshot
   restored from an earlier capture still carries them and their marker, so
   turning the flag off does not destroy a capture. Replay reports "no captured
-  burst/hop inputs" instead of guessing only when there is no marker at all.
+  burst/hop inputs" when the marker is present but no entry still has fresh
+  inputs, and "not a capture" when there is no marker at all.
 - The live counters remain the only view of the comparison against `cand`;
   the replay compares against the persistent `class` (post-hysteresis) and its
   output says so.

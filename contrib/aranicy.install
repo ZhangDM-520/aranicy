@@ -41,7 +41,11 @@ release_cgroups() (
     done < "$record"
     # Keep the ledger when something is still pinned: a later run can retry,
     # and without the file those directories are unreachable forever.
-    [ "$left" = 0 ] && rm -f "$record" 2>/dev/null
+    if [ "$left" = 0 ]; then
+        rm -f "$record" 2>/dev/null || true
+    else
+        echo "aranicy: cgroup cleanup incomplete; kept $record - a cgroup may still be throttled" >&2
+    fi
     return 0
 )
 

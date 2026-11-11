@@ -731,7 +731,7 @@ impl CgroupManager {
         for (name, def) in defs {
             if !valid_cgroup_name(&name) {
                 warnings.push(format!(
-                    "cgroup {name:?}: invalid name (empty, '.'/'..' or path separator)"
+                    "cgroup {name:?}: invalid name (empty, '.'/'..', path separator or control character)"
                 ));
                 continue;
             }
