@@ -140,7 +140,7 @@ a policy trade-off and stays documented as the trust model above.
 
 | digest item | commit | behavioural check |
 |---|---|---|
-| cgroup `CPUQuota` lost across a boot | `dd41fa2` | VM, real reboot: reproduced the `EACCES` at 8 s, `CPUQuota applied after retry` at 68 s, `cpu.max` correct, `dump cgroups` reports `cpu_quota_applied: true` |
+| cgroup `CPUQuota` lost across a boot | `dd41fa2`, `893e84c` | VM, real reboot: reproduced the `EACCES` at 8 s, `CPUQuota applied after retry` at 68 s, `cpu.max` correct, `dump cgroups` reports `cpu_quota_applied: true` |
 | `--reload` trusts the pidfile | `4e9f09a` | VM: pid 1 in the file → refused as stale; a live `sleep` pid → refused as "not aranicy"; the clean reload still signals |
 | `cpuset` names unvalidated | `96fe3ad` | VM: `turbo-cores` and `0-4-9` warn with file:line, `lint` exits 1 |
 | per-name bias opt-out | `1c2ff18` | VM A/B: `burn` (`"bias": false`, nice 5) learned bias 3 and stayed at 5; the unruled control went 0 → 3 |
@@ -153,9 +153,13 @@ boot; the VM shows the kernel did not offer `cpu.max` in the new cgroup until
 condition-independent. `ivy-15` — the uninstall half of that digest item —
 was *not* covered by `dd41fa2`: removing the package used to leave the cgroup
 and its quota behind, throttling whatever still ran inside. The daemon now
-records the directories it created and the removal hooks release them
-(`release_cgroups` in `contrib/aranicy.install` and
-`contrib/install.sh --uninstall`).
+keeps a cleanup ledger of the directories it created and the removal hooks
+release them (`release_cgroups` in `contrib/aranicy.install` and
+`contrib/install.sh --uninstall`); a definition removed by a reload stays in
+the ledger while its directory exists. Measured on the host against real
+cgroupfs: a process inside a daemon-created cgroup is moved to `/` and the
+directory is removed, while a directory that cannot be emptied keeps its
+ledger entry for a later attempt.
 
 ## Limitations of this method
 

@@ -77,11 +77,12 @@ pub struct Durable {
 }
 
 /// The boundary and moment a lean capture was taken with. Present while the
-/// entries still carry the inputs of a shadow window *and* this daemon runs
-/// the classifier that measured them: the stage/hop anchors are live config
-/// keys, so an offline replay that assumed the defaults would describe a
-/// classifier the daemon never ran. Survives both turning `bias_shadow` off
-/// and a restart under the same boundary (ADR 0003).
+/// entries still carry the inputs of a shadow window taken under this boundary
+/// (the flag may since have been turned off): the stage/hop anchors are live
+/// config keys, so an offline replay that assumed the defaults would describe
+/// a classifier the daemon never ran. Survives turning `bias_shadow` off and a
+/// restart under the same boundary; a boundary change drops it with the inputs
+/// (ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LeanCapture {

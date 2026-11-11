@@ -60,13 +60,16 @@ the live value, so a lost quota is visible instead of implied:
 
 The directory is not a package file, so removing the package would otherwise
 leave it — and its `cpu.max` — throttling whatever still runs inside. The
-daemon records the cgroups it created for the loaded corpus in
-`<bias_state_path>`'s directory
-(default `/var/lib/aranicy/cgroups`); `contrib/aranicy.install`
+daemon keeps a cleanup ledger in `<bias_state_path>`'s directory (default
+`/var/lib/aranicy/cgroups`): every directory it created, kept while the
+directory still exists (a definition removed by a reload is not forgotten),
+and never a directory that already existed before it (a corpus entry naming a
+cgroup somebody else made is managed, not evacuated). `contrib/aranicy.install`
 (`pacman -R`) and `contrib/install.sh --uninstall` move those processes back
-to the root cgroup and `rmdir` the directories. A cleanup that cannot move a
-process (or a name recorded under a different `bias_state_path`) leaves the
-directory behind; nothing else removes it short of a reboot.
+to the root cgroup and `rmdir` the directories, keeping the ledger when
+anything could not be released. A name recorded under a different
+`bias_state_path`, or a directory that cannot be emptied, is left behind;
+nothing else removes it short of a reboot.
 
 ## Matching and apply
 

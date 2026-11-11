@@ -16,7 +16,7 @@
 //! plan and hand it to `execute`, so counters, the closed-loop claim and the
 //! operator log are produced in one place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -402,14 +402,30 @@ fn init_cgroups(defs: &BTreeMap<Arc<str>, CgroupDef>) -> (CgroupManager, Vec<Str
     }
 }
 
-/// Persist the cgroups this daemon manages, so an uninstall can release them.
+/// A name the uninstall hook can safely act on: one line, inside the mount.
+fn ledger_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.chars().any(char::is_control)
+}
+
+/// Persist the cgroups this daemon created, so an uninstall can release them.
 ///
 /// A cgroup directory is not a package file: `pacman -R` cannot remove it, and
 /// the `cpu.max` written by [`CgroupManager`] keeps throttling whatever still
 /// runs inside long after the binary is gone (round-3 `ivy-15`).
 /// `contrib/aranicy.install` reads this list to move survivors out and `rmdir`
-/// the directories. Best-effort by design — a failed write costs only the
-/// cleanup, so it must never block a start or a reload.
+/// the directories.
+///
+/// This is a cleanup ledger, not a description of the loaded corpus: a
+/// definition removed by a reload or a restart leaves its directory (and its
+/// quota) on disk, and the hook needs that name, so the previous entries are
+/// kept while their directory still exists. Only directories this daemon
+/// created are added — a definition naming a cgroup somebody else made is
+/// managed but never evacuated on uninstall. Best-effort by design: a failed
+/// write costs only the cleanup, so it must never block a start or a reload.
 fn record_cgroups(state_path: &str, cgroups: &CgroupManager) {
     let path = paths::cgroup_record_path(std::path::Path::new(state_path));
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -418,11 +434,14 @@ fn record_cgroups(state_path: &str, cgroups: &CgroupManager) {
             return;
         }
     }
-    let body: String = cgroups
-        .created
-        .keys()
-        .map(|name| format!("{name}\n"))
+    let previous = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut ledger: BTreeSet<String> = previous
+        .lines()
+        .filter(|name| ledger_safe(name) && cgroups.mount.join(name).is_dir())
+        .map(str::to_string)
         .collect();
+    ledger.extend(cgroups.owned.iter().cloned());
+    let body: String = ledger.iter().map(|name| format!("{name}\n")).collect();
     if let Err(e) = std::fs::write(&path, body) {
         tracing::warn!("cgroup record: cannot write {}: {e}", path.display());
     }
@@ -1021,50 +1040,49 @@ mod tests {
         assert!(warnings.is_empty() || !manager.mount.as_os_str().is_empty());
     }
 
-    /// The uninstall hook releases what the daemon records here, so the list
-    /// must name only cgroups that were really created and must shrink when a
-    /// reload removes them.
+    /// The uninstall hook acts on this ledger, so it must keep a name while
+    /// its directory exists (a definition removed by a reload leaves the
+    /// directory and its quota behind), drop a name whose directory is gone,
+    /// and never adopt a directory the daemon did not create.
     #[test]
-    fn the_cgroup_record_lists_created_names_and_clears_on_reload() {
+    fn the_cgroup_record_is_a_cleanup_ledger_not_the_loaded_corpus() {
         let dir = TestDir::new("cgroup-record");
         let mount = dir.path().join("cgroup2");
         std::fs::create_dir_all(&mount).expect("mount dir");
         let state = dir.path().join("state").join("bias-state");
+        let record = state.with_file_name("cgroups");
+        let read = || std::fs::read_to_string(&record).expect("record");
 
+        // Somebody else's cgroup: managed (the rule may assign into it) but
+        // not owned, so an uninstall must not evacuate it.
+        std::fs::create_dir(mount.join("shared")).expect("pre-existing cgroup");
+
+        let def = |name: &str| CgroupDef {
+            name: Arc::from(name),
+            cpu_quota_pct: None,
+        };
         let defs: BTreeMap<String, CgroupDef> = [
-            (
-                "games".to_string(),
-                CgroupDef {
-                    name: Arc::from("games"),
-                    cpu_quota_pct: None,
-                },
-            ),
-            (
-                "bad/name".to_string(),
-                CgroupDef {
-                    name: Arc::from("bad/name"),
-                    cpu_quota_pct: None,
-                },
-            ),
+            ("games".to_string(), def("games")),
+            ("shared".to_string(), def("shared")),
+            ("bad/name".to_string(), def("bad/name")),
         ]
         .into_iter()
         .collect();
         let (manager, warnings) = CgroupManager::init_at(&mount, defs);
         assert_eq!(warnings.len(), 1, "the invalid name is refused: {warnings:?}");
         record_cgroups(state.to_str().expect("utf8"), &manager);
-        assert_eq!(
-            std::fs::read_to_string(state.with_file_name("cgroups")).expect("record"),
-            "games\n",
-            "only the created cgroup is recorded"
-        );
+        assert_eq!(read(), "games\n", "only the cgroup we created is recorded");
 
+        // A reload without the definition: the directory (and its quota) is
+        // still on disk, so the name must survive for the uninstall hook.
         let (empty, _) = CgroupManager::init_at(&mount, BTreeMap::new());
         record_cgroups(state.to_str().expect("utf8"), &empty);
-        assert_eq!(
-            std::fs::read_to_string(state.with_file_name("cgroups")).expect("record"),
-            "",
-            "a reload without cgroups clears the stale list"
-        );
+        assert_eq!(read(), "games\n", "a live directory is never forgotten");
+
+        // Once the directory is gone the name is pruned.
+        std::fs::remove_dir(mount.join("games")).expect("remove cgroup");
+        record_cgroups(state.to_str().expect("utf8"), &empty);
+        assert_eq!(read(), "", "a removed directory is pruned from the ledger");
     }
 
     #[test]

@@ -27,7 +27,7 @@
 use aranicy_model::{
     parse_cpu_list, set_cpu, CgroupDef, CpuSet, IoClass, Policy, SchedPolicy, MAX_CPUS,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -575,12 +575,16 @@ fn cgroup_error(e: &io::Error) -> ActionOutcome {
 }
 
 fn valid_cgroup_name(name: &str) -> bool {
+    // Control characters are rejected, not merely sanitized: the uninstall
+    // hook reads the created-cgroup ledger line by line, so a name carrying a
+    // newline would be read as two names and could reach a cgroup this daemon
+    // never owned (round-4 finding).
     !name.is_empty()
         && name != "."
         && name != ".."
         && !name.starts_with('/')
         && !name.contains('/')
-        && !name.contains('\0')
+        && !name.chars().any(char::is_control)
 }
 
 /// cpu.max value for `CPUQuota` (percent of ALL cpus): quota = pct × ncpu ×
@@ -669,6 +673,11 @@ pub struct PendingQuota {
 pub struct CgroupManager {
     pub mount: PathBuf,
     pub created: BTreeMap<String, CgroupDef>,
+    /// Names whose directory this manager really created (`create_dir` said
+    /// `Ok`). `created` cannot answer that: a definition whose directory
+    /// already existed is managed but not owned, and an uninstall must not
+    /// evacuate a cgroup somebody else made.
+    pub owned: BTreeSet<String>,
     /// Quotas whose `cpu.max` write did not land yet. cgroupfs answers
     /// **EACCES** (not ENOENT) when a controller file does not exist in the
     /// cgroup, which is what an early-boot start sees before the `cpu`
@@ -697,6 +706,7 @@ impl CgroupManager {
         Self {
             mount: PathBuf::from("/dev/null"),
             created: BTreeMap::new(),
+            owned: BTreeSet::new(),
             pending_quota: Mutex::new(BTreeMap::new()),
             ncpu: 1,
         }
@@ -715,6 +725,7 @@ impl CgroupManager {
             .map(|n| n.get())
             .unwrap_or(1);
         let mut created = BTreeMap::new();
+        let mut owned = BTreeSet::new();
         let mut warnings = Vec::new();
         let mut pending = BTreeMap::new();
         for (name, def) in defs {
@@ -726,7 +737,9 @@ impl CgroupManager {
             }
             let dir = mount.join(&name);
             match fs::create_dir(&dir) {
-                Ok(()) => {}
+                Ok(()) => {
+                    owned.insert(name.clone());
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => {
                     warnings.push(format!("cgroup {name:?} not created: {e}"));
@@ -747,6 +760,7 @@ impl CgroupManager {
             Self {
                 mount: mount.to_path_buf(),
                 created,
+                owned,
                 pending_quota: Mutex::new(pending),
                 ncpu,
             },
@@ -1316,6 +1330,20 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("invalid name"), "{warnings:?}");
         assert!(!mount.join("../evil").exists());
+        let _ = fs::remove_dir_all(&mount);
+    }
+
+    /// The uninstall hook reads the created-cgroup ledger line by line: a
+    /// name carrying a newline would be read as two names, and the second one
+    /// could name a cgroup this daemon never created.
+    #[test]
+    fn a_control_character_in_a_cgroup_name_is_refused() {
+        let mount = scratch_dir("control_name");
+        let (manager, warnings) = CgroupManager::init_at(&mount, one_cgroup("a\nb", None));
+        assert!(manager.created.is_empty(), "{:?}", manager.created.keys());
+        assert!(manager.owned.is_empty(), "nothing was created");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("invalid name"), "{warnings:?}");
         let _ = fs::remove_dir_all(&mount);
     }
 

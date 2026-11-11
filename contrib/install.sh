@@ -45,6 +45,7 @@ release_cgroups() (
     record=${ANANICY_CGROUP_RECORD:-/var/lib/aranicy/cgroups}
     [ -r "$record" ] || return 0
     [ -w "$mount/cgroup.procs" ] || return 0
+    left=0
     while IFS= read -r name; do
         case "$name" in
             ''|.|..|*/*) continue ;;
@@ -54,12 +55,15 @@ release_cgroups() (
         if [ -r "$dir/cgroup.procs" ]; then
             while IFS= read -r pid; do
                 [ -n "$pid" ] || continue
-                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || true
+                echo "$pid" > "$mount/cgroup.procs" 2>/dev/null || left=1
             done < "$dir/cgroup.procs"
         fi
-        rmdir "$dir" 2>/dev/null || true
+        rmdir "$dir" 2>/dev/null || left=1
     done < "$record"
-    rm -f "$record" 2>/dev/null || true
+    # Keep the ledger when something is still pinned: a later run can retry,
+    # and without the file those directories are unreachable forever.
+    [ "$left" = 0 ] && rm -f "$record" 2>/dev/null
+    return 0
 )
 
 usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }

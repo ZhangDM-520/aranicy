@@ -281,9 +281,9 @@ def main() -> int:
         )
         if lean is None:
             print(
-                "  lean axis: the snapshot carries no capture marker — the daemon "
-                "was not saving with bias_shadow = true, so its entries are not a "
-                "capture (ADR 0003)."
+                "  lean axis: the snapshot carries no capture marker, so its "
+                "entries are not a capture (the shadow never ran, or the file "
+                "predates the marker; ADR 0003)."
             )
         elif lean["cohort_with_lean_inputs"] == 0:
             print(
