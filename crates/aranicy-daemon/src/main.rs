@@ -79,15 +79,13 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `aranicy --reload`: SIGHUP the daemon recorded in the pidfile.
+/// `aranicy --reload`: SIGHUP the daemon recorded in the pidfile — after
+/// proving the file is held by a live daemon and that pid is this executable.
+/// A leftover file names a recycled pid, and SIGHUP's default action is
+/// terminate.
 fn reload_running() -> anyhow::Result<()> {
     let pidfile = paths::pidfile_path();
-    let Some(pid) = pidfile::read_pid(&pidfile) else {
-        anyhow::bail!(
-            "no running aranicy daemon found ({} is missing)",
-            pidfile.display()
-        );
-    };
+    let pid = pidfile::reload_target(&pidfile).map_err(|e| anyhow::anyhow!("{e}"))?;
     let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
     if r != 0 {
         anyhow::bail!(

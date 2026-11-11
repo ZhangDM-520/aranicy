@@ -333,7 +333,11 @@ nothing.
   `bias` shows the persisted bias snapshot),
 - `aranicy lint`, `aranicy match-test <name>` (dry-run, superset),
 - `--reload` reloads config **and rules** (superset: ananicy-cpp reloads
-  config only) and reconfigures the bias engine. It logs
+  config only) and reconfigures the bias engine. Before signalling, it checks
+  the pidfile: the file must still be locked by a running daemon and that pid's
+  executable must be `aranicy` — a leftover file names a recycled pid, and
+  SIGHUP terminates. A refusal says which check failed and never signals.
+  It logs
   `reloaded {n} rules; bias reconfigured`, calls out a changed `bias_group.*`
   (history keys change) and warns
   `restart-only keys ignored: <sorted key list>` for any deferred edit,
