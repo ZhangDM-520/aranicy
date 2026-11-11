@@ -59,3 +59,28 @@ names go in this ADR and the score classifier stays.
 - The live counters remain the only view of the comparison against `cand`;
   the replay compares against the persistent `class` (post-hysteresis) and its
   output says so.
+
+## First capture (2026-11-11, and why it does not clear the gate)
+
+A 2 vCPU VM, the wave's own payload, `bias_shadow = true`, 4 min of mixed
+load — deliberately including 35 spin loops, which saturated the box (load 39)
+before the capture was read. 84 entries, 38 with lean inputs, 26 decided:
+**24 agree / 2 disagree (7.7 %)**. The two inversions, both inspected:
+`sshd-session` (lean +0.86, burst 306 µs at 264 hops/s) and `sudo` (+0.26,
+294 µs at 385 hops/s) — interactive one-shots pushed just past the burst
+anchor by the saturation itself.
+
+Verdict: **gate not met, promotion stays blocked.** 26 decided entries is not
+a population, the load is the exact confound the quiet-host rule exists to
+remove, and the two inversions sit close enough to the anchor that a +3 on an
+interactive name is imaginable. The replay tool works
+(`tools/replay-bias/replay.py <snapshot>`), so the remaining work is a capture,
+not code: a quiet host with a real population (≥ 200 decided entries), then
+inspect every inversion by name.
+
+## Addendum — measured capture
+
+The first capture also prices the score axis it would replace: on the same
+snapshot the best absolute anchor recovers `T` exactly (115, 0 errors) and
+anchor 1185 violates 42 % of the cohort, which is ADR 0001's argument
+reproduced on new data.

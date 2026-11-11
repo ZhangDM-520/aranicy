@@ -133,6 +133,25 @@ Deferred enhancements (unanimous or repeated): a per-process "why"
 an opt-in/per-name switch for the learned axis (`"bias": false` on a rule)
 so a game can be pinned without maintaining a second config.
 
+## Follow-up wave (2026-11-11 evening): what shipped from the digest
+
+The owner adopted six of the seven items; the escalation gate was declined as
+a policy trade-off and stays documented as the trust model above.
+
+| digest item | commit | behavioural check |
+|---|---|---|
+| cgroup `CPUQuota` lost across a boot | `dd41fa2` | VM, real reboot: reproduced the `EACCES` at 8 s, `CPUQuota applied after retry` at 68 s, `cpu.max` correct, `dump cgroups` reports `cpu_quota_applied: true` |
+| `--reload` trusts the pidfile | `4e9f09a` | VM: pid 1 in the file → refused as stale; a live `sleep` pid → refused as "not aranicy"; the clean reload still signals |
+| `cpuset` names unvalidated | `96fe3ad` | VM: `turbo-cores` and `0-4-9` warn with file:line, `lint` exits 1 |
+| per-name bias opt-out | `1c2ff18` | VM A/B: `burn` (`"bias": false`, nice 5) learned bias 3 and stayed at 5; the unruled control went 0 → 3 |
+| live re-plan on reload | `ea6172f`, `4998e00` | VM: ionice 7→3 landed on reload, a deleted field reset to none, a deleted rule reset nice and ionice (`released=1`) |
+| two-axis classifier promotion | `21e7cd4` | ADR 0003: lean inputs persisted, offline replay implemented, first capture 24/2 (7.7 %) on a *saturated* 2 vCPU box — gate not met |
+
+The cgroup boot failure is worth a note: the persona saw it as a race with
+boot; the VM shows the kernel did not offer `cpu.max` in the new cgroup until
+~68 s into a 63 s userspace startup, so the retry is what makes it
+condition-independent.
+
 ## Limitations of this method
 
 - Personas ran as subagents on the maintainer's harness, which supplies the
