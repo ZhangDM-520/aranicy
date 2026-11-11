@@ -19,9 +19,13 @@ clean-room rewrite with a hard performance budget: **≤ 5% of one core at
 ## Design in one paragraph
 
 A single `sched_process_exec` eBPF tracepoint (fork/exit are never
-subscribed); every event resolves its name with one stack-buffered
-`/proc/<pid>/cmdline` read (no comm prescreen — `exec -a` spoofing makes
-comm-only filtering unsafe) followed by an O(1) `HashMap` lookup; rules are
+subscribed); every event resolves its name from `/proc/<pid>/exe` (one
+stack-buffered `readlink`) followed by an O(1) `HashMap` lookup. The
+executable, not `argv[0]` or `comm`: both of those are writable by the task
+itself (`exec -a`, `prctl(PR_SET_NAME)`), so a name taken from them is a
+name the process chose — it can evade its own rule or borrow someone else's.
+`basename(argv[0])` and the kernel comm remain as fallbacks for when
+`/proc/<pid>/exe` is unreadable. Rules are
 flattened into small `Copy`-friendly policy structs at load and `name_regex`
 patterns are compiled once at load; the apply layer walks `/proc/<pid>/task`
 once per process and issues syscalls only; failures are counted, not logged
@@ -41,8 +45,13 @@ but learned biases keep applying and age out gracefully
 
 Implemented and benchmarked (2026-10-22): **6.0× cheaper than ananicy-cpp
 under a 2 000 execs/s spawn storm (2.28% vs 13.7% of one core)**, applying
-policies at exec time — the acceptance target of ≤5% is met in both storm
-variants. 112 unit/integration tests (2026-10-28). See
+policies at exec time. Read that number with its conditions: a uniform paced
+storm on an otherwise idle host, daemon only, no rule corpus. Real workloads
+differ — a parallel build delivers 2 000-5 000 execs/s in clustered bursts,
+the bias engine's window work scales with the observed task count, and on a
+2-vCPU box the same absolute cost is a larger share of a core. The budget is
+a target for the storm protocol, not a guarantee for your machine; measure
+your own with `tools/storm/` (source tree) or `pidstat -p $(pgrep aranicy)`. 112 unit/integration tests (2026-10-28). See
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full measurement protocol
 and results.
 
@@ -83,6 +92,28 @@ link cannot consume. `libbpf` is therefore a runtime dependency; `cargo`, `clang
 and `llvm` are build dependencies for the BPF object.
 
 ## Install
+
+### From the package (Arch)
+
+```sh
+sudo pacman -U aranicy-collector-0.3.0-1-x86_64.pkg.tar.zst \
+                aranicy-0.3.0-1-x86_64.pkg.tar.zst
+sudo systemctl enable --now aranicy      # Requires= pulls the collector in
+aranicy lint                             # what the daemon loaded
+systemctl status aranicy                 # active (running) + the startup log
+```
+
+The package ships **no rule corpus**: rule data from the ananicy ecosystem is
+GPL and is not bundled (`provides=ananicy-cpp`, so an old `ananicy-cpp`
+install is replaced and its package-owned rules go with it). Put your own
+files in `/etc/ananicy.d/` (`*.rules`, `*.types`, `*.cgroups`, scanned
+recursively) or point `ANANICY_CPP_CONFDIR` at a corpus; `aranicy lint`
+reports `0 rules` until you do, and the daemon warns about it at startup.
+
+The packaged documentation is `/usr/share/doc/aranicy/README.md`,
+`COMPATIBILITY.md` and `BENCHMARKS.md`.
+
+### From the tree
 
 Generic installer (binary + systemd unit + config; keeps any existing
 `/etc/ananicy.d` rules corpus; replaces `ananicy-cpp` unless told otherwise):

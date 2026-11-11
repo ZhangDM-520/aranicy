@@ -1,0 +1,18 @@
+# Same reasoning as the daemon package: a collector left running owns the BPF
+# programs and both sockets, so a reinstall cannot take effect and an uninstall
+# leaves the machine collecting.
+pre_remove() {
+    systemctl --quiet disable --now aranicy-collector.service 2>/dev/null || true
+}
+
+post_install() {
+    systemctl --quiet daemon-reload 2>/dev/null || true
+}
+
+post_upgrade() {
+    systemctl --quiet daemon-reload 2>/dev/null || true
+}
+
+post_remove() {
+    systemctl --quiet daemon-reload 2>/dev/null || true
+}

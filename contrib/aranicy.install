@@ -1,0 +1,16 @@
+# Keep going on upgrade/reinstall: the files below are replaced, the unit is
+# handled by the daemon's own restart logic on the next `systemctl start`.
+post_upgrade() {
+    systemctl --quiet daemon-reload 2>/dev/null || true
+}
+
+# A daemon that outlives its package keeps applying priorities from deleted
+# inodes, cannot be replaced by a reinstall (the new binary is a different
+# file), and leaves an `enabled` symlink pointing at nothing. Stop it first.
+pre_remove() {
+    systemctl --quiet disable --now aranicy.service 2>/dev/null || true
+}
+
+post_remove() {
+    systemctl --quiet daemon-reload 2>/dev/null || true
+}
