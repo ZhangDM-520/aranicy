@@ -467,6 +467,7 @@ fn reload(shared: &Arc<Shared>, paths: &Paths) {
             let changed = old.changed_keys(&cfg);
             let deferred = old.restart_only_changed(&cfg);
             let groups_changed = changed.contains(&"bias_group.*");
+            let old_rules = shared.rules();
             let bias_cfg = cfg.bias_config();
             let bias_groups = compile_bias_groups(&cfg);
             let n = load::rule_count(&rules);
@@ -484,6 +485,9 @@ fn reload(shared: &Arc<Shared>, paths: &Paths) {
             // where they are retried, so let it out of an unbounded wait.
             shared.nudge();
             tracing::info!("reloaded {n} rules; bias reconfigured");
+            // The swap alone leaves running processes on the old corpus (only
+            // `nice` had a re-assert path); re-plan them against the new one.
+            reconcile_live(shared, &old_rules);
             if groups_changed {
                 tracing::info!(
                     "bias_group.* changed; existing bias history re-keyed under the new families"
@@ -604,6 +608,80 @@ fn maybe_summary(shared: &Shared, source: &EventClient, state: &mut SummaryState
         drift_dims = %drift.dims,
         "apply summary"
     );
+}
+
+/// Re-plan every live process under a freshly loaded corpus (ADR 0002).
+///
+/// A reload swaps the rule tree; nothing re-examined the processes already
+/// running. Drift re-asserts `nice` only, so an edit to `ioclass`, `cgroup`,
+/// `sched` or `oom_score_adj` never reached them, and a deleted rule left its
+/// dimensions behind while the learner took the nice. One pass fixes both:
+/// apply the new plan (idempotent), and for a name the new corpus no longer
+/// matches, apply what the old rule has to give back.
+///
+/// Counters are throwaway: a reload is not the event stream, and folding it
+/// into the per-minute `apply summary` would make a rule edit look like a
+/// storm. Kernel threads, PID 1 and the daemon's own process are never
+/// touched.
+fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let rules = shared.rules();
+    let cfg = shared.config();
+    let cgroups = shared.cgroups();
+    let applier = decision::SystemApplier {
+        cfg: &cfg,
+        caps: &shared.caps,
+        cgroups: &cgroups,
+    };
+    let counters = Counters::default();
+    let sink = Sink::new(&cfg, &shared.bias, Route::Reload);
+    let mut planned = 0usize;
+    let mut released = 0usize;
+    for entry in entries.flatten() {
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(pid) = procname::entry_pid(&entry.file_name()) else {
+            continue;
+        };
+        let mut stat = [0u8; STAT_CAP];
+        let Some(n) = shared.proc.read_stat(pid, &mut stat) else {
+            continue;
+        };
+        if procname::stat_is_kthread(&stat[..n]) {
+            continue;
+        }
+        let comm = procname::stat_comm(&stat[..n]).unwrap_or(b"");
+        let mut buf = [0u8; NAME_CAP];
+        let len = shared.proc.derive_name(pid, comm, &mut buf);
+        let Some(plan) = decision::reconcile_locked(
+            &buf[..len],
+            comm,
+            pid,
+            old_rules,
+            &rules,
+            &shared.bias,
+            &cfg,
+        ) else {
+            continue;
+        };
+        let name = std::str::from_utf8(&buf[..len]).unwrap_or("");
+        let released_this = old_rules.lookup(name).is_some() && rules.lookup(name).is_none();
+        decision::execute(plan, pid, &applier, &counters, &sink);
+        planned += 1;
+        if released_this {
+            released += 1;
+        }
+    }
+    if planned > 0 {
+        tracing::info!(
+            processes = planned,
+            released,
+            "re-planned live processes against the new corpus"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -44,10 +44,10 @@
 //! fields, no allocation). Formatting happens only when a summary is emitted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use aranicy_apply::{apply_policy, ActionOutcome, ApplyReport, Capabilities, CgroupManager};
-use aranicy_model::Policy;
+use aranicy_model::{IoClass, Policy, SchedPolicy};
 use aranicy_rules::RuleSet;
 
 use crate::bias::BiasEngine;
@@ -280,6 +280,116 @@ pub fn plan_locked<'a>(
     plan(name, comm, pid, rules, &engine, cfg)
 }
 
+/// What a rule that is no longer in the corpus must give back: every
+/// dimension it set, back to the kernel default.
+///
+/// `cpuset` is deliberately excluded — there is no safe "unset" (the process
+/// was confined on purpose, possibly by its unit, and widening to every CPU is
+/// worse than leaving the set in place). ADR 0002 records the trade-off.
+fn release_policy(old: &Policy) -> Policy {
+    Policy {
+        nice: old.nice.map(|_| 0),
+        // `latency_nice` falls back to `nice` at apply time, so a nice-only
+        // rule still set it.
+        latency_nice: old.latency_nice.or(old.nice).map(|_| 0),
+        sched: old.sched.map(|_| SchedPolicy::Normal),
+        rtprio: old.rtprio.map(|_| 0),
+        ioclass: old.ioclass.map(|_| IoClass::None),
+        ionice: old.ionice.map(|_| 0),
+        oom_score_adj: old.oom_score_adj.map(|_| 0),
+        cgroup: old.cgroup.as_ref().map(|_| Arc::from("")),
+        cpuset: None,
+        autogroup: old.autogroup.map(|_| 0),
+        bias: None,
+    }
+}
+
+/// Fill the dimensions a deleted rule has to give back into a plan the new
+/// corpus produced (the learner's own `nice` survives; everything else the
+/// old rule set is reset).
+fn fill_released(desired: &mut Policy, old: &Policy) {
+    let rel = release_policy(old);
+    desired.nice = desired.nice.or(rel.nice);
+    desired.latency_nice = desired.latency_nice.or(rel.latency_nice);
+    desired.sched = desired.sched.or(rel.sched);
+    desired.rtprio = desired.rtprio.or(rel.rtprio);
+    desired.ioclass = desired.ioclass.or(rel.ioclass);
+    desired.ionice = desired.ionice.or(rel.ionice);
+    desired.oom_score_adj = desired.oom_score_adj.or(rel.oom_score_adj);
+    desired.cgroup = desired.cgroup.clone().or(rel.cgroup);
+    desired.autogroup = desired.autogroup.or(rel.autogroup);
+}
+
+/// Decide what a reload owes a process that is already running.
+///
+/// `old` is the rule tree that was live until this reload. A process the new
+/// corpus still matches gets its full plan re-applied (idempotent, and the
+/// only way an edit reaches a dimension drift does not re-assert); a process
+/// whose rule was deleted gets the old rule's dimensions reset, under any
+/// `nice` the learner now wants. `None` = nothing to do.
+pub fn reconcile<'a>(
+    name: &'a [u8],
+    comm: &'a [u8],
+    pid: u32,
+    old: &RuleSet,
+    new: &RuleSet,
+    bias: &BiasEngine,
+    cfg: &Config,
+) -> Option<Plan<'a>> {
+    if name.is_empty() || pid == 1 || pid == std::process::id() {
+        return None;
+    }
+    let name = std::str::from_utf8(name).ok()?;
+    let comm = std::str::from_utf8(comm).unwrap_or(name);
+    let old_policy = old.lookup(name).map(|(p, _)| p);
+    let still_matched = new.lookup(name).is_some();
+    match plan(name.as_bytes(), comm.as_bytes(), pid, new, bias, cfg) {
+        Plan::Apply {
+            mut policy,
+            target,
+            base,
+            key,
+        } => {
+            if !still_matched {
+                fill_released(&mut policy, old_policy?);
+            }
+            Some(Plan::Apply {
+                policy,
+                target,
+                base,
+                key,
+            })
+        }
+        // No rule and no bias: only a rule that disappeared has anything owed.
+        Plan::Skip {
+            reason: Skip::NoRule,
+        } => {
+            let old = old_policy?;
+            Some(Plan::Apply {
+                policy: release_policy(old),
+                target: 0,
+                base: 0,
+                key: BiasKey { name, comm },
+            })
+        }
+        Plan::Skip { reason } => Some(Plan::Skip { reason }),
+    }
+}
+
+/// [`reconcile`] with the engine-lock protocol handled here.
+pub fn reconcile_locked<'a>(
+    name: &'a [u8],
+    comm: &'a [u8],
+    pid: u32,
+    old: &RuleSet,
+    new: &RuleSet,
+    bias: &Mutex<BiasEngine>,
+    cfg: &Config,
+) -> Option<Plan<'a>> {
+    let engine = bias.lock().unwrap_or_else(PoisonError::into_inner);
+    reconcile(name, comm, pid, old, new, &engine, cfg)
+}
+
 /// Drift correction's delta rule: re-assert only a `nice` that actually
 /// moved. A policy that dictates no nice (a cgroup/sched-only rule) has
 /// nothing for the corrector to re-assert, and a process already at the
@@ -299,6 +409,8 @@ pub fn settle<'a>(plan: Plan<'a>, current_nice: i8) -> Plan<'a> {
 pub enum Route {
     Exec,
     Drift,
+    /// A reload re-planned a process that was already running (ADR 0002).
+    Reload,
 }
 
 impl Route {
@@ -306,6 +418,7 @@ impl Route {
         match self {
             Route::Exec => "exec",
             Route::Drift => "drift",
+            Route::Reload => "reload",
         }
     }
 }
@@ -777,6 +890,140 @@ mod tests {
             panic!("bias: true must behave like an absent key, got {plan:?}");
         };
         assert_eq!(policy.nice, Some(3), "the learned axis still applies");
+    }
+
+    fn rules_of(name: &str, policy: Policy) -> RuleSet {
+        let mut rules = RuleSet::empty();
+        rules.exact.insert(Arc::from(name), Arc::new(policy));
+        rules
+    }
+
+    /// `kaz-8`: an edit reached a running process only for `nice`, because
+    /// drift re-asserts that one dimension. A reload must re-apply the whole
+    /// plan even when `nice` did not move.
+    #[test]
+    fn a_reload_reapplies_a_dimension_drift_never_reasserts() {
+        let old = rules_with("game", Some(-5));
+        let new = rules_of(
+            "game",
+            Policy {
+                nice: Some(-5),
+                ioclass: Some(IoClass::BestEffort),
+                ionice: Some(7),
+                ..Policy::default()
+            },
+        );
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+
+        let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .expect("a matched process is re-planned");
+        let Plan::Apply { policy, .. } = &plan else {
+            panic!("expected an apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(-5), "unchanged nice");
+        assert_eq!(policy.ioclass, Some(IoClass::BestEffort), "the edit landed");
+        assert_eq!(policy.ionice, Some(7));
+    }
+
+    /// `kaz-11`: deleting a rule left its dimensions on the process. They must
+    /// be given back, not merely forgotten.
+    #[test]
+    fn a_deleted_rule_gives_back_every_dimension_it_set() {
+        let old = rules_of(
+            "game",
+            Policy {
+                nice: Some(-7),
+                ioclass: Some(IoClass::BestEffort),
+                ionice: Some(3),
+                oom_score_adj: Some(-500),
+                cgroup: Some(Arc::from("games")),
+                autogroup: Some(5),
+                ..Policy::default()
+            },
+        );
+        let new = RuleSet::empty();
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+
+        let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .expect("a released process is re-planned");
+        let Plan::Apply { policy, target, .. } = &plan else {
+            panic!("expected an apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(0), "the kernel default");
+        assert_eq!(*target, 0);
+        assert_eq!(policy.ioclass, Some(IoClass::None));
+        assert_eq!(policy.ionice, Some(0));
+        assert_eq!(policy.oom_score_adj, Some(0));
+        assert_eq!(policy.cgroup.as_deref(), Some(""));
+        assert_eq!(policy.autogroup, Some(0));
+        assert!(policy.sched.is_none(), "the old rule set no scheduler");
+        assert!(policy.cpuset.is_none());
+    }
+
+    #[test]
+    fn a_deleted_rule_leaves_the_cpuset_in_place() {
+        let old = rules_of(
+            "game",
+            Policy {
+                nice: Some(-5),
+                cpuset: Some(aranicy_model::CpuSet::Alias(Arc::from("big-cores"))),
+                ..Policy::default()
+            },
+        );
+        let new = RuleSet::empty();
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+        let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .expect("a released process is re-planned");
+        let Plan::Apply { policy, .. } = &plan else {
+            panic!("expected an apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(0));
+        assert!(
+            policy.cpuset.is_none(),
+            "widening affinity to every CPU is worse than leaving it"
+        );
+    }
+
+    #[test]
+    fn a_deleted_rule_keeps_the_learners_nice_but_gives_back_the_rest() {
+        let old = rules_of(
+            "game",
+            Policy {
+                nice: Some(-7),
+                ioclass: Some(IoClass::BestEffort),
+                ionice: Some(3),
+                ..Policy::default()
+            },
+        );
+        let new = RuleSet::empty();
+        let engine = Mutex::new(engine_with("game", 3));
+        let cfg = Config::default();
+
+        let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .expect("a released process is re-planned");
+        let Plan::Apply { policy, target, .. } = &plan else {
+            panic!("expected an apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(3), "the learner's say, not 0");
+        assert_eq!(*target, 3);
+        assert_eq!(policy.ioclass, Some(IoClass::None), "the rule's IO class goes");
+        assert_eq!(policy.ionice, Some(0));
+    }
+
+    #[test]
+    fn reconcile_ignores_names_neither_corpus_knows_and_never_pid_one() {
+        let empty = RuleSet::empty();
+        let engine = Mutex::new(engine_with("other", 0));
+        let cfg = Config::default();
+        assert!(reconcile_locked(b"stranger", b"stranger", 4242, &empty, &empty, &engine, &cfg).is_none());
+        let old = rules_with("init", Some(19));
+        assert!(
+            reconcile_locked(b"init", b"init", 1, &old, &empty, &engine, &cfg).is_none(),
+            "PID 1 has its own route"
+        );
     }
 
     #[test]
