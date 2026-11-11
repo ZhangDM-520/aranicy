@@ -57,6 +57,13 @@ pub struct Durable {
     pub confidence: f64,
     /// Closed-loop mismatch freeze (restored entries keep the re-baseline flag).
     pub frozen: bool,
+    /// Lean axis (shadow mode): mean burst (ns per schedule) and hop rate
+    /// (sleeps/s) of the last window that carried runtime evidence. 0 = no
+    /// evidence. Recorded so `tools/replay-bias/replay.py` can re-run the
+    /// two-axis verdict offline against a captured population instead of
+    /// trusting the live counters (ADR 0003).
+    pub burst_ns: u64,
+    pub hop_hz: u64,
 }
 
 /// One persisted per-name history entry. `Durable` is flattened so the
@@ -158,6 +165,7 @@ mod tests {
                         last_seen: 1_760_000_000,
                         confidence: 0.75,
                         frozen: false,
+                        ..Durable::default()
                     },
                 },
                 EntrySnapshot {
@@ -170,6 +178,7 @@ mod tests {
                         last_seen: 1_760_000_060,
                         confidence: 0.25,
                         frozen: true,
+                        ..Durable::default()
                     },
                 },
             ],
@@ -187,6 +196,22 @@ mod tests {
         // Save again over an existing file (tmp + rename must clobber cleanly).
         save(&snap, &path).expect("resave");
         assert_eq!(load(&path).expect("load").expect("present"), snap);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lean inputs are part of the record, not of the live half: the
+    /// offline replay gate reads them from a snapshot (ADR 0003).
+    #[test]
+    fn lean_inputs_survive_the_round_trip() {
+        let dir = scratch_dir("lean_round_trip");
+        let path = dir.join("state.json");
+        let mut snap = sample_snapshot();
+        snap.entries[0].durable.burst_ns = 5_000_000;
+        snap.entries[0].durable.hop_hz = 3;
+        save(&snap, &path).expect("save");
+        let loaded = load(&path).expect("load").expect("present");
+        assert_eq!(loaded.entries[0].durable.burst_ns, 5_000_000);
+        assert_eq!(loaded.entries[0].durable.hop_hz, 3);
         fs::remove_dir_all(&dir).ok();
     }
 

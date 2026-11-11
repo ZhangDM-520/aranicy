@@ -421,8 +421,12 @@ with test-thread names excluded (they are 300+ of 4096 live entries and score
   mostly `old=Bulk new=Responsive` for browser/IO threads — which is exactly
   what the ADR's flip gate exists to adjudicate. Do not "fix" the population
   boundary from this number alone.
-- The config key is reconfigurable on reload; the live host currently has it
-  on, with a pre-image at `/var/lib/aranicy/ananicy.conf.pre-shadow-20261109`.
+- The config key is reconfigurable on reload; pre-images live at
+  `/var/lib/aranicy/ananicy.conf.pre-shadow-*`. The snapshot now records
+  `burst_ns`/`hop_hz` per entry when the key is on, and
+  `tools/replay-bias/replay.py` re-runs the verdict offline (ADR 0003: the
+  promotion gate is a quiet-host capture; the live host's config has the flag
+  off as of 2026-11-11 19:30).
 - `runs`/`sleeps` (per-window counts, additive on the wire) exist for exact
   offline replay; the live shadow still uses the per-row means. A missing
   field is 0 = no evidence on the lean axis only.

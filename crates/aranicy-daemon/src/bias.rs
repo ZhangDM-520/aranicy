@@ -531,7 +531,12 @@ impl Entry {
         // accumulation in `absorb` and nothing else.
         let lean_window = if cfg.shadow && self.live.win_lean_n > 0 {
             let n = self.live.win_lean_n;
-            Some((self.live.win_burst_sum_ns / n, self.live.win_hop_sum / n))
+            let window = (self.live.win_burst_sum_ns / n, self.live.win_hop_sum / n);
+            // Persisted so the verdict can be replayed offline (ADR 0003);
+            // the recorded population is the only evidence the gate accepts.
+            self.durable.burst_ns = window.0;
+            self.durable.hop_hz = window.1;
+            Some(window)
         } else {
             None
         };
@@ -2716,9 +2721,28 @@ mod tests {
         let (off_snap, off_changes) = run(false);
         let (on_snap, on_changes) = run(true);
         assert_eq!(off_changes, on_changes, "shadow must not move any bias");
+        // The two capture fields are the one durable difference by design
+        // (ADR 0003): the verdict must be replayable offline. Everything the
+        // state machine reads must still be identical.
+        fn without_lean(mut s: BiasSnapshot) -> BiasSnapshot {
+            for e in &mut s.entries {
+                e.durable.burst_ns = 0;
+                e.durable.hop_hz = 0;
+            }
+            s
+        }
         assert_eq!(
-            off_snap, on_snap,
-            "shadow must not reach the persisted (durable) state"
+            without_lean(off_snap.clone()),
+            without_lean(on_snap.clone()),
+            "shadow must not reach any decision state"
+        );
+        assert!(
+            on_snap.entries.iter().any(|e| e.durable.burst_ns > 0),
+            "shadow-on must record the lean inputs for the replay"
+        );
+        assert!(
+            off_snap.entries.iter().all(|e| e.durable.burst_ns == 0),
+            "shadow-off must record nothing"
         );
         // ...and the off run really did compute nothing.
         assert_eq!(off_snap.version, BIAS_STATE_VERSION);

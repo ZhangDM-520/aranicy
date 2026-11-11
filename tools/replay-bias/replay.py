@@ -26,8 +26,15 @@ effect can be shown.
 
 import argparse
 import json
+import math
 import statistics
 import sys
+
+# The two-axis boundary, mirrored from crates/aranicy-daemon/src/classify.rs so
+# the replay and the live shadow call the same arithmetic (ADR 0003).
+STAGE_MIN_NS = 64_000  # cake SEAT_BURST_MIN_NS
+HOP_MIN_HZ = 100  # hop floor
+BURST_FLOOR_NS = 1_464  # cake handoff floor
 
 # libtest thread names are the test path truncated to 15 characters; the
 # detectable shapes are a `::` path, a `tests:` segment, or a 15-char token
@@ -61,6 +68,67 @@ def sweep(bulk, responsive, deadband_pct):
         if best_band is None or band < best_band[1]:
             best_band = (t, band)
     return best_hard, best_band
+
+
+def lean_value(burst_ns, hop_hz):
+    """Mirror of `classify::lean`: positive = bulk, negative = responsive."""
+    if burst_ns == 0:
+        return None
+    burst = max(burst_ns, BURST_FLOOR_NS) / STAGE_MIN_NS
+    rate = max(hop_hz, HOP_MIN_HZ) / HOP_MIN_HZ
+    return math.log2(burst) - math.log2(rate)
+
+
+def lean_report(cohort, deadband_pct):
+    """Re-run the two-axis verdict over a captured population.
+
+    The stored `class` is the *actuated* (post-hysteresis) label, so a
+    disagreement here is the same shape the live `bias shadow` counters report
+    but not the same denominator: live compares against the pre-hysteresis
+    `cand`, some of which is `None` (deadband) and shows up as unilateral.
+    """
+    deadband = math.log2(1 + deadband_pct / 100)
+    agree = disagree = unilateral = no_evidence = 0
+    examples = []
+    for e in cohort:
+        burst = e.get("burst_ns", 0)
+        hop = e.get("hop_hz", 0)
+        value = lean_value(burst, hop)
+        if value is None:
+            no_evidence += 1
+            continue
+        if abs(value) <= deadband:
+            continue
+        lean_cls = "bulk" if value > 0 else "responsive"
+        pop = e.get("class")
+        if pop in ("bulk", "responsive"):
+            if pop == lean_cls:
+                agree += 1
+            else:
+                disagree += 1
+                if len(examples) < 8:
+                    examples.append(
+                        {
+                            "name": e.get("name"),
+                            "lean": round(value, 3),
+                            "lean_class": lean_cls,
+                            "class": pop,
+                            "burst_ns": burst,
+                            "hop_hz": hop,
+                        }
+                    )
+        else:
+            unilateral += 1
+    decided = agree + disagree + unilateral
+    return {
+        "cohort_with_lean_inputs": decided,
+        "no_evidence": no_evidence,
+        "agree": agree,
+        "disagree": disagree,
+        "unilateral": unilateral,
+        "disagreement_pct": round(100 * disagree / decided, 1) if decided else 0.0,
+        "examples": examples,
+    }
 
 
 def main() -> int:
@@ -109,6 +177,7 @@ def main() -> int:
     viol_resp = sum(1 for x in resp if x <= lo)
     viol = viol_bulk + viol_resp
     best_hard, best_band = sweep(bulk, resp, args.deadband_pct)
+    lean = lean_report(cohort, args.deadband_pct)
 
     report = {
         "snapshot": args.snapshot,
@@ -141,6 +210,7 @@ def main() -> int:
             "hard": {"threshold": best_hard[0], "errors": best_hard[1]},
             "band": {"threshold": best_band[0], "errors": best_band[1]},
         },
+        "lean": lean,
     }
 
     if args.json:
@@ -172,6 +242,26 @@ def main() -> int:
             "  note: labels came from the population boundary, so 'best' recovers T; "
             "this is a compatibility check, not accuracy."
         )
+        if lean["cohort_with_lean_inputs"] == 0:
+            print(
+                "  lean axis: no captured burst/hop inputs — run with "
+                "bias_shadow = true so the snapshot records them (ADR 0003)."
+            )
+        else:
+            print(
+                f"  lean axis: {lean['agree']} agree / {lean['disagree']} disagree "
+                f"({lean['disagreement_pct']}%) / {lean['unilateral']} unilateral; "
+                f"{lean['no_evidence']} without runtime evidence"
+            )
+            for ex in lean["examples"]:
+                print(
+                    f"    {ex['name']}: lean {ex['lean']:+.2f} = {ex['lean_class']}, "
+                    f"actuated {ex['class']} (burst {ex['burst_ns']} ns, {ex['hop_hz']} hops/s)"
+                )
+            print(
+                "  note: the stored class is post-hysteresis; the live counters compare "
+                "against the pre-hysteresis verdict, so the percentages differ."
+            )
 
     if args.max_violations is not None and viol > args.max_violations:
         print(

@@ -236,6 +236,13 @@ silently live.
   record at all (after a restart — the expectation is not persisted) re-baselines
   on a fresh sample; an explicitly released claim (`note_applied(name, None)`:
   the apply did not take) keeps the freeze.
+- The **two-axis lean classifier** (`burst` vs `hop`, absolute units) is
+  implemented and runs as an *observer* under `bias_shadow`: it is compared
+  against the window's population verdict, counted (`windows`,
+  `disagreements`, `unilateral`) and logged, but never actuates. With the flag
+  on, the snapshot also records each entry's `burst_ns`/`hop_hz` so
+  `tools/replay-bias/replay.py` can re-run the verdict offline; ADR 0003 holds
+  the promotion gate.
 - Classification: per-sample score from weight-free sched stats against a
   population threshold (EWMA of the population mean score). BULK below and
   RESPONSIVE above the `bias_deadband_pct` band for 2 consecutive

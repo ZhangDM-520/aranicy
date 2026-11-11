@@ -1,0 +1,61 @@
+# ADR 0003 — the lean classifier stays observational until it is replayed
+
+Status: **accepted**. Date: 2026-11-11. Depends on ADR 0001. Evidence:
+round-3 `dana-4`.
+
+## Context
+
+ADR 0001 killed the absolute-anchor proposal (the best anchor simply tracks
+the live population `T`; re-measured today: `T = 1375`, 909 confident entries,
+anchor 1185 violates 6.93 %) and named the next attempt: the two-axis `lean`
+classifier already behind `bias_shadow`.
+
+That classifier is implemented (`classify.rs`): `lean = log2(burst/64 µs) −
+log2(hop/100 Hz)`, a multiplicative deadband, and burst 0 = no evidence. It is
+free of population statistics and is wired into `close_window` where it is
+compared — as an observer only — against the pre-hysteresis `cand`, with
+counters (`windows`, `disagreements`, `unilateral`) and rate-limited logs.
+
+What kept it observational is not doubt about the arithmetic; it is the
+capture. The persisted snapshot stored only `score_ema`, so the two-axis
+verdict could not be re-run offline at all: promoting it would have been
+assertion, and the round-3 `dana-4` reading (a shell at score 1011 and a CPU
+spinner at 3.9, both actuated `Bulk +3`) shows the cost of a wrong label.
+
+## Decision
+
+1. The snapshot now records the lean inputs — `burst_ns` and `hop_hz`, the
+   window means the verdict is computed from — when `bias_shadow` is on
+   (`Durable`, so they survive a restart and need no second projection).
+2. `tools/replay-bias/replay.py` re-runs the same arithmetic (mirrored
+   constants) over a captured snapshot and reports agreement, disagreement and
+   the concrete inverted names. It is the offline half of the gate.
+3. **The learner's actuation input is unchanged in this wave**:
+   `bias_shadow` remains observation-only.
+
+## Promotion gate (all three, on a quiet-host capture)
+
+A "quiet host" means no `cargo test` (libtest names fill the history with
+BULK-at-~200 entries) and no build: the capture is taken on an idle VM.
+
+1. **Disagreement < 10 % of decided entries**, computed by the replay, not by
+   the live counters (the live denominator includes deadband windows).
+2. **Every inversion is inspected, not just counted** — the ADR 0001 flip gate.
+   A chatty interactive name classified `Bulk` (the `shell` shape) is a
+   blocker even if the percentage passes: that is the +3 the engine would add.
+3. **A two-window lean hysteresis** exists before any actuation, symmetric with
+   the score classifier's streak, so a single odd window cannot step.
+
+If the capture passes 1–2, the next wave is `bias_lean_actuate`: the lean
+verdict replaces `cand` behind a config switch, with the hysteresis from 3 and
+the same clamped targets. If it does not pass, the numbers and the inverted
+names go in this ADR and the score classifier stays.
+
+## Consequences
+
+- The state file grows by two integers per entry (~24 bytes × 4096).
+- `bias_shadow = false` records no lean inputs: replay then reports "no
+  captured burst/hop inputs" instead of guessing.
+- The live counters remain the only view of the comparison against `cand`;
+  the replay compares against the persistent `class` (post-hysteresis) and its
+  output says so.
