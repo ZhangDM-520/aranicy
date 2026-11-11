@@ -28,7 +28,6 @@ HARD=(
     'aranicy_wire'
     'SAMPLE_CAP'
     'plan_locked'
-    'scx_stats'
     'v0\.3\.0 socket'
     '/home/zhangdm'
     'ZhangDM-520'
@@ -39,6 +38,7 @@ HARD=(
 # Vocabulary that could plausibly leak a design hint but might also be a user's
 # own words. Reported, never fatal.
 SOFT=(
+    'scx_stats'   # appears in the shipped README, so quoting the package is fine
     'bias engine'
     'shadow classif'
     'classifier'
