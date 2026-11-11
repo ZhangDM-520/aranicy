@@ -141,13 +141,13 @@ impl RuleSet {
     }
 }
 
-// Note: there is deliberately no comm-based prescreen. The compat match key is
-// `basename(argv[0])`, and `exec -a` lets argv[0] differ from comm entirely
-// (verified: a `sleep` process matched a rule named `gsa-smoke-uniq`). Any
-// filter that skips name resolution based on comm would silently miss rules,
-// breaking the compatibility contract. The hot path instead resolves argv[0]
-// with a single stack-buffered /proc/<pid>/cmdline read (no allocations),
-// then does the O(1) lookup above.
+// Note: there is deliberately no comm-based prescreen. The match key is
+// `basename(/proc/<pid>/exe)`, falling back to `basename(argv[0])` and then
+// the comm, and `exec -a` lets argv[0] differ from comm entirely (verified: a
+// `sleep` process matched a rule named `gsa-smoke-uniq`). Any filter that
+// skips name resolution based on comm would silently miss rules, breaking the
+// compatibility contract. The hot path instead resolves the name with
+// stack-buffered /proc reads (no allocations), then does the O(1) lookup above.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchKind {
@@ -344,8 +344,9 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
             // The match key is a basename (exe, then argv[0]) or a comm. A comm
             // is the key only when neither of those yields a basename, so a
             // separator-bearing key comes from the kernel-thread shape (never
-            // touched), a zombie, or a task that hides both; the name is dead
-            // weight for every process whose exe or argv[0] is readable.
+            // touched), a zombie, or a task whose exe is unreadable and whose
+            // argv[0] yields no basename; the name is dead weight for every
+            // process whose exe or argv[0] yields a basename.
             //
             // Only when the rule has no *compiled* `name_regex`: with one, the
             // exact key is dead but the definition may still apply through the

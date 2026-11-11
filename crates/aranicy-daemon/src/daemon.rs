@@ -54,7 +54,7 @@ struct Shared {
     /// traffic is tallied apart from the event counters (see `decision`).
     drift_counters: Counters,
     /// Dynamic nice bias engine (plan.md §4.2); lookups use the sample `comm`
-    /// namespace, rule bases use the argv[0]-derived match name
+    /// namespace, rule bases use the executable-derived match name
     /// (`decision::BiasKey` bundles the two for every decision).
     bias: Mutex<BiasEngine>,
     shutdown: AtomicBool,

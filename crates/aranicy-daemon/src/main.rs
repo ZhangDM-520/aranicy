@@ -57,7 +57,8 @@ enum Action {
     Lint,
     /// Show which rule a process name would match, without applying anything.
     MatchTest {
-        /// Process name as the daemon derives it (basename(argv[0])).
+        /// Process name as the daemon derives it (`basename(exe)`, then
+        /// `argv[0]`, then comm).
         name: String,
     },
 }

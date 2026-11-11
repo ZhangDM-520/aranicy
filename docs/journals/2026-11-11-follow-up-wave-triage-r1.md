@@ -185,10 +185,10 @@ parenthetical contradicted its own next clause — a `comm` set via `prctl`
 "the one separator-bearing comm … is a kernel thread". The `name_regex` row
 claimed the rest of the rule still applies (false for a regex-only rule) and
 called itself the only exception to "bad lines … are skipped" (a `cpuset` or
-`cgroup` that cannot be applied is another). The deferred ledger still counted
-the `comm` sentence as open after the row fixed it. The both-dead pin's
-message claimed the pattern matched no key while the rule's own path key is
-registered.
+`cgroup` that cannot be applied is another). It also called the ledger wrong
+for leaving the `comm` sentence open — premature, since the message half was
+still unfixed (round 13). The both-dead pin's message claimed the pattern
+matched no key while the rule's own path key is registered.
 
 All are addressed here: the row is rescoped, the `name_regex` row says the
 rule's other fields apply when another key matches, the ledger records the
@@ -207,21 +207,26 @@ HIGH, one MEDIUM, two LOW; Spec one MEDIUM, one LOW). The HIGH is mine. The
 shipped the corrected contract row beside the old message that told a corpus
 author a separator name "can never apply". The row was also narrower than
 `derive_name`: `comm` is the key when neither `exe` nor `argv[0]` *yields a
-basename* — a non-dumpable task makes both unreadable together, so an empty
-`argv[0]` is not required — and a zombie's `exe` link fails rather than being
-empty.
+basename*. A non-dumpable task supplies the first half (`exe` is denied while
+`cmdline` stays readable), so an empty `argv[0]` supplies the second — round 14
+measured this; "both unreadable" was wrong. A zombie's `exe` link fails rather
+than being empty.
 
 Fixed here: the message and its comment state the condition the row states (a
 basename from `exe` or `argv[0]`, or the raw `comm` when neither yields one),
 the row says a separator name "matches no basename key" and names the
 kernel-thread, zombie and hidden-both shapes, the pin's comment no longer
-claims the rule is dead for every process and the test now refuses a message
-that claims impossibility, and the module brief's key order (`exe`, then
-`argv[0]`, then comm) matches the code. The ledger records the `comm` item's
+claims the rule is dead for every process and the test now pins the lost
+wording (it rejects the literal "never apply"), and the module brief's key
+order (`exe`, then `argv[0]`, then comm) matches the code. The ledger records the `comm` item's
 two halves by round, which is what round 12 should have done once the row
 landed.
 
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes
-already placed in a cgroup, and that drift remains nice-only. Both are
-documented behaviours of the current design, not defects of this wave.
+already placed in a cgroup — a consequence not yet written into
+`COMPATIBILITY.md` — and that drift remains nice-only (ADR 0002). The report's
+Q7 un-pinned invariants (`daemon_cpu_count` is always `None` under test; a
+pre-created cgroup leaves `owned` empty in `a_quota_that_cannot_land`) are
+neither actioned nor deferred above; they are test-harness limits, not
+findings of the nine.

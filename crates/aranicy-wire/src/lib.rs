@@ -187,7 +187,7 @@ impl FrameBuf {
         &self.0[8..8 + comm_len]
     }
 
-    /// Match name resolved at capture (`basename(argv[0])` → exe → comm).
+    /// Match name resolved at capture (`basename(exe)` → `argv[0]` → comm).
     /// Empty when resolution failed; the daemon then falls back to comm.
     pub fn name(&self) -> &[u8] {
         let (_, _, name_len) = header(&self.0);

@@ -40,9 +40,11 @@ green/clean — the done-gate for any code wave).
 - After a mutation probe, restore the file WITHOUT `cp -p`: preserved mtimes can
   make cargo reuse the mutated artifact and report a phantom failure (or a
   phantom pass). `touch` the restored file, or copy without `-p`. Never restore
-  with `git checkout --` while the file also holds uncommitted edits — it
-  reverts those too, silently. (2026-11-12: that lost a rewritten lint message;
-  the next review round caught it against the commit message's claim.)
+  over a file that also holds uncommitted edits with `git checkout --` or
+  `git restore` — they overwrite working-tree changes silently. Re-apply the
+  inverse edit, or keep a `cp` copy taken before the probe and restore from it.
+  (2026-11-12: the first spelling lost a rewritten lint message; the next
+  review round caught it against the commit message's claim.)
 - Journal telemetry is only `bias changed` lines — freeze/rebaseline/classify
   events are silent. Each line now carries `prev`, `class` and `cause`
   (`Evidence`/`Relax`/`Flush`), so an evidence step and a relax stop looking

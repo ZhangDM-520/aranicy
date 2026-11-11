@@ -20,7 +20,8 @@
 //!
 //! A decision straddles two namespaces, and swapping them is silent, so they
 //! travel together in a [`BiasKey`]: rules match the **match name**
-//! (`basename(argv[0])`, resolved by the collector at capture time), bias
+//! (`basename(/proc/<pid>/exe)`, then `argv[0]`, then comm, resolved by the
+//! collector at capture time), bias
 //! history is filed under the **comm** (the kernel task name). They differ in
 //! real processes (an Electron binary execs `/usr/bin/electron` while its
 //! threads stay `Chrome_ChildIOT`).
@@ -81,7 +82,8 @@ impl<'a> BiasKey<'a> {
         self.comm
     }
 
-    /// The rule-match name (`basename(argv[0])`).
+    /// The rule-match name (`basename(/proc/<pid>/exe)`, then `argv[0]`, then
+    /// comm).
     pub fn name(&self) -> &'a str {
         self.name
     }

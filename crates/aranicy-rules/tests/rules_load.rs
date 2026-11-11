@@ -422,8 +422,10 @@ fn a_well_formed_explicit_cpuset_is_checked_against_the_host() {
     );
 }
 
-/// Matching is on the executable's basename, so a rule that spells a path is
-/// dead weight; `lint` has to say so rather than pass it silently.
+/// Matching is on the executable's basename (then `argv[0]`, then comm), so a
+/// rule that spells a path is dead weight for any process whose `exe` or
+/// `argv[0]` yields a basename; `lint` has to say so rather than pass it
+/// silently.
 #[test]
 fn a_name_with_a_path_separator_is_reported_at_load() {
     let f = Fixture::new("path-name");
@@ -437,8 +439,9 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
     assert_eq!(m.len(), 1, "{m:?}");
     assert!(m[0].contains("path separator") && m[0].contains("/usr/bin/foo"), "{m:?}");
     // `comm` is the key whenever neither `exe` nor `argv[0]` yields a
-    // basename, so the separator shapes include a zombie and a task that
-    // hides both; the message must not claim impossibility.
+    // basename, so the separator shapes include a zombie and a task whose
+    // `exe` is unreadable with an `argv[0]` that yields none; the message must
+    // not claim impossibility.
     assert!(!m[0].contains("never apply"), "{m:?}");
 
     // A rule that also carries a regex still applies through it, so its dead
@@ -490,7 +493,7 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
 
     // The recorded limit: no *basename* key can match this rule (the exact key
     // is a path, the pattern needs one), so it is dead weight for every process
-    // whose `exe` or `argv[0]` is readable — yet a pattern's reach is
+    // whose `exe` or `argv[0]` yields a basename — yet a pattern's reach is
     // undecidable from its text, so it loads silently. The rule itself is
     // registered: a key carrying a separator would match it. Keep this pin
     // honest if a language check ever replaces the limit.

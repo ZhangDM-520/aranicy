@@ -195,7 +195,7 @@ Scope and known limits (by design or measured):
   the tested mixes (contention drops the wake-score below the classification
   threshold). Bulk→positive is the exercised direction.
 - **History is keyed by kernel comm** (the lavd sample namespace); rules match
-  the argv[0]-derived name. A spoofed `exec -a` name therefore combines its
+  the executable-derived name (`exe` basename, then `argv[0]`, then comm). A spoofed `exec -a` name therefore combines its
   rule base with its *executable's* comm history — inherent to the sample
   stream, which carries only comm.
 - **Transient freeze on view lag**: lavd's sample `static_prio` can lag our
