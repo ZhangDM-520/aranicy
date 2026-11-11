@@ -44,6 +44,11 @@ pub struct Config {
     pub bias_starved_min_demand: u64,
     /// Share-starvation gate: starved when delivered < ratio * demand.
     pub bias_starved_ratio: f64,
+    /// Aggregate CPU demand a name must carry across a window before a step
+    /// that LOWERS its priority may be taken (0..1024, 1024 == one core).
+    /// Shells and one-shot tools stay at 0 however interactive their score
+    /// looks; steps that raise priority are never gated.
+    pub bias_attack_min_util: u64,
     /// Shadow mode: run the absolute lean classifier alongside the actuated
     /// one, log disagreements only. Default off (observation, never actuation).
     pub bias_shadow: bool,
@@ -154,6 +159,7 @@ config_key_table! {
     "bias_half_life_s" => Reconfigurable . bias_half_life_s;
     "bias_starved_min_demand" => Reconfigurable . bias_starved_min_demand;
     "bias_starved_ratio" => Reconfigurable . bias_starved_ratio;
+    "bias_attack_min_util" => Reconfigurable . bias_attack_min_util;
     // Shadow mode and its two axes are observation knobs: the flip may be
     // toggled and the boundary tuned on a reload, without touching history.
     "bias_shadow" => Reconfigurable . bias_shadow;
@@ -198,6 +204,7 @@ impl Default for Config {
             collector_wait_ms: 5000,
             bias_starved_min_demand: 64,
             bias_starved_ratio: 0.5,
+            bias_attack_min_util: 512,
             bias_shadow: false,
             bias_lean_stage_min_ns: crate::classify::STAGE_MIN_NS,
             bias_lean_hop_hz: crate::classify::HOP_MIN_HZ,
@@ -358,6 +365,13 @@ impl Config {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.bias_starved_ratio = v,
                     _ => bad(&mut cfg, "bias_starved_ratio (0.0..=1.0)"),
                 },
+                "bias_attack_min_util" => match value.parse::<u64>() {
+                    // task_util_est is clamped to 1024 (one full CPU), so a
+                    // larger floor would disable attacks forever.
+                    Ok(v) if v <= 1024 => cfg.bias_attack_min_util = v,
+                    Ok(_) => bad(&mut cfg, "bias_attack_min_util (<= 1024)"),
+                    Err(_) => bad(&mut cfg, "bias_attack_min_util (u64)"),
+                },
                 "bias_shadow" => set_bool(value, &mut cfg.bias_shadow, idx, &mut cfg.warnings),
                 // 0 would divide by zero in log space; refuse it (warn and
                 // keep the default) instead of letting the axis go infinite.
@@ -455,6 +469,7 @@ impl Config {
             max_bias: self.bias_max,
             starved_min_demand: self.bias_starved_min_demand,
             starved_ratio: self.bias_starved_ratio,
+            attack_min_util: self.bias_attack_min_util,
             shadow: self.bias_shadow,
             lean_stage_min_ns: self.bias_lean_stage_min_ns,
             lean_hop_hz: self.bias_lean_hop_hz,
@@ -707,6 +722,7 @@ mod tests {
             collector_wait_ms: 1,
             bias_starved_min_demand: 1,
             bias_starved_ratio: 0.1,
+            bias_attack_min_util: 2,
             bias_shadow: true,
             bias_lean_stage_min_ns: 2,
             bias_lean_hop_hz: 3,
@@ -734,7 +750,7 @@ mod tests {
 
         let count = |l: Liveness| CONFIG_KEYS.iter().filter(|s| s.liveness == l).count();
         assert_eq!(count(Liveness::Live), 14);
-        assert_eq!(count(Liveness::Reconfigurable), 13);
+        assert_eq!(count(Liveness::Reconfigurable), 14);
         assert_eq!(count(Liveness::RestartOnly), 7);
         assert_eq!(count(Liveness::AcceptedOnly), 1);
     }

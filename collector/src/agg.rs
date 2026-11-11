@@ -9,8 +9,9 @@
 //!
 //! The sample fields, their units and their scales are defined once, on
 //! [`aranicy_wire::Sample`]; this module only produces that type. In short:
-//! `wait_freq`/`wake_freq` are events per second, `avg_runtime_wall` is
-//! nanoseconds per schedule, `task_util_est` is DEMAND (running + runnable
+//! `wait_freq`/`wake_freq` are events per second of the task's OWN activity
+//! (not per second of wall clock — see `per_active_sec`), `avg_runtime_wall`
+//! is nanoseconds per schedule, `task_util_est` is DEMAND (running + runnable
 //! duty) and `cpu_util_wall` is DELIVERED (running duty), both on the same
 //! 0..[`MAX_UTIL`] scale so starvation is `delivered < ratio * demand`, and
 //! `static_prio` is nice + [`NICE_OFFSET`].
@@ -46,7 +47,9 @@ pub struct RawAcc {
     pub comm: [u8; TASK_COMM_LEN],
     /// nice + 20 (the BPF side subtracts MAX_RT_PRIO).
     pub static_prio: u32,
-    pub pad: u32,
+    /// Bit 0: `PF_KTHREAD` (see `ACC_F_KTHREAD` in the BPF source). Was
+    /// padding, so the mirrored layout did not move.
+    pub flags: u32,
     pub run_ns: u64,
     pub runnable_ns: u64,
     pub runs: u64,
@@ -59,7 +62,17 @@ pub struct RawAcc {
     pub last_tick: u64,
 }
 
+/// `RawAcc::flags` bit 0: the task is a kernel thread (`PF_KTHREAD`), mirrored
+/// from `ACC_F_KTHREAD` in `bpf/collector.bpf.c`.
+pub const ACC_F_KTHREAD: u32 = 1;
+
 impl RawAcc {
+    /// Kernel thread: the daemon must never bias one (nice on a kthread is
+    /// meaningless, and the entry only competes for the shared step budget).
+    pub fn is_kernel_thread(&self) -> bool {
+        self.flags & ACC_F_KTHREAD != 0
+    }
+
     /// comm is NUL-padded; stop at the first NUL and replace invalid UTF-8.
     pub fn comm_str(&self) -> String {
         let end = self
@@ -83,7 +96,7 @@ impl RawAcc {
         Some(RawAcc {
             comm,
             static_prio: u32_at(16),
-            pad: u32_at(20),
+            flags: u32_at(20),
             run_ns: u64_at(24),
             runnable_ns: u64_at(32),
             runs: u64_at(40),
@@ -190,8 +203,24 @@ impl Aggregator {
                 continue;
             }
 
-            let per_sec = |delta: u64| -> f64 {
-                (u128::from(delta) * u128::from(NANOS_PER_SEC)) as f64 / dt as f64
+            // Event rates are per second of the task's OWN activity, not per
+            // second of wall clock. lavd's EWMA updated per scheduling event,
+            // so what it reported was `1e9 / inter-event interval`; dividing
+            // by the window instead multiplies the rate by the task's duty
+            // cycle, and short-lived tools have the smallest one. Measured
+            // 2026-11-11: a shell one-liner sleeping twice during 1 ms of a
+            // 500 ms window reported 4/s where lavd reported 2 000/s, which
+            // read as "never sleeps" and classified every shell utility BULK
+            // while the compiler fell into the deadband.
+            //
+            // `run_ns` and `runnable_ns` are disjoint (running vs runnable but
+            // not running), so their sum is exactly the interval scale the
+            // counters already carry. A task with no activity in the window
+            // has no active interval, so the window is the only scale left.
+            let active = d_run.saturating_add(d_runnable);
+            let per_active_sec = |delta: u64| -> f64 {
+                let scale = if active > 0 { active } else { dt };
+                (u128::from(delta) * u128::from(NANOS_PER_SEC)) as f64 / scale as f64
             };
             let util = |nanos: u64| -> u64 {
                 (((u128::from(nanos) * u128::from(MAX_UTIL)) / u128::from(dt)) as u64).min(MAX_UTIL)
@@ -218,8 +247,8 @@ impl Aggregator {
             } else {
                 0.0
             };
-            let inst_wait = per_sec(d_sleeps);
-            let inst_wake = per_sec(d_wakes);
+            let inst_wait = per_active_sec(d_sleeps);
+            let inst_wake = per_active_sec(d_wakes);
             let e = self.ema.entry(*pid).or_default();
             if seen_before {
                 e.wait += (inst_wait - e.wait) * alpha;
@@ -257,6 +286,7 @@ impl Aggregator {
                 // "never slept", not a missing measurement).
                 runs: u32::try_from(d_runs).unwrap_or(u32::MAX),
                 sleeps: u32::try_from(d_sleeps).unwrap_or(u32::MAX),
+                kthread: u64::from(c.is_kernel_thread()),
             });
         }
 
@@ -339,8 +369,11 @@ mod tests {
         let s = &rows[0];
         assert_eq!(s.pid, 7);
         assert_eq!(s.comm, "app");
-        assert_eq!(s.wait_freq, 50, "sleeps per second");
-        assert_eq!(s.wake_freq, 20, "wakes issued per second");
+        // 750 ms of activity (500 running + 250 runnable) holds 50 sleeps:
+        // one sleep per 15 ms of active time. The rate is per active second,
+        // never per window second (see `rate_is_per_active_second_...`).
+        assert_eq!(s.wait_freq, 67, "sleeps per ACTIVE second (50 / 0.75 s)");
+        assert_eq!(s.wake_freq, 27, "wakes issued per active second (20 / 0.75 s)");
         assert_eq!(s.avg_runtime_wall, 5_000_000, "500ms / 100 runs");
         assert_eq!(s.task_util_est, 768, "running + runnable = 75% of 1024");
         assert_eq!(s.cpu_util_wall, 512, "50% of 1024");
@@ -422,6 +455,80 @@ mod tests {
         assert!(agg.ingest(snap(7, idle), T0 + ONE_SEC).is_empty());
     }
 
+    /// The rate must be per ACTIVE second, not per window second.
+    ///
+    /// A shell utility that sleeps twice during 1 ms of activity inside a
+    /// 500 ms window has an inter-sleep interval of 500 us, i.e. 2 000
+    /// sleeps/s — the quantity lavd reported. Dividing by the window instead
+    /// reports 4/s, which reads as "never sleeps" and is exactly how the
+    /// v0.3.0 producer change turned `grep` (1033 -> 180) and every shell
+    /// one-liner into BULK (measured live 2026-11-11).
+    #[test]
+    fn rate_is_per_active_second_not_per_window_second() {
+        let mut agg = Aggregator::new();
+        agg.ingest(snap(7, acc("grep")), T0);
+
+        let mut c = acc("grep");
+        c.run_ns = 900_000; // 0.9 ms running
+        c.runnable_ns = 100_000; // 0.1 ms runnable: 1 ms active in a 500 ms window
+        c.runs = 2;
+        c.sleeps = 2;
+        c.wakes_issued = 1;
+        let rows = agg.ingest(snap(7, c), T0 + 500_000_000);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].wait_freq, 2_000,
+            "sleeps per ACTIVE second (1 ms active / 2 sleeps), not per window"
+        );
+        assert_eq!(rows[0].wake_freq, 1_000, "wakes per active second");
+    }
+
+    /// A task with counters that imply sleeps but zero active time cannot
+    /// define an active interval; the window is the only scale left, and the
+    /// division must not blow up.
+    #[test]
+    fn zero_active_time_falls_back_to_the_window_rate() {
+        let mut agg = Aggregator::new();
+        agg.ingest(snap(7, acc("app")), T0);
+
+        let mut c = acc("app");
+        c.sleeps = 2;
+        c.wakes_issued = 1;
+        let rows = agg.ingest(snap(7, c), T0 + ONE_SEC);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].wait_freq, 2, "window is the only scale available");
+        assert_eq!(rows[0].wake_freq, 1);
+    }
+
+    /// `PF_KTHREAD` is carried on the row so the daemon can refuse to bias a
+    /// kernel thread. It is the exact kernel test, not a name prefix: the
+    /// prefix list cannot cover `kworker/N:mm`, `kworker/R-*`, `rcuog/N` or
+    /// `idle_inject/N`, and a wrong guess either biases a kthread or loses a
+    /// real task.
+    #[test]
+    fn kernel_thread_rows_are_flagged() {
+        let mut agg = Aggregator::new();
+        let mut kt = acc("kworker/3");
+        kt.flags = ACC_F_KTHREAD;
+        kt.run_ns = ONE_SEC / 2;
+        kt.runs = 10;
+        let mut user = acc("cargo");
+        user.run_ns = ONE_SEC / 2;
+        user.runs = 10;
+        let mut cur = snap(7, kt);
+        cur.extend(snap(8, user));
+
+        agg.ingest(snap(7, acc("kworker/3")), T0);
+        let rows = agg.ingest(cur, T0 + ONE_SEC);
+
+        let by_pid: std::collections::BTreeMap<i64, bool> =
+            rows.iter().map(|s| (s.pid, s.is_kernel_thread())).collect();
+        assert_eq!(by_pid.get(&7), Some(&true), "kworker row must be flagged");
+        assert_eq!(by_pid.get(&8), Some(&false), "a user task is not a kthread");
+    }
+
     /// A task that is present in the map but does nothing must have its
     /// rates relaxed toward zero: otherwise a task idle for minutes reports
     /// its pre-idle rate in the first window it moves again.
@@ -430,9 +537,12 @@ mod tests {
         let mut agg = Aggregator::new();
         agg.ingest(snap(7, acc("app")), T0);
 
+        // Active for the whole window (running + runnable = dt), so this
+        // window's rate is 100/s under either scale: the test is about decay.
         let mut busy = acc("app");
         busy.runs = 10;
-        busy.run_ns = ONE_SEC / 10;
+        busy.run_ns = 9 * ONE_SEC / 10;
+        busy.runnable_ns = ONE_SEC / 10;
         busy.sleeps = 100;
         busy.wakes_issued = 100;
         let rows = agg.ingest(snap(7, busy), T0 + ONE_SEC);
@@ -503,7 +613,7 @@ mod tests {
         let mut bytes = Vec::with_capacity(size_of::<RawAcc>());
         bytes.extend_from_slice(&a.comm);
         bytes.extend_from_slice(&a.static_prio.to_ne_bytes());
-        bytes.extend_from_slice(&a.pad.to_ne_bytes());
+        bytes.extend_from_slice(&a.flags.to_ne_bytes());
         for f in [
             a.run_ns,
             a.runnable_ns,

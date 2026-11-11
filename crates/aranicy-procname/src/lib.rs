@@ -287,6 +287,38 @@ pub fn stat_nice(stat: &[u8]) -> Option<i8> {
     None
 }
 
+/// `PF_KTHREAD` in `/proc/<pid>/stat` field 9 (`flags`), `include/linux/sched.h`.
+pub const PF_KTHREAD: u64 = 0x0020_0000;
+
+/// The task behind this `/proc/<pid>/stat` is a kernel thread.
+///
+/// The exact test, read from the task itself: a name list cannot cover
+/// `kworker/N:mm`, `kworker/R-*`, `rcuog/N` or `idle_inject/N`. Nicing a
+/// kernel thread is meaningless, so no route may ever apply to one — this is
+/// the runtime guard that also covers history written before the collector
+/// started flagging rows.
+pub fn stat_is_kthread(stat: &[u8]) -> bool {
+    let Some(close) = stat.iter().rposition(|&b| b == b')') else {
+        return false;
+    };
+    let rest = &stat[close + 1..];
+    // Tokens after comm start at field 3 (state); flags is field 9 -> index 6.
+    let mut idx = 0usize;
+    for tok in rest.split(|&b| b == b' ') {
+        if tok.is_empty() {
+            continue;
+        }
+        if idx == 6 {
+            return std::str::from_utf8(tok)
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .is_some_and(|f| f & PF_KTHREAD != 0);
+        }
+        idx += 1;
+    }
+    false
+}
+
 /// Basename-compaction in place: given `buf[..n]` holds a path, move its
 /// basename to the front and return its length.
 fn compact_basename(buf: &mut [u8], n: usize) -> usize {
@@ -386,6 +418,23 @@ mod tests {
         assert_eq!(stat_nice(stat), Some(-5));
         let stat = b"42 (name with spaces) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 19 20";
         assert_eq!(stat_nice(stat), Some(19));
+    }
+
+    /// Kernel threads must be recognisable from `/proc/<pid>/stat` alone:
+    /// their `comm` is a free-form name, so no prefix list is exact.
+    #[test]
+    fn stat_flags_identify_kernel_threads() {
+        // flags is field 9 -> index 6 after the comm.
+        // 2129984 = 0x208000, i.e. PF_KTHREAD plus PF_NO_SETAFFINITY — the
+        // value this host's own kthreadd reports.
+        let kt = b"2 (kworker/u97:2) S 2 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0";
+        assert!(stat_is_kthread(kt), "kworker carries PF_KTHREAD");
+        let user = b"4242 (cargo) S 4241 4241 4241 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0";
+        assert!(!stat_is_kthread(user), "a user task does not");
+        // A comm containing ')' must not shift the field index.
+        let odd = b"7 (evil ) name) S 1 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0";
+        assert!(stat_is_kthread(odd), "last ')' closes the comm");
+        assert!(!stat_is_kthread(b"truncated"), "unparseable is not a kthread");
     }
 
     #[test]

@@ -154,6 +154,45 @@ accepts and always errors retries at the floor forever.
   connections; resetting per connection silently replays the first (often the
   failure) entry and wedges reconnect tests in confusing ways.
 
+## Bias signal: what the producer must and must not change — Last reviewed: 2026-11-11
+
+- **The rate fields are per second of the task's OWN activity** (`Aggregator`
+  divides by `run_ns + runnable_ns`, falling back to the window when a task was
+  never active). The window denominator multiplies the rate by the task's duty
+  cycle; lavd's per-event EWMA reported `1e9 / inter-sleep interval`, so the
+  window form is not the same quantity. It is pinned by
+  `agg::tests::rate_is_per_active_second_not_per_window_second`.
+- **The score axis ranks interaction rate, so it cannot decide actuation.**
+  Live 2026-11-11: `bash`, `cat`, `grep`, `ls`, `date`, `rm`, `git`, `gcc` and
+  `kthreadd` held bias +3 while `cargo`, `makepkg`, `ninja` and `rustc` sat at
+  0. A chatty one-shot tool outranks a compiler on that axis. Steps that LOWER
+  priority are now gated on the name's AGGREGATE demand across the window
+  (`BiasConfig::attack_min_util`, default 512 of 1024 = half a core), because
+  a per-row mean cannot see a `make -j24` of 80 ms `cc1plus` instances — it
+  calls the canonical bulk workload unattackable. Steps that RAISE priority
+  (starved → −1, every release) are never gated. Check the *effect*
+  (`dump bias` + live nice), not the class labels.
+- **A kernel thread must never be touched on any route.** Rows carry the
+  `PF_KTHREAD` flag and `absorb` skips them, AND the drift scan re-checks
+  `PF_KTHREAD` from `/proc/<pid>/stat` (`procname::stat_is_kthread`) before it
+  acts — the second check is what protects history written before the flag
+  existed, which otherwise keeps applying for ~an hour after an upgrade.
+- **Kernel threads are excluded by `PF_KTHREAD`, not by name.** The flag rides
+  in `task_acc.flags` (the old padding word, so the layout did not move).
+  `vmlinux.h` carries no macros, so `PF_KTHREAD` must be defined by hand
+  (`0x00200000`), and it is refreshed on exec because a pid can be recycled.
+- **The scx_stats row has a SECOND projection on the daemon side.** The
+  `Sampler`'s `lenient_sample` rebuilds each row from a whitelist
+  (`UNSIGNED_FIELDS`) and silently drops anything absent — that is how the
+  kernel-thread flag shipped dead (83 kthread entries right after deploy).
+  `every_contract_field_survives_the_lenient_parse` round-trips every field of
+  `Sample`, so adding a contract field without a whitelist line is now red.
+- **A restored entry cannot attack until fresh demand is measured**: `restore`
+  carries no `demand_ewma`, so a restart no longer re-arms the whole cohort
+  into the attack queue (the 2026-10-31 "32–45 wanters" clog).
+- `T` is an EWMA of the live population mean, so it tracks the population, not
+  a fixed calibration. After the rate fix it sits at ~1 190 on this host.
+
 ## Bias-engine control-law lessons — Last reviewed: 2026-11-09 (threshold-mean pitfall is live again: the v0.2.3 ramp-starvation defect is exactly this failure mode)
 
 - The engine has two verbs and the loop owes both per iteration: `ingest`

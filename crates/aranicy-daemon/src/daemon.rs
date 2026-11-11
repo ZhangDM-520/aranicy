@@ -657,6 +657,13 @@ fn drift_scan(shared: &Shared) {
         let Some(n) = shared.proc.read_stat(pid, &mut stat) else {
             continue;
         };
+        // Never touch a kernel thread, whatever the history says about its
+        // name. This is the exact test (PF_KTHREAD from the task itself), and
+        // it is also the guard for state written before the collector began
+        // flagging rows: a restored `kworker/*` entry must not keep applying.
+        if procname::stat_is_kthread(&stat[..n]) {
+            continue;
+        }
         let Some(current_nice) = procname::stat_nice(&stat[..n]) else {
             continue;
         };

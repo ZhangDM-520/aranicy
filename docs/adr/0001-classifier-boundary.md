@@ -120,6 +120,30 @@ scale.
 - 7b is a separate wave (collector fields + shadow mode + gate). No part of it
   is started by this ADR.
 
+## Addendum (2026-11-11) — the constant was measured against a broken producer
+
+The 18 % violation figure above was measured on a **distorted** score. The
+v0.3.0 collector computed `wait_freq`/`wake_freq` per WINDOW second
+(`delta * 1e9 / dt`), which multiplies the rate by the task's duty cycle and so
+collapsed the score of exactly the short-lived tools this boundary has to
+separate (`grep` 1033 → 180, `bash` 804 → 225). With the producer fixed to
+per-ACTIVE-second rates (the quantity scx_lavd's per-event EWMA reported), the same
+snapshot that produced 181/996 violations produces:
+
+| reading | anchor 1185 band | bulk p90 | responsive p10 |
+|---|---|---|---|
+| 2026-11-09 (window rates) | 267 violations (23.0 %) | 314 | 387 |
+| 2026-11-11 (active-second rates) | **2 violations (0.55 %)** | 970 | 1 444 |
+
+Two things follow. First, the cohorts now separate cleanly, so the
+`T`-tracking boundary is no longer papering over an inversion. Second, the
+rejected constant 1185 is nearly compatible *now* — which is evidence that it
+was a reasonable calibration of the intended metric, and that the metric, not
+the constant, was the defect. The decision below is unchanged (the population
+bet still ships, the flip still waits on shadow data), but no future boundary
+argument may cite the old violations number without saying which producer
+produced it.
+
 ## Reproduce
 
 ```sh

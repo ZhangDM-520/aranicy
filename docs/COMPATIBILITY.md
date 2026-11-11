@@ -70,7 +70,8 @@ loud failure, never silent rule-less operation.
 comments; the wire names are unchanged (`pid`, `comm`, `static_prio`,
 `wait_freq`, `wake_freq`, `avg_runtime_wall`, `task_util_est`,
 `cpu_util_wall`, and since the shadow classifier `runs`, `sleeps` — per-window
-counts, not rates, defaulted to 0 so an old producer still parses). Both util
+counts, not rates, defaulted to 0 so an old producer still parses — and
+`kthread`, a `PF_KTHREAD` flag (1 = kernel thread, defaulted to 0). Both util
 fields share the `aranicy_wire::MAX_UTIL` scale,
 so the starved gate
 (`demand > bias_starved_min_demand && delivered < bias_starved_ratio * demand`)
@@ -78,6 +79,44 @@ compares like with like; lavd emitted demand in 0..1024 and delivered in
 0..100, which made the comparison meaningless. A `wait_freq` of zero is a
 *meaningful* zero (the task never sleeps — the canonical bulk case), not a
 missing field.
+
+The two rate fields are per second of the task's **own activity** (running +
+runnable), not per second of wall clock. That denominator is what keeps the
+score comparable with the scx_lavd era it was designed against: lavd's
+per-event EWMA reported `1e9 / inter-sleep interval`, while dividing by the
+window scales the rate by the task's duty cycle and makes short-lived tools
+read as never-sleeping. Measured live 2026-11-11 — the window form put `bash`,
+`cat`, `grep`, `ls` and `date` at bias +3 while `cargo` fell into the deadband.
+
+A row whose `kthread` flag is set is skipped by the bias engine entirely: it
+gets no entry, contributes nothing to the population threshold, and never
+claims the shared step budget. The flag is `PF_KTHREAD`, read from the task
+struct in BPF (`ACC_F_KTHREAD`), not inferred from the name: the prefix list
+cannot cover `kworker/N:mm`, `kworker/R-*`, `rcuog/N` or `idle_inject/N`.
+
+**Deprioritising a name needs sustained load, not just a score.** A step that
+moves a name *up* in nice (target > 0, the bulk direction) requires its
+AGGREGATE demand across the window — the sum of its rows' `task_util_est`,
+where 1024 is one core — to reach `bias_attack_min_util` (default 512, i.e.
+half a core; 0 disables the gate). The score axis ranks *interaction rate*, so
+chatty one-shot tools (`ls`, `date`, `cut`, `chown`, `env`) rank as bulk-ish
+while using a few milliseconds of CPU per window; without the gate they spend
+the shared step budget and the real throughput work never ramps (measured live
+2026-11-11).
+
+The measure is deliberately the sum, not the per-row mean: a `make -j24` of
+80 ms `cc1plus` instances leaves every row at a low duty cycle (they are
+short-lived, not idle), so a mean-based floor would call the canonical bulk
+workload unattackable while passing a single long-lived `rustc`
+(`a_parallel_build_of_short_instances_can_still_learn`). Steps that *lower*
+nice — the starved-RESPONSIVE correction and every release — are never gated:
+un-learning and share correction always win
+(`the_demand_gate_never_blocks_a_starved_step`).
+
+No route ever applies to a kernel thread: rows carry a `PF_KTHREAD` flag that
+`absorb` skips, and the drift scan re-checks `PF_KTHREAD` from
+`/proc/<pid>/stat` before it acts, so history written before the flag existed
+cannot keep nicing `kworker/*`.
 
 **Observation budget** — `aranicy_wire::SAMPLE_CAP` (8192) bounds the rows one
 window may carry. It is one constant shared by producer and consumer: the

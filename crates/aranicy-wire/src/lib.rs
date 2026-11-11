@@ -57,9 +57,18 @@ pub struct Sample {
     pub comm: String,
     /// Kernel static priority: nice + 20 (see [`NICE_OFFSET`]).
     pub static_prio: u64,
-    /// Sleeps per second over the window (EWMA). 0 is a real measurement.
+    /// Sleeps per second of the task's OWN activity (EWMA). 0 is a real
+    /// measurement.
+    ///
+    /// The denominator is active time (running + runnable), never wall clock:
+    /// lavd's per-event EWMA reported `1e9 / inter-sleep interval`, and a
+    /// window-wide denominator instead multiplies the rate by the task's duty
+    /// cycle, so a shell one-liner sleeping twice in 1 ms of a 500 ms window
+    /// reads 4/s and classifies as BULK (measured live 2026-11-11: that put
+    /// `bash`/`cat`/`grep` at bias +3 and the compiler in the deadband).
     pub wait_freq: u64,
-    /// Wakes issued to other tasks per second (EWMA). 0 is a real
+    /// Wakes issued to other tasks per second of the task's own activity
+    /// (EWMA; same denominator as [`Sample::wait_freq`]). 0 is a real
     /// measurement: a compiler forks its children, it does not wake them.
     pub wake_freq: u64,
     /// Mean nanoseconds per schedule. 0 means "never ran" (no evidence).
@@ -81,6 +90,26 @@ pub struct Sample {
     /// `runs > 0` is a real observation (a task that never slept), not a
     /// missing field.
     pub sleeps: u32,
+    /// The row describes a KERNEL thread (`PF_KTHREAD`). Never bias one:
+    /// nice on a kthread is meaningless, and claiming the shared step budget
+    /// for `kworker/*` starves the workloads the bias exists for (measured
+    /// live 2026-11-11: `kthreadd` and `ksoftirqd/12` held +3).
+    ///
+    /// Additive and defaulted, and a FLAG (`1`), not a measurement: the
+    /// `scx_stats` row type has no `bool` field (`bool` does not implement
+    /// `Meta`), so the contract keeps it numeric; [`Sample::is_kernel_thread`]
+    /// is the reader. A producer that predates the field reports `0`, i.e.
+    /// "not known to be a kernel thread", which degrades to the old behaviour.
+    pub kthread: u64,
+}
+
+impl Sample {
+    /// The row belongs to a kernel thread. Never bias one: nice on a kthread
+    /// is meaningless, and claiming the shared step budget for `kworker/*`
+    /// starves the workloads the bias exists for.
+    pub fn is_kernel_thread(&self) -> bool {
+        self.kthread != 0
+    }
 }
 
 pub const COMM_LEN: usize = 16;
@@ -428,6 +457,7 @@ mod tests {
             cpu_util_wall: 700,
             runs: 118,
             sleeps: 0,
+            kthread: 0,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         let back: Sample = serde_json::from_str(&json).expect("deserialize");
@@ -435,6 +465,27 @@ mod tests {
         assert_eq!(back.wait_freq, 0, "a meaningful zero survives the wire");
         assert_eq!(back.runs, 118, "per-window counts survive the wire");
         assert_eq!(back.sleeps, 0, "a count of zero is a real observation");
+    }
+
+    /// The kernel-thread flag is additive: an old producer omits it (0 =
+    /// "not known to be a kthread"), a new one sends 1.
+    #[test]
+    fn the_kernel_thread_flag_survives_and_defaults_off() {
+        let s = Sample {
+            comm: "kworker/3".into(),
+            kthread: 1,
+            ..Sample::default()
+        };
+        assert!(s.is_kernel_thread());
+        let back: Sample = serde_json::from_str(&serde_json::to_string(&s).expect("ser"))
+            .expect("deserialize");
+        assert!(back.is_kernel_thread(), "the flag reaches the daemon");
+
+        let old: Sample = serde_json::from_str(r#"{"pid":1,"comm":"cargo"}"#).expect("old payload");
+        assert!(
+            !old.is_kernel_thread(),
+            "a missing flag must not invent a kernel thread"
+        );
     }
 
     #[test]

@@ -602,6 +602,11 @@ const UNSIGNED_FIELDS: &[&str] = &[
     "static_prio",
     "runs",
     "sleeps",
+    // A flag, but numeric for the same reason: the `scx_stats` row type has no
+    // `bool`. Dropping it here silently turned every kernel thread into a
+    // user task (measured: 83 kthread entries created right after the flag
+    // shipped, because this whitelist is a second projection of the schema).
+    "kthread",
 ];
 
 /// Coerce an int-or-string field to a JSON number (`pid` accepts i64, the
@@ -1211,6 +1216,32 @@ mod tests {
 
         h.shutdown();
         h.join().unwrap();
+    }
+
+    /// Every field of the contract must survive the lenient parse. This
+    /// whitelist is a SECOND projection of the schema, so a field added to
+    /// `Sample` without a line here is silently dropped — which is exactly how
+    /// the kernel-thread flag shipped dead (83 kthread entries created right
+    /// after deploy). Round-tripping a fully populated row pins all of them.
+    #[test]
+    fn every_contract_field_survives_the_lenient_parse() {
+        let full = aranicy_wire::Sample {
+            pid: 4242,
+            comm: "kworker/3".into(),
+            static_prio: 23,
+            wait_freq: 17,
+            wake_freq: 19,
+            avg_runtime_wall: 424_242,
+            task_util_est: 900,
+            cpu_util_wall: 800,
+            runs: 21,
+            sleeps: 22,
+            kthread: 1,
+        };
+        let json = serde_json::to_value(&full).expect("serialize");
+        let back = lenient_sample(&json).expect("parse");
+        assert_eq!(back, full, "a contract field was dropped by the whitelist");
+        assert!(back.is_kernel_thread(), "the flag decides a policy: keep it");
     }
 
     #[test]

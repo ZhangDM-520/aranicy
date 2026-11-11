@@ -45,6 +45,12 @@ pub struct SchedSample {
     pub runs: u32,
     #[stat(desc = "Sleeps entered in this window (a count, not a rate)")]
     pub sleeps: u32,
+    /// The row belongs to a KERNEL thread (`PF_KTHREAD`): the daemon must
+    /// never bias one. Additive and defaulted, so a client that predates the
+    /// field still parses the payload.
+    #[serde(default)]
+    #[stat(desc = "Kernel thread (PF_KTHREAD): never bias")]
+    pub kthread: u64,
 }
 
 impl From<Sample> for SchedSample {
@@ -60,6 +66,7 @@ impl From<Sample> for SchedSample {
             cpu_util_wall: s.cpu_util_wall,
             runs: s.runs,
             sleeps: s.sleeps,
+            kthread: s.kthread,
         }
     }
 }
@@ -163,6 +170,7 @@ mod tests {
             cpu_util_wall: 700,
             runs: 118,
             sleeps: 4,
+            kthread: 0,
         };
         let w = SchedSample::from(s);
         assert_eq!(w.pid, 42);

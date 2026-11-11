@@ -44,8 +44,21 @@ struct task_struct {
 	int pid;
 	int tgid;
 	int static_prio;
+	unsigned int flags;
 	char comm[TASK_COMM_LEN];
 } __attribute__((preserve_access_index));
+
+/*
+ * `PF_KTHREAD` is a macro, so it is not in vmlinux.h (BTF carries types, not
+ * preprocessor state). Value from include/linux/sched.h, stable across the
+ * versions this collector targets.
+ */
+#ifndef PF_KTHREAD
+#define PF_KTHREAD 0x00200000
+#endif
+
+/* `task_acc.flags`: the task is a kernel thread (PF_KTHREAD). */
+#define ACC_F_KTHREAD 1u
 
 /*
  * Per-task accumulator, keyed by pid.
@@ -62,7 +75,14 @@ struct task_struct {
 struct task_acc {
 	char comm[TASK_COMM_LEN];
 	unsigned int static_prio; /* nice + 20, the lavd wire convention */
-	unsigned int pad;
+	/*
+	 * Bit 0: PF_KTHREAD. The exact kernel-thread test, taken from the task
+	 * struct at entry creation — a name prefix list cannot keep up with
+	 * `kworker/N:mm`, `kworker/R-*`, `rcuog/N`, `idle_inject/N`, ... and
+	 * nicing a kernel thread is meaningless anyway. Costs one load per new
+	 * task; the field was padding before, so the layout is unchanged.
+	 */
+	unsigned int flags;
 	unsigned long long run_ns;
 	unsigned long long runnable_ns;
 	unsigned long long runs;
@@ -105,6 +125,7 @@ static __always_inline struct task_acc *acc_get_or_create(struct task_struct *p,
 	__builtin_memcpy(zero.comm, p->comm, TASK_COMM_LEN);
 	/* static_prio is 120 + nice; the bias engine speaks nice + 20. */
 	zero.static_prio = (unsigned int)(p->static_prio - 100);
+	zero.flags = (p->flags & PF_KTHREAD) ? ACC_F_KTHREAD : 0;
 	zero.last_seen = now;
 	bpf_map_update_elem(&tasks, &pid, &zero, BPF_NOEXIST);
 	return bpf_map_lookup_elem(&tasks, &pid);
@@ -218,6 +239,7 @@ int BPF_PROG(on_sched_process_exec_account, struct task_struct *p)
 	if (a) {
 		__builtin_memcpy(a->comm, p->comm, TASK_COMM_LEN);
 		a->static_prio = (unsigned int)(p->static_prio - 100);
+		a->flags = (p->flags & PF_KTHREAD) ? ACC_F_KTHREAD : 0;
 		/* exec replaces the image: the old identity's counters must not
 		 * bleed into the new one. Leaving `last_tick` set would also let
 		 * the next switch back-date the slice to the pre-exec interval. */

@@ -173,6 +173,12 @@ pub struct BiasConfig {
     pub starved_ratio: f64,
     /// Demand noise floor: below this the starved gate stays shut.
     pub starved_min_demand: u64,
+    /// Aggregate CPU DEMAND a name must carry before a POSITIVE (bulk) step
+    /// may be taken, on the `MAX_UTIL` scale where 1024 is one core. It is the
+    /// window's total across the name's rows (instances × duty), so a parallel
+    /// build of many short-lived compilers passes while a shell one-liner that
+    /// ran for 2 ms reads ~12 however interactive its score looks.
+    pub attack_min_util: u64,
     /// Run the absolute two-axis lean classifier alongside the actuated one
     /// and log only disagreements (observation only; never actuates).
     pub shadow: bool,
@@ -200,6 +206,7 @@ impl Default for BiasConfig {
             global_step_s: 5,
             starved_ratio: 0.5,
             starved_min_demand: 64,
+            attack_min_util: 512,
             shadow: false,
             lean_stage_min_ns: classify::STAGE_MIN_NS,
             lean_hop_hz: classify::HOP_MIN_HZ,
@@ -295,6 +302,11 @@ struct Live {
     relax_watermark: f64,
     cpu_util_ewma: f64,
     demand_ewma: f64,
+    /// Aggregate demand of the name over a window: the SUM of its rows'
+    /// `task_util_est`, i.e. instances × duty on the 1024-per-core scale.
+    /// Mean demand cannot see a parallel build (each short-lived `cc1plus`
+    /// row looks idle); the sum can.
+    agg_demand_ewma: f64,
     util_init: bool,
     /// `score_ema` holds a real observation (a genuine 0.0 score must not be
     /// re-used as the "uninitialized" sentinel).
@@ -480,12 +492,15 @@ impl Entry {
         if self.live.win_util_n > 0 {
             let cpu = self.live.win_cpu_sum as f64 / self.live.win_util_n as f64;
             let dem = self.live.win_util_sum as f64 / self.live.win_util_n as f64;
+            let agg = self.live.win_util_sum as f64;
             if self.live.util_init {
                 self.live.cpu_util_ewma += (cpu - self.live.cpu_util_ewma) * alpha;
                 self.live.demand_ewma += (dem - self.live.demand_ewma) * alpha;
+                self.live.agg_demand_ewma += (agg - self.live.agg_demand_ewma) * alpha;
             } else {
                 self.live.cpu_util_ewma = cpu;
                 self.live.demand_ewma = dem;
+                self.live.agg_demand_ewma = agg;
                 self.live.util_init = true;
             }
         }
@@ -627,6 +642,26 @@ impl Entry {
         // spends the shared global step and re-arms the FIFO (AGENTS.md, "Open
         // finding — no-op attack cycle").
         if self.durable.confidence <= 0.0 {
+            return false;
+        }
+        // Sustained load, not a rank on the score axis: the bias deprioritizes
+        // throughput work, and a name that used a few ms of CPU in the whole
+        // window is not throughput work whatever its score says. Measured live
+        // 2026-11-11: `ls`, `date`, `cut`, `chown`, `env` and `gettext` ramped
+        // to +1 and burned the shared step budget while `rustc` sat at 0.
+        //
+        // Only steps that LOWER a name's priority are gated. `target < 0` is
+        // the starved-RESPONSIVE move (raise priority for a task that is being
+        // starved of CPU), which must never be blocked: it is a correction in
+        // the harmless direction, and gating it would silently disable
+        // `bias_starved_min_demand` for every demand below this floor.
+        //
+        // The measure is the name's AGGREGATE demand across the window, not
+        // the per-row mean: a `make -j24` of 80 ms `cc1plus` instances leaves
+        // each row at a low duty cycle (they are short-lived, not idle), so a
+        // mean-based floor would declare the canonical bulk workload
+        // permanently unattackable.
+        if self.live.target > 0 && self.live.agg_demand_ewma < cfg.attack_min_util as f64 {
             return false;
         }
         self.live.want_since_attack.is_some_and(|w| {
@@ -772,6 +807,16 @@ impl BiasEngine {
         self.window_end = Some(end);
 
         for s in batch {
+            // Kernel threads are out of scope for the whole engine: nice on a
+            // kthread is meaningless and, because the step budget is global,
+            // every kthread entry that wants a ramp delays the workloads the
+            // bias exists for (measured live 2026-11-11: `kthreadd` and
+            // `ksoftirqd/12` held +3 while `cargo` sat at 0). Skipped before
+            // the key is derived, so they also stay out of the population
+            // mean `T` that classifies everything else.
+            if s.is_kernel_thread() {
+                continue;
+            }
             // Fuzzy family key: suffix families pool (kworker/u97:*), and
             // declared bias_group patterns pool semantic families (cc1*/lto1).
             let key = entry_key(&s.comm, &self.groups).into_owned();
@@ -1404,6 +1449,191 @@ mod tests {
         assert_eq!(sample_score(&sample("x", 100, 100, 0, 0, 0)), None);
     }
 
+    /// A kernel thread is out of scope for the whole engine: it must not get
+    /// an entry, must not contribute to the population mean `T`, and must not
+    /// claim the shared step budget. Live 2026-11-11: `kthreadd` and
+    /// `ksoftirqd/12` held +3 while `cargo` sat at 0.
+    #[test]
+    fn kernel_threads_never_enter_the_engine() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let kt = |name: &str| {
+            let mut s = sample(name, 0, 0, 3_000_000, 900, 800);
+            s.kthread = 1;
+            s
+        };
+        // The proven two-window bulk drive (with the background population the
+        // threshold needs), plus kernel-thread rows carrying plenty of
+        // evidence: they must change nothing, including `T`.
+        let mut w1 = noise_batch(60);
+        let mut w2 = noise_batch(60);
+        w1.extend(bulk_batch("cargo", 32));
+        w2.extend(bulk_batch("cargo", 32));
+        for w in [&mut w1, &mut w2] {
+            for name in ["kworker/3", "ksoftirqd/12", "kworker/u97"] {
+                w.extend(std::iter::repeat_n(kt(name), 32));
+            }
+        }
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61));
+        eng.ingest(&[], ts(121));
+        ramp_attack(&mut eng);
+        let snap = eng.snapshot();
+        let names: Vec<&str> = snap.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("kworker") || n.starts_with("ksoftirqd")),
+            "kernel threads entered the engine: {names:?}"
+        );
+        // The real workload still learned: the skip must not have poisoned T.
+        let cargo = snap
+            .entries
+            .iter()
+            .find(|e| e.name == "cargo")
+            .expect("cargo learned");
+        assert!(
+            cargo.durable.bias > 0,
+            "cargo bias {} after the drive",
+            cargo.durable.bias
+        );
+    }
+
+    /// A name can rank BULK on the score axis and still not deserve a ramp:
+    /// the bias exists to deprioritize throughput work, and a shell one-liner
+    /// that used a few milliseconds of CPU in the window is not throughput
+    /// work. Both names below carry identical (bulk) scores; only the one
+    /// with sustained demand may attack.
+    ///
+    /// Measured live 2026-11-11 (before this gate): `ls`, `date`, `cut`,
+    /// `chown`, `env` and `gettext` ramped to +1 and burned the shared step
+    /// budget while `rustc` waited.
+    #[test]
+    fn a_shell_never_attacks_on_a_cpu_spike() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let mut w1 = noise_batch(60);
+        let mut w2 = noise_batch(60);
+        for w in [&mut w1, &mut w2] {
+            // Same rates, therefore the same score; only the duty cycle differs.
+            w.extend(bulk_batch("rustc", 32));
+            w.extend(
+                (0..32).map(|_| sample("ls", 31, 31, 5_000_000, 4, 2)),
+            );
+        }
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61));
+        eng.ingest(&[], ts(121));
+
+        let snap = eng.snapshot();
+        for name in ["rustc", "ls"] {
+            let e = snap.entries.iter().find(|e| e.name == name).expect(name);
+            assert_eq!(e.durable.class, BiasClass::Bulk, "{name} class");
+        }
+
+        ramp_attack(&mut eng);
+        let snap = eng.snapshot();
+        let rustc = snap.entries.iter().find(|e| e.name == "rustc").expect("rustc");
+        let ls = snap.entries.iter().find(|e| e.name == "ls").expect("ls");
+        assert!(
+            rustc.durable.bias > 0,
+            "the real load must still learn (bias {})",
+            rustc.durable.bias
+        );
+        assert_eq!(
+            ls.durable.bias, 0,
+            "a CPU spike spent the step budget on a shell one-liner"
+        );
+    }
+
+    /// The demand gate must never block the STARVED move. A starved
+    /// RESPONSIVE name gets target −1, which raises its priority — a
+    /// correction in the harmless direction. Gating it would silently disable
+    /// `bias_starved_min_demand` for every demand below the floor.
+    #[test]
+    fn the_demand_gate_never_blocks_a_starved_step() {
+        // A floor nobody can reach: bulk ramps are impossible, starved steps
+        // are not.
+        let mut eng = BiasEngine::new(BiasConfig {
+            attack_min_util: 1_000_000,
+            ..BiasConfig::default()
+        });
+        drive_class(&mut eng, &["starved"], starved_batch);
+        assert_eq!(snap_entry(&eng, "starved").class, BiasClass::Responsive);
+        ramp_attack(&mut eng);
+        assert_eq!(
+            snap_entry(&eng, "starved").bias,
+            -1,
+            "the starved ramp was blocked by the demand gate"
+        );
+    }
+
+    /// The gate measures AGGREGATE demand, so a parallel build of short-lived
+    /// compilers still learns: each `cc1plus` row is a low duty cycle over the
+    /// drain (it is short-lived, not idle), and a per-row floor would call the
+    /// canonical bulk workload unattackable while passing a single long-lived
+    /// `rustc`.
+    #[test]
+    fn a_parallel_build_of_short_instances_can_still_learn() {
+        let mut eng = BiasEngine::new(BiasConfig::default());
+        let mut w1 = noise_batch(60);
+        let mut w2 = noise_batch(60);
+        for w in [&mut w1, &mut w2] {
+            // 32 instances at 14% duty each: ~4.5 cores of aggregate demand,
+            // every single row far below any per-row floor.
+            w.extend((0..32).map(|_| sample("cc1plus", 31, 31, 5_000_000, 143, 143)));
+        }
+        eng.ingest(&w1, ts(1));
+        eng.ingest(&w2, ts(61));
+        eng.ingest(&[], ts(121));
+        let cls = snap_entry(&eng, "cc1plus").class;
+        ramp_attack(&mut eng);
+
+        assert!(
+            cls == BiasClass::Bulk,
+            "fixture did not classify bulk: {cls:?}"
+        );
+        assert!(
+            snap_entry(&eng, "cc1plus").bias > 0,
+            "a parallel build was starved by the demand gate (bias {})",
+            snap_entry(&eng, "cc1plus").bias
+        );
+    }
+
+    /// The classifier's ordering, on the contract level: a shell one-liner
+    /// (short bursts, many hops) must outrank a compiler (long bursts, few
+    /// hops), and each axis must carry the direction on its own.
+    ///
+    /// The producer, not this formula, is what inverted in v0.3.0 — the
+    /// red-first regression for that lives in the collector
+    /// (`agg::tests::rate_is_per_active_second_not_per_window_second`). This
+    /// test pins the formula so a future change cannot quietly flip an axis
+    /// and re-create the 2026-11-11 mis-targeting (`bash`/`cat`/`grep` at +3,
+    /// `cargo` at 0).
+    #[test]
+    fn a_shell_outranks_a_compiler_on_both_axes() {
+        // 50 us bursts, ~2000 sleeps/s of active time, 100 wakes/s.
+        let shell = sample("ls", 0, 0, 50_000, 2_000, 100);
+        // 5 ms bursts, ~20 sleeps/s, 2 wakes/s.
+        let compiler = sample("cargo", 0, 0, 5_000_000, 20, 2);
+
+        let (shell_score, compiler_score) = (
+            sample_score(&shell).expect("shell ran"),
+            sample_score(&compiler).expect("compiler ran"),
+        );
+        assert!(
+            shell_score > compiler_score,
+            "interactive work must score above throughput work: shell {shell_score} vs compiler {compiler_score}"
+        );
+
+        // Burst axis alone: same hop rate, the shorter burst wins.
+        let mut shell_burst = compiler.clone();
+        shell_burst.avg_runtime_wall = 50_000;
+        assert!(sample_score(&shell_burst) > sample_score(&compiler));
+
+        // Hop axis alone: same burst, the higher hop rate wins.
+        let mut shell_hop = compiler.clone();
+        shell_hop.wait_freq = 2_000;
+        shell_hop.wake_freq = 100;
+        assert!(sample_score(&shell_hop) > sample_score(&compiler));
+    }
+
     #[test]
     fn actuator_independence() {
         // Same behavior at nice 0 and nice +3 must score identically: the
@@ -1550,7 +1780,12 @@ mod tests {
     /// Fairness cap: never two release wins in a row while an attack waits.
     #[test]
     fn release_flood_cannot_starve_attacks() {
-        let mut eng = BiasEngine::new(BiasConfig::default());
+        // Fairness of the shared step, not the demand gate (see
+        // `a_shell_never_attacks_on_a_cpu_spike`).
+        let mut eng = BiasEngine::new(BiasConfig {
+            attack_min_util: 0,
+            ..BiasConfig::default()
+        });
         let mut entries = vec![EntrySnapshot {
             name: "app".into(),
             durable: Durable {
@@ -1665,7 +1900,13 @@ mod tests {
 
     #[test]
     fn zero_confidence_entries_do_not_spend_the_global_step() {
-        let mut eng = BiasEngine::new(BiasConfig::default());
+        // Isolates the confidence rule: the sustained-demand gate has its own
+        // test (`a_shell_never_attacks_on_a_cpu_spike`), and these restored
+        // entries carry no measured demand.
+        let mut eng = BiasEngine::new(BiasConfig {
+            attack_min_util: 0,
+            ..BiasConfig::default()
+        });
         let entry = |name: &str, confidence: f64| EntrySnapshot {
             name: name.into(),
             durable: Durable {
