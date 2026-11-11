@@ -1324,26 +1324,20 @@ mod tests {
     /// rejection here (or the reverse) is red.
     #[test]
     fn every_unusable_alias_is_rejected_at_apply_time() {
-        for name in [
-            "turbo-cores",
-            "x3d-cache",
-            "x3d-frequency",
-            "warp-cores",
-            "big-cores",
-        ] {
-            let v = CpuSet::Alias(name.into());
+        // Driven by the model's list, not a copy of it: adding a name there
+        // without a rejection here is red. Host-dependent aliases (`big-cores`)
+        // are deliberately absent — they resolve on a hybrid box.
+        for name in aranicy_model::CPUSET_UNUSABLE_ALIASES {
+            let v = CpuSet::Alias((*name).into());
+            let msg = resolve_cpuset(&v).expect_err("an unusable alias must not resolve");
             assert!(
-                resolve_cpuset(&v).is_err(),
-                "{name} must not resolve to a mask"
+                msg.contains("unsupported") || msg.contains("not usable"),
+                "{name}: {msg}"
             );
-            if aranicy_model::cpuset_alias_unusable(name) {
-                let msg = resolve_cpuset(&v).unwrap_err();
-                assert!(
-                    msg.contains("unsupported") || msg.contains("not usable"),
-                    "{name}: {msg}"
-                );
-            }
         }
+        // A name nobody knows is rejected too, by the alias table itself.
+        let v = CpuSet::Alias("warp-cores".into());
+        assert!(resolve_cpuset(&v).is_err());
     }
 
     #[test]

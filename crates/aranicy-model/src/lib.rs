@@ -72,8 +72,10 @@ pub struct CgroupDef {
 /// exposes: the apply path rejects them, so the loader warns about them.
 /// One list, because two copies drift (the loader used to warn about a
 /// different set than the one apply rejected).
+pub const CPUSET_UNUSABLE_ALIASES: &[&str] = &["turbo-cores", "x3d-cache", "x3d-frequency"];
+
 pub fn cpuset_alias_unusable(name: &str) -> bool {
-    matches!(name, "turbo-cores" | "x3d-cache" | "x3d-frequency")
+    CPUSET_UNUSABLE_ALIASES.contains(&name)
 }
 
 /// CPU indices are limited to 0..=1023 (glibc `CPU_SETSIZE`).

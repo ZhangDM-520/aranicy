@@ -145,9 +145,24 @@ pub fn cgroups_json(rs: &RuleSet) -> Value {
 /// `available_parallelism` (affinity-aware), while this dump may run under a
 /// different affinity (`taskset -c 0 aranicy dump cgroups`), so comparing
 /// against one count reports a false "not applied".
-fn quota_matches(live: &str, pct: u8, ncpu: [usize; 2]) -> bool {
+fn quota_matches(live: &str, pct: u8, ncpu: &[usize]) -> bool {
     ncpu.iter()
         .any(|n| live == aranicy_apply::expected_cpu_max(pct, (*n).max(1)))
+}
+
+/// CPUs the *daemon* can use, from its recorded pid: its unit may pin
+/// `CPUAffinity=`, in which case it sized the quota for fewer CPUs than this
+/// process or the machine sees. `None` when the pidfile/`/proc` is unreadable
+/// (an unprivileged dump still gets here; `/proc/<pid>/status` is world
+/// readable).
+fn daemon_cpu_count() -> Option<usize> {
+    let pid = crate::pidfile::read_pid(&crate::paths::pidfile_path())?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("Cpus_allowed_list:"))?;
+    let mask = aranicy_model::parse_cpu_list(line.split_once(':')?.1.trim()).ok()?;
+    Some(mask.iter().map(|w| w.count_ones() as usize).sum())
 }
 
 fn online_cpus() -> usize {
@@ -163,7 +178,11 @@ fn cgroups_json_at(rs: &RuleSet, mount: Option<&std::path::Path>) -> Value {
     let affinity_ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let ncpu = [affinity_ncpu, online_cpus()];
+    let ncpu = [
+        affinity_ncpu,
+        online_cpus(),
+        daemon_cpu_count().unwrap_or(0),
+    ];
     let map: Map<String, Value> = rs
         .cgroups
         .iter()
@@ -174,7 +193,7 @@ fn cgroups_json_at(rs: &RuleSet, mount: Option<&std::path::Path>) -> Value {
                 .map(|s| s.trim().to_string());
             let applied = def
                 .cpu_quota_pct
-                .map(|pct| live.as_deref().is_some_and(|v| quota_matches(v, pct, ncpu)));
+                .map(|pct| live.as_deref().is_some_and(|v| quota_matches(v, pct, &ncpu)));
             (
                 name.to_string(),
                 json!({
@@ -416,10 +435,10 @@ mod tests {
     #[test]
     fn a_quota_matches_either_cpu_count() {
         let for_online = aranicy_apply::expected_cpu_max(50, 12);
-        assert!(quota_matches(&for_online, 50, [1, 12]));
-        assert!(quota_matches(&for_online, 50, [12, 1]));
-        assert!(!quota_matches(&for_online, 50, [2, 4]));
-        assert!(!quota_matches("max 100000", 50, [1, 12]));
+        assert!(quota_matches(&for_online, 50, &[1, 12]));
+        assert!(quota_matches(&for_online, 50, &[12, 1]));
+        assert!(!quota_matches(&for_online, 50, &[2, 4, 0]));
+        assert!(!quota_matches("max 100000", 50, &[1, 12, 0]));
     }
 
     /// The dump must not claim a quota the cgroup does not have: after the

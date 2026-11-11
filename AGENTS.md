@@ -428,10 +428,14 @@ with test-thread names excluded (they are 300+ of 4096 live entries and score
   records `burst_ns`/`hop_hz`/`lean_at` per entry **and** a top-level
   `lean_capture { stage_min_ns, hop_min_hz, deadband_pct, saved_at }`; the
   anchors are live config keys, so the replay uses the recorded ones and
-  refuses a file with no marker. `tools/replay-bias/replay.py` re-runs the
-  verdict offline with `--max-lean-age` (default 1 h) excluding stale
-  entries. ADR 0003 holds the promotion gate (a quiet-host capture); the live
-  host's config has the flag off as of 2026-11-11 19:30.
+  refuses a file with no marker. A capture survives turning the key **off**
+  (the marker names the boundary it was taken with), and a boundary change on
+  reload drops the inputs and the marker — the two must not mix classifiers.
+  `tools/replay-bias/replay.py` re-runs the verdict offline with
+  `--max-lean-age` (default 1 h) excluding stale entries, and treats
+  `deadband_pct = 0` as a boundary, not as an absent value. ADR 0003 holds the
+  promotion gate (a quiet-host capture); the live host's config has the flag
+  off as of 2026-11-11 19:30.
 - `runs`/`sleeps` (per-window counts, additive on the wire) exist for exact
   offline replay; the live shadow still uses the per-row means. A missing
   field is 0 = no evidence on the lean axis only.

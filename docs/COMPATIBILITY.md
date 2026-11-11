@@ -240,9 +240,15 @@ silently live.
   implemented and runs as an *observer* under `bias_shadow`: it is compared
   against the window's population verdict, counted (`windows`,
   `disagreements`, `unilateral`) and logged, but never actuates. With the flag
-  on, the snapshot also records each entry's `burst_ns`/`hop_hz` so
-  `tools/replay-bias/replay.py` can re-run the verdict offline; ADR 0003 holds
-  the promotion gate.
+  on, the snapshot records each entry's `burst_ns`/`hop_hz`/`lean_at` plus a
+  `lean_capture` marker naming the boundary in force (`stage_min_ns`,
+  `hop_min_hz`, `deadband_pct`, `saved_at`) — the anchors are live keys, so
+  the marker is what lets `tools/replay-bias/replay.py` re-run the verdict
+  with the classifier the daemon actually ran. A snapshot without the marker
+  is not a capture and is refused rather than scored; inputs older than
+  `--max-lean-age` (default 1 h) are reported as stale and excluded. A
+  changed boundary invalidates the capture (inputs and marker are dropped).
+  ADR 0003 holds the promotion gate.
 - Classification: per-sample score from weight-free sched stats against a
   population threshold (EWMA of the population mean score). BULK below and
   RESPONSIVE above the `bias_deadband_pct` band for 2 consecutive
@@ -339,7 +345,12 @@ nothing.
   appear within `collector_wait_ms`),
 - `aranicy dump {rules,types,cgroups,proc,autogroup,bias}` (unprivileged;
   `bias` shows the persisted bias snapshot),
-- `aranicy lint`, `aranicy match-test <name>` (dry-run, superset),
+- `aranicy lint`, `aranicy match-test <name>` (dry-run, superset). `lint` is
+  **host-specific**: it resolves every `cpuset` against this machine's
+  topology, so an alias that cannot resolve here (`big-cores` on a uniform
+  box, an out-of-range `llc-N`) is a warning, exactly like an undefined
+  cgroup. A corpus linted in a container is linted against the container's
+  CPUs.
 - `--reload` reloads config **and rules** (superset: ananicy-cpp reloads
   config only), reconfigures the bias engine and re-plans every **running**
   process against the new corpus (ADR 0002): a rule edit reaches all its

@@ -639,6 +639,7 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
     let sink = Sink::new(&cfg, &shared.bias, Route::Reload);
     let mut planned = 0usize;
     let mut released = 0usize;
+    let mut released_names: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         if shared.shutdown.load(Ordering::Relaxed) {
             return;
@@ -656,7 +657,7 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
         let comm = procname::stat_comm(&stat[..n]).unwrap_or(b"");
         let mut buf = [0u8; NAME_CAP];
         let len = shared.proc.derive_name(pid, comm, &mut buf);
-        let Some(plan) = decision::reconcile_locked(
+        let reconciled = decision::reconcile_locked(
             &buf[..len],
             comm,
             pid,
@@ -664,21 +665,28 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
             &rules,
             &shared.bias,
             &cfg,
-        ) else {
+        );
+        if reconciled.released {
+            released += 1;
+            if released_names.len() < 8 {
+                released_names.push(
+                    std::str::from_utf8(&buf[..len])
+                        .unwrap_or("?")
+                        .to_string(),
+                );
+            }
+        }
+        let Some(plan) = reconciled.plan else {
             continue;
         };
-        let name = std::str::from_utf8(&buf[..len]).unwrap_or("");
-        let released_this = old_rules.lookup(name).is_some() && rules.lookup(name).is_none();
         decision::execute(plan, pid, &applier, &counters, &sink);
         planned += 1;
-        if released_this {
-            released += 1;
-        }
     }
-    if planned > 0 {
+    if planned > 0 || released > 0 {
         tracing::info!(
             processes = planned,
             released,
+            names = ?released_names,
             "re-planned live processes against the new corpus"
         );
     }
@@ -690,6 +698,10 @@ fn reconcile_live(shared: &Arc<Shared>, old_rules: &RuleSet) {
 
 fn drift_loop(shared: &Shared) {
     let mut retry = CgroupRetry::new();
+    // The quota retry shortens the wait to 5 s while it is owed; the drift
+    // scan keeps its own cadence instead of inheriting that (a quota that can
+    // never land must not multiply the /proc walk by twelve).
+    let mut last_scan = Instant::now();
     loop {
         // Owed quota writes first: on a boot start the cgroup exists before
         // the kernel offers `cpu.max`, and nothing else would ever write it.
@@ -719,10 +731,18 @@ fn drift_loop(shared: &Shared) {
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
-        if freq > 0 {
+        if freq > 0 && scan_due(freq, last_scan, Instant::now()) {
+            last_scan = Instant::now();
             drift_scan(shared);
         }
     }
+}
+
+/// Is a drift scan due? Extracted so the cadence is a function, not a thread:
+/// the loop wakes every 5 s while a quota is owed, and the scan must still
+/// happen once per `check_freq`, not once per wake.
+fn scan_due(freq: u64, last_scan: Instant, now: Instant) -> bool {
+    freq > 0 && now.saturating_duration_since(last_scan) >= Duration::from_secs(freq)
 }
 
 /// How often a quota write that did not land is retried. Short on purpose: the
@@ -954,6 +974,16 @@ mod tests {
         assert!(opts.nice && opts.latency_nice && opts.sched && opts.ionice);
         assert!(opts.oom_score_adj && opts.cgroup && opts.cpuset && opts.autogroup);
         assert!(opts.cgroup_realtime_workaround);
+    }
+
+    #[test]
+    fn the_scan_cadence_is_the_configured_one_not_the_retry_wake() {
+        let t0 = Instant::now();
+        // A 5-second quota-retry wake is not a scan slot.
+        assert!(!scan_due(60, t0, t0 + Duration::from_secs(5)));
+        assert!(scan_due(60, t0, t0 + Duration::from_secs(60)));
+        // check_freq = 0 disables scanning, whatever the wake interval.
+        assert!(!scan_due(0, t0, t0 + Duration::from_secs(3600)));
     }
 
     #[test]

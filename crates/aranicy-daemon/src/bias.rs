@@ -706,6 +706,11 @@ pub struct BiasEngine {
     shadow_unilateral: u64,
     /// When the cumulative summary was last emitted (`SHADOW_LOG_S` throttle).
     shadow_summary_at: Option<u64>,
+    /// Boundary of the most recent capture window (shadow mode). Kept even
+    /// after `bias_shadow` is switched off, so a capture taken before the
+    /// switch is still replayable; a boundary change clears it together with
+    /// the entries' inputs (they measured a different classifier).
+    capture: Option<crate::bias_state::LeanCapture>,
 }
 
 impl BiasEngine {
@@ -738,6 +743,7 @@ impl BiasEngine {
             shadow_disagreements: 0,
             shadow_unilateral: 0,
             shadow_summary_at: None,
+            capture: None,
         }
     }
 
@@ -934,17 +940,13 @@ impl BiasEngine {
 
     /// Serializable state for persistence (see `bias_state::save`).
     pub fn snapshot(&self) -> BiasSnapshot {
-        // The lean anchors are live config keys; record the ones in force so
-        // the offline replay judges with the daemon's boundary, not a guess.
-        let lean_capture = self.cfg.shadow.then(|| {
-            let b = self.cfg.boundary();
-            crate::bias_state::LeanCapture {
-                stage_min_ns: b.stage_min_ns,
-                hop_min_hz: b.hop_min_hz,
-                deadband_pct: b.deadband_pct,
-                saved_at: unix_secs(SystemTime::now()),
-            }
-        });
+        // The boundary the capture was taken with, not the one currently
+        // configured: `bias_lean_*` are live keys, and turning the shadow off
+        // must not discard a capture that already exists. Cleared when no
+        // entry carries inputs any more (or when the boundary changed).
+        let lean_capture = self
+            .capture
+            .filter(|_| self.entries.values().any(|e| e.durable.lean_at > 0));
         BiasSnapshot {
             version: BIAS_STATE_VERSION,
             threshold_ema: self.threshold,
@@ -1014,9 +1016,20 @@ impl BiasEngine {
             std::mem::swap(&mut cfg.min_bias, &mut cfg.max_bias);
         }
         self.groups = groups;
+        // A different boundary makes every recorded lean input describe a
+        // classifier this daemon no longer runs; the capture restarts.
+        let boundary_changed = self.cfg.boundary() != cfg.boundary();
+        if boundary_changed {
+            self.capture = None;
+        }
 
         let mut rekeyed: BTreeMap<String, Entry> = BTreeMap::new();
         for (name, mut e) in std::mem::take(&mut self.entries) {
+            if boundary_changed {
+                e.durable.burst_ns = 0;
+                e.durable.hop_hz = 0;
+                e.durable.lean_at = 0;
+            }
             let old_bias = e.durable.bias;
             e.durable.bias = e.durable.bias.clamp(cfg.min_bias, cfg.max_bias);
             e.live.target = target_for(&cfg, e.durable.class, e.live.starved);
@@ -1110,6 +1123,15 @@ impl BiasEngine {
                     );
                 }
             }
+        }
+        if self.cfg.shadow {
+            let b = self.cfg.boundary();
+            self.capture = Some(crate::bias_state::LeanCapture {
+                stage_min_ns: b.stage_min_ns,
+                hop_min_hz: b.hop_min_hz,
+                deadband_pct: b.deadband_pct,
+                saved_at: close_t,
+            });
         }
         self.pop_score_sum = 0;
         self.pop_score_n = 0;
@@ -2780,6 +2802,70 @@ mod tests {
         );
         // ...and the off run really did compute nothing.
         assert_eq!(off_snap.version, BIAS_STATE_VERSION);
+    }
+
+    /// The lean anchors are live config keys. A reload that changes them makes
+    /// every recorded input describe a classifier the daemon no longer runs,
+    /// so the capture restarts; the same boundary keeps it.
+    #[test]
+    fn a_boundary_change_invalidates_the_capture() {
+        let mut eng = BiasEngine::new(BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        });
+        eng.ingest(&shadow_window(), ts(1));
+        eng.ingest(&[], ts(61));
+        assert!(eng.snapshot().lean_capture.is_some());
+        assert!(eng.entries.values().any(|e| e.durable.lean_at > 0));
+
+        eng.reconfigure(
+            BiasConfig {
+                shadow: true,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+        assert!(
+            eng.snapshot().lean_capture.is_some(),
+            "an unchanged boundary keeps the capture"
+        );
+
+        eng.reconfigure(
+            BiasConfig {
+                shadow: true,
+                lean_stage_min_ns: 32_000,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+        let snap = eng.snapshot();
+        assert!(
+            snap.lean_capture.is_none(),
+            "a different classifier invalidates the capture"
+        );
+        assert!(snap.entries.iter().all(|e| e.durable.lean_at == 0));
+    }
+
+    /// Switching the shadow off must not discard a capture that already
+    /// exists: the marker records the boundary the inputs were measured with.
+    #[test]
+    fn a_capture_survives_turning_shadow_off() {
+        let mut eng = BiasEngine::new(BiasConfig {
+            shadow: true,
+            ..BiasConfig::default()
+        });
+        eng.ingest(&shadow_window(), ts(1));
+        eng.ingest(&[], ts(61));
+        eng.reconfigure(
+            BiasConfig {
+                shadow: false,
+                ..BiasConfig::default()
+            },
+            Vec::new(),
+        );
+        let snap = eng.snapshot();
+        assert!(snap.lean_capture.is_some(), "the earlier capture is still usable");
+        assert!(snap.entries.iter().any(|e| e.durable.lean_at > 0));
     }
 
     /// A window the population boundary calls BULK but the lean axis calls

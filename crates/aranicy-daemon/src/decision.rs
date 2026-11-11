@@ -326,6 +326,34 @@ fn fill_released(desired: &mut Policy, old: &Policy) {
     desired.autogroup = desired.autogroup.or(rel.autogroup);
 }
 
+/// Dimensions the old rule set that the new corpus does not: the give-back
+/// set. `cpuset` counts even though it is not reset (no safe value), because
+/// the journal must show that a decision was owed.
+fn owed_dims(old: &Policy, new: Option<&Policy>) -> usize {
+    let unset = |f: fn(&Policy) -> bool| !new.is_some_and(f);
+    usize::from(old.nice.is_some() && unset(|p| p.nice.is_some()))
+        + usize::from(old.latency_nice.is_some() && unset(|p| p.latency_nice.is_some()))
+        + usize::from(old.sched.is_some() && unset(|p| p.sched.is_some()))
+        + usize::from(old.rtprio.is_some() && unset(|p| p.rtprio.is_some()))
+        + usize::from(old.ioclass.is_some() && unset(|p| p.ioclass.is_some()))
+        + usize::from(old.ionice.is_some() && unset(|p| p.ionice.is_some()))
+        + usize::from(
+            old.oom_score_adj.is_some() && unset(|p| p.oom_score_adj.is_some()),
+        )
+        + usize::from(old.cgroup.is_some() && unset(|p| p.cgroup.is_some()))
+        + usize::from(old.cpuset.is_some() && unset(|p| p.cpuset.is_some()))
+        + usize::from(old.autogroup.is_some() && unset(|p| p.autogroup.is_some()))
+}
+
+/// What a reload owes one running process.
+pub struct Reconciled<'a> {
+    /// `None` = nothing to do.
+    pub plan: Option<Plan<'a>>,
+    /// The old tree set dimensions the new one does not — so the journal says
+    /// a decision was owed, even when the plan is a skip.
+    pub released: bool,
+}
+
 /// Decide what a reload owes a process that is already running.
 ///
 /// `old` is the rule tree that was live until this reload. A process the new
@@ -341,14 +369,22 @@ pub fn reconcile<'a>(
     new: &RuleSet,
     bias: &BiasEngine,
     cfg: &Config,
-) -> Option<Plan<'a>> {
+) -> Reconciled<'a> {
+    let nothing = Reconciled {
+        plan: None,
+        released: false,
+    };
     if name.is_empty() || pid == 1 || pid == std::process::id() {
-        return None;
+        return nothing;
     }
-    let name = std::str::from_utf8(name).ok()?;
+    let Ok(name) = std::str::from_utf8(name) else {
+        return nothing;
+    };
     let comm = std::str::from_utf8(comm).unwrap_or(name);
-    let old_policy = old.lookup(name).map(|(p, _)| p);
-    match plan(name.as_bytes(), comm.as_bytes(), pid, new, bias, cfg) {
+    let old_policy = old.lookup(name).map(|(p, _)| &**p);
+    let new_policy = new.lookup(name).map(|(p, _)| &**p);
+    let released = old_policy.is_some_and(|o| owed_dims(o, new_policy) > 0);
+    let plan = match plan(name.as_bytes(), comm.as_bytes(), pid, new, bias, cfg) {
         Plan::Apply {
             mut policy,
             target,
@@ -371,17 +407,15 @@ pub fn reconcile<'a>(
         // No rule and no bias: only a rule that disappeared has anything owed.
         Plan::Skip {
             reason: Skip::NoRule,
-        } => {
-            let old = old_policy?;
-            Some(Plan::Apply {
-                policy: release_policy(old),
-                target: 0,
-                base: 0,
-                key: BiasKey { name, comm },
-            })
-        }
+        } => old_policy.map(|old| Plan::Apply {
+            policy: release_policy(old),
+            target: 0,
+            base: 0,
+            key: BiasKey { name, comm },
+        }),
         Plan::Skip { reason } => Some(Plan::Skip { reason }),
-    }
+    };
+    Reconciled { plan, released }
 }
 
 /// [`reconcile`] with the engine-lock protocol handled here.
@@ -393,7 +427,7 @@ pub fn reconcile_locked<'a>(
     new: &RuleSet,
     bias: &Mutex<BiasEngine>,
     cfg: &Config,
-) -> Option<Plan<'a>> {
+) -> Reconciled<'a> {
     let engine = bias.lock().unwrap_or_else(PoisonError::into_inner);
     reconcile(name, comm, pid, old, new, &engine, cfg)
 }
@@ -926,6 +960,7 @@ mod tests {
         let cfg = Config::default();
 
         let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .plan
             .expect("a matched process is re-planned");
         let Plan::Apply { policy, .. } = &plan else {
             panic!("expected an apply, got {plan:?}");
@@ -956,6 +991,7 @@ mod tests {
         let cfg = Config::default();
 
         let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .plan
             .expect("a released process is re-planned");
         let Plan::Apply { policy, target, .. } = &plan else {
             panic!("expected an apply, got {plan:?}");
@@ -982,6 +1018,7 @@ mod tests {
         let cfg = Config::default();
 
         let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .plan
             .expect("a matched process is re-planned");
         let Plan::Apply { policy, .. } = &plan else {
             panic!("expected an apply, got {plan:?}");
@@ -1011,6 +1048,7 @@ mod tests {
         let cfg = Config::default();
 
         let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .plan
             .expect("a matched process is re-planned");
         let Plan::Apply { policy, .. } = &plan else {
             panic!("expected an apply, got {plan:?}");
@@ -1034,6 +1072,7 @@ mod tests {
         let engine = Mutex::new(engine_with("game", 0));
         let cfg = Config::default();
         let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .plan
             .expect("a released process is re-planned");
         let Plan::Apply { policy, .. } = &plan else {
             panic!("expected an apply, got {plan:?}");
@@ -1061,6 +1100,7 @@ mod tests {
         let cfg = Config::default();
 
         let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .plan
             .expect("a released process is re-planned");
         let Plan::Apply { policy, target, .. } = &plan else {
             panic!("expected an apply, got {plan:?}");
@@ -1071,15 +1111,54 @@ mod tests {
         assert_eq!(policy.ionice, Some(0));
     }
 
+    /// The journal counter must see a *field* deletion (and a `cpuset` one,
+    /// which is deliberately not reset) — not only a rule that disappeared.
+    #[test]
+    fn reconcile_reports_a_field_deletion_as_released() {
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+        let old = rules_of(
+            "game",
+            Policy {
+                nice: Some(-5),
+                ionice: Some(7),
+                cpuset: Some(aranicy_model::CpuSet::Alias(Arc::from("big-cores"))),
+                ..Policy::default()
+            },
+        );
+        let new = rules_with("game", Some(-5));
+        let r = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg);
+        assert!(r.plan.is_some());
+        assert!(r.released, "ionice and cpuset were dropped from a live rule");
+
+        // Nothing removed: not a release.
+        let same = rules_of(
+            "game",
+            Policy {
+                nice: Some(-5),
+                ionice: Some(7),
+                ..Policy::default()
+            },
+        );
+        let r = reconcile_locked(b"game", b"game", 4242, &same, &same, &engine, &cfg);
+        assert!(!r.released, "an unchanged rule owes nothing");
+    }
+
     #[test]
     fn reconcile_ignores_names_neither_corpus_knows_and_never_pid_one() {
         let empty = RuleSet::empty();
         let engine = Mutex::new(engine_with("other", 0));
         let cfg = Config::default();
-        assert!(reconcile_locked(b"stranger", b"stranger", 4242, &empty, &empty, &engine, &cfg).is_none());
+        assert!(
+            reconcile_locked(b"stranger", b"stranger", 4242, &empty, &empty, &engine, &cfg)
+                .plan
+                .is_none()
+        );
         let old = rules_with("init", Some(19));
         assert!(
-            reconcile_locked(b"init", b"init", 1, &old, &empty, &engine, &cfg).is_none(),
+            reconcile_locked(b"init", b"init", 1, &old, &empty, &engine, &cfg)
+                .plan
+                .is_none(),
             "PID 1 has its own route"
         );
     }

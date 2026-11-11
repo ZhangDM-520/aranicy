@@ -96,10 +96,12 @@ def lean_report(cohort, capture, max_age_s):
     # The boundary is the one the daemon ran with, recorded in the snapshot:
     # `bias_lean_stage_min_ns`, `bias_lean_hop_hz` and `bias_deadband_pct` are
     # live config keys, so the defaults are only a fallback for old files.
-    stage = capture.get("stage_min_ns") or STAGE_MIN_NS
-    hop_min = capture.get("hop_min_hz") or HOP_MIN_HZ
-    deadband_pct = capture.get("deadband_pct") or 15
-    saved_at = capture.get("saved_at") or 0
+    # Presence, not truthiness: `bias_deadband_pct = 0` is a legal boundary
+    # (no deadband), and `or 15` would silently rescore every window.
+    stage = capture["stage_min_ns"] if "stage_min_ns" in capture else STAGE_MIN_NS
+    hop_min = capture["hop_min_hz"] if "hop_min_hz" in capture else HOP_MIN_HZ
+    deadband_pct = capture["deadband_pct"] if "deadband_pct" in capture else 15
+    saved_at = capture["saved_at"] if "saved_at" in capture else 0
     deadband = math.log2(1 + deadband_pct / 100)
     agree = disagree = unilateral = no_evidence = stale = 0
     examples = []
