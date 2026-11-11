@@ -123,6 +123,24 @@ and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
   `name_regex` containing `/` is as dead as a `name` and is not warned about;
   and the two hook copies are byte-identical by inspection only.
 
+## Round 10: the regex-death warning was unsound and is reverted
+
+The round-9 fix for "a rule whose exact name *and* pattern both require a
+separator is silent" tested `pattern.contains('/')`. Both axes flagged that as
+wrong in the other direction: a regex may contain a separator and still match a
+key (`^(/usr/bin/)?foo$` matches `foo`, `foo/bar|baz` matches `baz`,
+`[^/]+` matches everything), so a working corpus would have gone red with a
+false "this definition can never apply". Deciding whether a pattern *requires*
+a separator needs a language check, not a substring test, so the warning is
+gone and the silence is recorded as a known limit instead. What remains is
+sound: the exact-`name` warning fires unless the rule has a *compiled*
+`name_regex` (an uncompiled one is no escape and the rule already warns about
+it), and the contract row says so.
+
+Pins: `a_name_with_a_path_separator_is_reported_at_load` now covers the plain
+name, a live regex beside a dead exact key, a live pattern that contains a
+separator, and an uncompiled pattern beside a dead exact key.
+
 ## Round 9: one MEDIUM (a sentence I wrote), three LOWs
 
 Standards returned FIX-FIRST on a documentation claim introduced in the
@@ -144,9 +162,10 @@ same doc item. All four are fixed:
   not "the ledger vanished" keeps the ledger instead of letting `rm -f` delete
   the only pointer to still-throttled cgroups.
 
-`deferred: 9 low/nit at round 9` — the round-8 list plus `released` counting a
-learned `nice` that is re-applied rather than reset (documented), and the
-inert `Apply` gating pin (documented).
+`deferred: 8 items at round 9` — the round-8 list, less the `name_regex`
+item this round addressed (see round 10: that attempt was reverted as
+unsound). The round-8 list is 7 bullets but 9 distinct items; counted as
+items, and with `name_regex` now re-deferred, the open set is 9 again.
 
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes

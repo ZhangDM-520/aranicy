@@ -22,7 +22,7 @@ ananicy-cpp parity); CRLF tolerated. Bad lines warn and are skipped.
 
 | field | type | semantics |
 |---|---|---|
-| `name` | string | match key, exact, `basename(/proc/<pid>/exe)` (`argv[0]`, then comm as fallbacks). A name containing `/` cannot apply — the match key is a basename, and the only comm shape that carries a separator (`kworker/0:1-events`) is a kernel thread, which is never touched — so the loader warns about it with `file:line` and `lint` exits non-zero, *unless* the rule also declares a `name_regex` that can match (then the exact key is dead but the definition still applies); a `name_regex` containing `/` is dead for the same reason and warns |
+| `name` | string | match key, exact, `basename(/proc/<pid>/exe)` (`argv[0]`, then comm as fallbacks). A name containing `/` cannot apply — the match key is a basename, and the only comm shape that carries a separator (`kworker/0:1-events`) is a kernel thread, which is never touched — so the loader warns about it with `file:line` and `lint` exits non-zero, *unless* the rule also has a `name_regex` that compiles — then the exact key is dead but the definition may still apply through the pattern, and a pattern's reach is not decidable from its text (`^(/usr/bin/)?foo$` contains a separator and matches `foo`), so no warning is emitted |
 | `name_regex` | string | unanchored regex, tried only when no exact name matches; first in load order wins; compiled once at load |
 | `cmdlines` | [string] | accepted, ignored (lint note) |
 | `type` | string | type bundle reference; rule fields override; explicit `null` suppresses |

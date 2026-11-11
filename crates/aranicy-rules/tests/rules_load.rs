@@ -452,18 +452,37 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
         "the regex still matches"
     );
 
-    // A regex that itself requires a path separator is dead (no match key has
-    // one), so a rule whose exact key is also dead is reported — once, for the
-    // regex.
-    let f = Fixture::new("path-name-both-dead");
+    // An uncompiled regex is no escape hatch: the exact key is still dead, so
+    // it is named alongside the invalid-pattern warning.
+    let f = Fixture::new("path-name-bad-regex");
     f.write(
         "10-a.rules",
-        "{\"name\": \"/usr/bin/foo\", \"name_regex\": \"^/usr/bin/foo$\", \"nice\": 5}\n",
+        "{\"name\": \"/usr/bin/foo\", \"name_regex\": \"[\", \"nice\": 5}\n",
     );
     let rs = f.load_default();
     let m = messages(&rs);
-    assert_eq!(m.len(), 1, "{m:?}");
-    assert!(m[0].contains("name_regex") && m[0].contains("path separator"), "{m:?}");
+    assert!(m.iter().any(|x| x.contains("invalid name_regex")), "{m:?}");
+    assert!(
+        m.iter().any(|x| x.contains("path separator") && x.contains("/usr/bin/foo")),
+        "the dead exact key is named too: {m:?}"
+    );
+
+    // A regex may contain a separator and still match a key
+    // (`^(/usr/bin/)?foo$` matches `foo`), so a pattern is never judged dead
+    // from its text: no warning, and lint stays green.
+    let f = Fixture::new("path-name-live-regex");
+    f.write(
+        "10-a.rules",
+        "{\"name_regex\": \"^(/usr/bin/)?foo$\", \"nice\": 5}\n\
+         {\"name\": \"foo\", \"name_regex\": \"^/usr/bin/foo$\", \"nice\": 6}\n",
+    );
+    let rs = f.load_default();
+    assert!(messages(&rs).is_empty(), "{:?}", rs.warnings);
+    assert_eq!(
+        rs.lookup("foo").map(|(p, kind)| (p.nice, kind)),
+        Some((Some(6), MatchKind::Exact)),
+        "the exact key still wins for `foo`"
+    );
 }
 
 #[test]
