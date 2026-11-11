@@ -25,6 +25,10 @@ release_cgroups() (
     [ -r "$record" ] || return 0
     [ -w "$mount/cgroup.procs" ] || return 0
     left=0
+    # The ledger can vanish between the `-r` test above and this redirect;
+    # that is "nothing left to do", not an error to abort on (in
+    # `install.sh --uninstall` an abort here would skip removing the binary).
+    {
     while IFS= read -r name; do
         case "$name" in
             ''|.|..|*/*) continue ;;
@@ -48,6 +52,7 @@ release_cgroups() (
             left=1
         fi
     done < "$record"
+    } || true
     # Keep the ledger when something is still pinned: a later run can retry,
     # and without the file those directories are unreachable forever.
     if [ "$left" = 0 ]; then

@@ -344,7 +344,11 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
             // comm. A comm may carry a separator (`kworker/0:1-events`), but
             // kernel threads are never touched, so a name with one can only
             // ever describe a target this daemon refuses to act on.
-            if name.contains('/') {
+            //
+            // Only when the rule has no regex: with one, the exact key is dead
+            // but the definition still applies, and a red `lint` would be a
+            // false alarm.
+            if draft.pattern.is_none() && name.contains('/') {
                 resolve_warnings.push(LoadWarning {
                     file: draft.file.clone(),
                     line: draft.line,

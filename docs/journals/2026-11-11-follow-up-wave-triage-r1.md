@@ -81,6 +81,48 @@ between the `-r` test and the `done <` redirect could abort
 `install.sh --uninstall` under `set -e`; the read loop is guarded now, and the
 two hook copies are byte-identical (checked).
 
+## Round 8: PASS on both axes
+
+Both axes returned **PASS** with no `HIGH`/`MEDIUM` and no repeated blocking
+finding, which closes the loop. Two round-8 findings were fixed anyway because
+each finished a change this wave had just introduced rather than polishing an
+old one:
+
+- the `name`-with-`/` warning fired even for a rule that also carries
+  `name_regex`, where the exact key is dead but the definition still applies —
+  `lint` would have gone red on a working corpus. It is now guarded on
+  `draft.pattern.is_none()`, with the regex case pinned in the same test.
+- the outer `done < "$record"` loop had the same `set -e` exposure as the
+  inner one fixed in round 7: a ledger that disappears between the `-r` test
+  and the redirect aborted `install.sh --uninstall` before the binary was
+  removed. Both copies are guarded and still byte-identical.
+
+Three documentation sentences were corrected to match the code they describe:
+the ADR 0003 gate list now carries the 200-decided minimum (the tool has
+enforced it since round 7), and ADR 0002 / COMPATIBILITY describe `released`
+and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
+
+`deferred: 7 low/nit at round 8` — recorded, not actioned:
+
+- a marker with `saved_at == 0` (only possible from a hand-edited or
+  foreign-build file; every production save stamps) disables the replay's age
+  check, while the field doc says the replay "cannot age this";
+- the human replay line for an all-deadband cohort blames "no fresh inputs";
+- `released` includes a `nice` the learner re-applies at the learned value
+  (the ADR wording above now says so, the counter still counts it);
+- `an_unidentifiable_process_is_not_counted_as_a_revert` passes through the
+  pre-existing non-UTF-8 early return, so it does not exercise the `Apply`
+  gate it claims;
+- the `comm`-carries-a-separator sentence is broader than the truth (a
+  userspace `comm` can contain `/` via `prctl`, it just never becomes the
+  match key while `/proc/<pid>/exe` is readable);
+- the privilege pin returns early on a root runner instead of asserting the
+  `Stale` outcome root actually gets;
+- `PidFile::drop` unlinks by path without comparing the inode it locked, so an
+  externally removed pidfile can end up deleting a successor's file;
+  `name_regex` containing `/` is as dead as a `name` and is not warned about;
+  and the two hook copies are byte-identical by inspection only.
+
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes
 already placed in a cgroup, and that drift remains nice-only. Both are

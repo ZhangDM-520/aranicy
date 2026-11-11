@@ -385,8 +385,9 @@ nothing.
   (history keys change) and warns
   `restart-only keys ignored: <sorted key list>` for any deferred edit,
   `--config`, `--config-dir`. The re-plan line separates `released=N`
-  (N re-planned processes had dimensions reset) from `kept_cpuset=M` (M
-  re-planned processes kept their affinity, ADR 0002); a process the pass
-  could not reach counts in neither.
+  (N re-planned processes lost at least one dimension to the new corpus) from
+  `kept_cpuset=M` (M re-planned processes whose rule no longer declares a
+  cpuset, so the old affinity is left alone, ADR 0002); both describe what the
+  pass planned, and a process `/proc` hid counts in neither.
 - Unit `aranicy.service`, `ExecReload=/usr/bin/aranicy --reload`,
   `Conflicts=ananicy-cpp.service` for drop-in cutover.

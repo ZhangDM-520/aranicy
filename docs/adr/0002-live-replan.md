@@ -46,10 +46,13 @@ confined by its unit or a container, and widening affinity to every CPU is
 worse than leaving a stale set in place. An edit that changes `cpuset` still
 lands via (2); a deletion leaves the old affinity, which the journal line and
 this ADR make discoverable. The line counts the two facts apart —
-`released=N` is re-planned processes whose dimensions were reset, and
-`kept_cpuset=M` is re-planned processes whose affinity was left in place — so
-neither number claims work the other did, and a process the pass could not
-reach (`/proc` hid it, or it exited) counts in neither.
+`released=N` is re-planned processes for which the new corpus stopped
+dictating at least one dimension, and `kept_cpuset=M` is re-planned processes
+whose rule no longer declares a cpuset, so the old affinity is left alone. A
+`nice` the learner knows is re-applied at the learned value rather than reset,
+so `released` describes the pass's intent, not a count of syscalls; treat both
+numbers as what the pass planned. A process `/proc` hid counts in neither, and
+one that exits between planning and execution is still counted.
 
 ## Consequences and limits
 

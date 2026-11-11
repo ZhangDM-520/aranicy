@@ -436,6 +436,21 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
     // Exactly one rule is wrong: the plain `foo` beside it must stay silent.
     assert_eq!(m.len(), 1, "{m:?}");
     assert!(m[0].contains("path separator") && m[0].contains("/usr/bin/foo"), "{m:?}");
+
+    // A rule that also carries a regex still applies through it, so its dead
+    // exact key is not a lint failure.
+    let f = Fixture::new("path-name-regex");
+    f.write(
+        "10-a.rules",
+        "{\"name\": \"/usr/bin/sleep\", \"name_regex\": \"^sleep$\", \"nice\": 5}\n",
+    );
+    let rs = f.load_default();
+    assert!(messages(&rs).is_empty(), "{:?}", rs.warnings);
+    assert_eq!(
+        rs.lookup("sleep").map(|(p, _)| p.nice),
+        Some(Some(5)),
+        "the regex still matches"
+    );
 }
 
 #[test]
