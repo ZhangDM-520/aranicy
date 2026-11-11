@@ -102,7 +102,7 @@ the ADR 0003 gate list now carries the 200-decided minimum (the tool has
 enforced it since round 7), and ADR 0002 / COMPATIBILITY describe `released`
 and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
 
-`deferred: 7 low/nit at round 8` — recorded, not actioned:
+`deferred: 7 bullets / 9 items at round 8` — recorded, not actioned:
 
 - a marker with `saved_at == 0` (only possible from a hand-edited or
   foreign-build file; every production save stamps) disables the replay's age
@@ -123,6 +123,31 @@ and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
   `name_regex` containing `/` is as dead as a `name` and is not warned about;
   and the two hook copies are byte-identical by inspection only.
 
+## Round 9: one MEDIUM (a sentence I wrote), three LOWs
+
+Standards returned FIX-FIRST on a documentation claim introduced in the
+round-8 commit — ADR 0003 said the replay reports `null` for every cohort below
+200, which is true only for an empty one (a 150-entry cohort returns a number
+with `gate_cohort_ok: false`) — plus three LOWs; Spec returned PASS with the
+same doc item. All four are fixed:
+
+- ADR 0003 gate 1 now says "`null` when nothing was decided, and
+  `gate_cohort_ok: false` below that count", which is what the tool does and
+  what its tests pin.
+- `COMPATIBILITY.md`'s `name` row now carries the `name_regex` exception.
+- rules: a `name_regex` containing a path separator warned, so a rule whose
+  exact name *and* pattern both required one was no longer silent (one warning
+  naming the regex, mutation-probed red). **Reverted in round 10**: a pattern
+  containing a separator is not a pattern requiring one.
+- hooks: `} || { [ ! -e "$record" ] || left=1; }` — a redirect failure that is
+  not "the ledger vanished" keeps the ledger instead of letting `rm -f` delete
+  the only pointer to still-throttled cgroups.
+
+`deferred: 8 items at round 9` — the round-8 list less the `name_regex` item
+this round addressed. The round-8 section is 7 bullets but 9 distinct items;
+counted as items, and with `name_regex` re-deferred by round 10, the open set
+is 9 again.
+
 ## Round 10: the regex-death warning was unsound and is reverted
 
 The round-9 fix for "a rule whose exact name *and* pattern both require a
@@ -137,35 +162,16 @@ sound: the exact-`name` warning fires unless the rule has a *compiled*
 `name_regex` (an uncompiled one is no escape and the rule already warns about
 it), and the contract row says so.
 
+Round 11 reviewed that commit and returned **PASS on both axes** (Standards
+with two NITs, Spec with one LOW and four observations — all about this
+record's wording, none about the code). Round 10's items were all about the
+removed check and are closed by the commit, so the open set is again the
+round-8 list; the wording corrections above are round 11's follow-up.
+
 Pins: `a_name_with_a_path_separator_is_reported_at_load` now covers the plain
-name, a live regex beside a dead exact key, a live pattern that contains a
-separator, and an uncompiled pattern beside a dead exact key.
-
-## Round 9: one MEDIUM (a sentence I wrote), three LOWs
-
-Standards returned FIX-FIRST on a documentation claim introduced in the
-round-8 commit — ADR 0003 said the replay reports `null` for every cohort below
-200, which is true only for an empty one (a 150-entry cohort returns a number
-with `gate_cohort_ok: false`) — plus three LOWs; Spec returned PASS with the
-same doc item. All four are fixed:
-
-- ADR 0003 gate 1 now says "`null` when nothing was decided, and
-  `gate_cohort_ok: false` below that count", which is what the tool does and
-  what its tests pin.
-- `COMPATIBILITY.md`'s `name` row now carries the `name_regex` exception, and
-  documents that a `name_regex` containing `/` is dead for the same reason and
-  warns.
-- rules: a `name_regex` containing a path separator now warns, so a rule whose
-  exact name *and* pattern both require one is no longer silent (one warning
-  naming the regex, mutation-probed red).
-- hooks: `} || { [ ! -e "$record" ] || left=1; }` — a redirect failure that is
-  not "the ledger vanished" keeps the ledger instead of letting `rm -f` delete
-  the only pointer to still-throttled cgroups.
-
-`deferred: 8 items at round 9` — the round-8 list, less the `name_regex`
-item this round addressed (see round 10: that attempt was reverted as
-unsound). The round-8 list is 7 bullets but 9 distinct items; counted as
-items, and with `name_regex` now re-deferred, the open set is 9 again.
+name, a live regex beside a dead exact key, an uncompiled pattern beside a
+dead exact key, a live pattern that contains a separator, and the both-dead
+silence this section records as the limit.
 
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes

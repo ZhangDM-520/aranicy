@@ -483,6 +483,19 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
         Some((Some(6), MatchKind::Exact)),
         "the exact key still wins for `foo`"
     );
+
+    // Both keys dead is the recorded limit: the exact key is dead and the
+    // pattern matches no match key, but a pattern's reach is undecidable from
+    // its text, so the rule loads silently. Keep this pin honest if a language
+    // check ever replaces it.
+    let f = Fixture::new("path-name-both-dead");
+    f.write(
+        "10-a.rules",
+        "{\"name\": \"/usr/bin/foo\", \"name_regex\": \"^/usr/bin/foo$\", \"nice\": 5}\n",
+    );
+    let rs = f.load_default();
+    assert!(messages(&rs).is_empty(), "{:?}", rs.warnings);
+    assert!(rs.lookup("foo").is_none(), "the pattern matches no match key");
 }
 
 #[test]
