@@ -22,7 +22,7 @@ ananicy-cpp parity); CRLF tolerated. Bad lines warn and are skipped.
 
 | field | type | semantics |
 |---|---|---|
-| `name` | string | match key, exact, `basename(argv[0])` (exe fallback) |
+| `name` | string | match key, exact, `basename(/proc/<pid>/exe)` (`argv[0]`, then comm as fallbacks) |
 | `name_regex` | string | unanchored regex, tried only when no exact name matches; first in load order wins; compiled once at load |
 | `cmdlines` | [string] | accepted, ignored (lint note) |
 | `type` | string | type bundle reference; rule fields override; explicit `null` suppresses |
@@ -64,6 +64,20 @@ Sockets (`/run/aranicy/`, systemd `RuntimeDirectory`):
 `bias_collector_socket` / `collector_events_socket`; `collector_wait_ms`
 (default 5000) is the startup readiness budget — a missing collector is a
 loud failure, never silent rule-less operation.
+
+### Match identity (deliberate divergence from ananicy-cpp)
+
+ananicy-cpp keys a rule on `basename(argv[0])`. aranicy keys it on
+`basename(/proc/<pid>/exe)`, then `basename(argv[0])`, then the kernel comm.
+The executable is the only one of the three the task cannot rewrite:
+`exec -a` sets `argv[0]` and `prctl(PR_SET_NAME)` sets `comm`, so either one
+would let a process choose which rule it is matched against — borrowing a
+rule it was never meant to have, or evading its own. Two consequences worth
+knowing: a daemon that rewrites `argv[0]` (`postgres: checkpointer`,
+`nginx: worker`) now keeps matching its own binary, and a symlink or wrapper
+that execs another file matches by what it execs, not by the name it was
+invoked under. `aranicy match-test <name>` shows exactly what a name matches;
+`dump proc` reports the name the daemon derived for a live pid.
 
 **Sample contract** — defined once, as the Rust type
 `aranicy_wire::Sample` (`crates/aranicy-wire/src/lib.rs`) and its doc
@@ -165,7 +179,7 @@ the sampler `degraded` with the stable reason `transport down` — never
 silently live.
 
 - History keyed by the **kernel comm** (the `scx_lavd` sample namespace; rule
-  matching uses the separate argv[0]-derived name), with fuzzy keying: a
+  matching uses the separate executable-derived name), with fuzzy keying: a
   `bias_group.<tag> = <regex>` family pools every matching comm into one entry
   named `<tag>` (a build's cc1plus→as→ld→lto1 handoff learns as one stream),
   otherwise per-instance suffixes (`kworker/u97:10` → `kworker/u97`) and one
@@ -174,6 +188,12 @@ silently live.
 - Applied nice = `clamp(rule_nice + bias, -20, 19)`; unruled names synthesize a
   policy when bias ≠ 0. Live check: `/proc/<pid>/stat` field 19 (`nice`) must
   equal that value (field 18 is `nice + 20`).
+- **PID 1 is never a target**, rule or no rule: a policy for it always asks for
+  the kernel default (0), which also unwinds a value an older build left there.
+  The learned axis additionally skips any comm matching `bias_protect`
+  (default: `systemd dbus-broker dbus-daemon sshd gdm sddm polkitd elogind`,
+  prefix-matched because comm is capped at 15 bytes). Explicit rules still
+  apply to those names — the list gates only the learned axis.
 - Closed loop: applied values are re-checked against the nice observed in the
   lavd sample stream (`static_prio` there = nice + 20), against the value this
   daemon actually applied — never against re-derived rules. A mismatch freezes
@@ -224,7 +244,7 @@ Config keys (all `bias_*`): `bias_enable`, `bias_min`, `bias_max`,
 `bias_window_s`, `bias_deadband_pct`, `bias_min_samples`, `bias_cadence_ms`,
 `bias_max_entries`, `bias_half_life_s`, `bias_state_path`,
 `bias_collector_socket`, `bias_starved_min_demand`, `bias_starved_ratio`,
-`bias_shadow`, `bias_lean_stage_min_ns`, `bias_lean_hop_hz`, plus
+`bias_shadow`, `bias_lean_stage_min_ns`, `bias_lean_hop_hz`, `bias_protect`, plus
 the non-`bias_*` collector keys `collector_events_socket` and
 `collector_wait_ms`, and repeatable `bias_group.<tag> = <regex>` family
 declarations (first definition wins; bad tags/regexes warn and skip).

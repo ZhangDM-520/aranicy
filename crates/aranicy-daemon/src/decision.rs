@@ -130,6 +130,15 @@ fn eff_nice_for(rule_nice: Option<i8>, target: i8, applied: Option<i8>) -> Optio
     }
 }
 
+/// Whether the learned axis may move this process at all.
+///
+/// PID 1 is handled above (it is never a target at all); this is the name
+/// axis: [`Config::bias_protect`], matched as a comm prefix because `comm` is
+/// capped at 15 bytes.
+fn bias_may_apply(cfg: &Config, comm: &str) -> bool {
+    !cfg.bias_protect.iter().any(|p| comm.starts_with(p.as_str()))
+}
+
 /// Decide for one process seen at `pid`.
 ///
 /// `name` is the match name bytes (capture-time resolution, or the local
@@ -158,12 +167,36 @@ pub fn plan<'a>(
     // closest valid stand-in (both callers did this, so it lives here).
     let comm = std::str::from_utf8(comm).unwrap_or(name);
 
+    // Init is never a policy target, rule or no rule: it owns the whole
+    // machine, and "no rule corpus is worth renicing PID 1". Anything an
+    // older daemon left there is put back to the kernel default.
+    if pid == 1 {
+        return Plan::Apply {
+            policy: Policy {
+                nice: Some(0),
+                ..Policy::default()
+            },
+            target: 0,
+            base: 0,
+            key: BiasKey { name, comm },
+        };
+    }
+
     let matched = rules.lookup(name);
     let base = matched.as_ref().map_or(0, |(p, _)| p.nice.unwrap_or(0));
-    let (target, applied) = if cfg.bias_enable {
+    // The learned axis is a bet on the workload. PID 1 and the core system
+    // services are not a workload: losing the journal or the session manager
+    // loses the machine, and nothing in the rules asked for it. An explicit
+    // rule still applies to them — the operator asked for that by name.
+    let (target, applied) = if !cfg.bias_enable {
+        (base, None)
+    } else if bias_may_apply(cfg, comm) {
         (bias.target_nice(comm, base), bias.applied_nice(comm))
     } else {
-        (base, None)
+        // No new bias, but a claim recorded before this name was protected
+        // (or before an upgrade changed the default list) must still unwind:
+        // carrying `applied` is what lets `eff_nice_for` ask for `base`.
+        (base, bias.applied_nice(comm))
     };
     let eff_nice = eff_nice_for(matched.as_ref().and_then(|(p, _)| p.nice), target, applied);
     let key = BiasKey { name, comm };
@@ -659,6 +692,92 @@ mod tests {
     }
 
     #[test]
+    fn protected_names_take_no_learned_bias() {
+        let rules = RuleSet::empty();
+        let engine = Mutex::new(engine_with("systemd", 3));
+        let cfg = Config::default(); // "systemd" is in the default list
+
+        let plan = plan_locked(b"systemd", b"systemd", 209, &rules, &engine, &cfg);
+        assert_eq!(
+            plan,
+            Plan::Skip {
+                reason: Skip::NoRule
+            },
+            "a protected name with no rule and no claim must be left alone"
+        );
+    }
+
+    #[test]
+    fn a_rule_still_applies_to_a_protected_name_but_without_the_bias() {
+        let rules = rules_with("systemd", Some(5));
+        let engine = Mutex::new(engine_with("systemd", 3));
+        let cfg = Config::default();
+
+        let plan = plan_locked(b"systemd", b"systemd", 209, &rules, &engine, &cfg);
+        let Plan::Apply { policy, target, .. } = &plan else {
+            panic!("an explicit rule must still apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(5), "the rule value, not 5 + 3");
+        assert_eq!(*target, 5);
+    }
+
+    #[test]
+    fn a_protected_name_unwinds_a_claim_recorded_before_protection() {
+        let rules = RuleSet::empty();
+        let engine = Mutex::new(engine_with("systemd", 2));
+        let cfg = Config::default();
+        // What a pre-fix daemon (or an upgrade) left behind: PID 1 at +2.
+        engine.lock().unwrap().note_applied("systemd", Some(2));
+
+        let plan = settle(
+            plan_locked(b"systemd", b"systemd", 209, &rules, &engine, &cfg),
+            2,
+        );
+        let Plan::Apply { policy, target, .. } = &plan else {
+            panic!("a stale claim on a protected name must be corrected, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(0), "drifted init must be brought back");
+        assert_eq!(*target, 0);
+    }
+
+    #[test]
+    fn pid_one_is_only_ever_put_back_to_the_kernel_default() {
+        let fork = |rules: RuleSet, comm: &'static str| {
+            let engine = Mutex::new(engine_with(comm, 3));
+            let cfg = Config::default();
+            let plan = plan_locked(comm.as_bytes(), comm.as_bytes(), 1, &rules, &engine, &cfg);
+            let Plan::Apply { policy, target, .. } = plan else {
+                panic!("pid 1 must always be planned towards 0, got {plan:?}");
+            };
+            (policy.nice, target)
+        };
+
+        // No rule, a learned bias of +3, and a name outside the protect list:
+        // none of it may reach init.
+        assert_eq!(fork(RuleSet::empty(), "init"), (Some(0), 0));
+        // An explicit rule is not a licence either.
+        assert_eq!(fork(rules_with("init", Some(19)), "init"), (Some(0), 0));
+        // Nor is a rule that raises priority.
+        assert_eq!(fork(rules_with("init", Some(-20)), "init"), (Some(0), 0));
+    }
+
+    #[test]
+    fn an_empty_protect_list_leaves_only_pid_one_protected() {
+        let rules = RuleSet::empty();
+        let engine = Mutex::new(engine_with("systemd", 3));
+        let cfg = Config {
+            bias_protect: Vec::new(),
+            ..Config::default()
+        };
+
+        let plan = plan_locked(b"systemd", b"systemd", 500, &rules, &engine, &cfg);
+        let Plan::Apply { policy, .. } = &plan else {
+            panic!("with the list cleared, a non-init pid must be biased, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(3));
+    }
+
+    #[test]
     fn failed_nice_apply_releases_the_claim() {
         let rules = rules_with("cc1plus", Some(5));
         let engine = Mutex::new(engine_with("cc1plus", 3));
@@ -761,16 +880,19 @@ mod tests {
         let (exec, drift) = (Counters::default(), Counters::default());
         let fake = FakeApplier::new(ActionOutcome::Applied);
 
-        let plan = plan_locked(b"cc1plus", b"cc1plus", 1, &rules, &engine, &cfg);
-        execute(plan, 1, &fake, &exec, &Sink::new(&cfg, &engine, Route::Exec));
+        // Any ordinary pid: pid 1 is reserved for init and never carries a
+        // bias, which would make this a different test.
+        let pid = 4321;
+        let plan = plan_locked(b"cc1plus", b"cc1plus", pid, &rules, &engine, &cfg);
+        execute(plan, pid, &fake, &exec, &Sink::new(&cfg, &engine, Route::Exec));
 
         // Drift re-plans the same process (already at the target: NoChange)
         // and one unmanaged process (NoRule): scan traffic, tallied apart.
         let settled = settle(
-            plan_locked(b"cc1plus", b"cc1plus", 1, &rules, &engine, &cfg),
+            plan_locked(b"cc1plus", b"cc1plus", pid, &rules, &engine, &cfg),
             8,
         );
-        execute(settled, 1, &fake, &drift, &Sink::new(&cfg, &engine, Route::Drift));
+        execute(settled, pid, &fake, &drift, &Sink::new(&cfg, &engine, Route::Drift));
         let stranger = plan_locked(b"nobody", b"nobody", 2, &rules, &engine, &cfg);
         execute(
             stranger,

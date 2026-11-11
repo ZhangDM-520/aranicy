@@ -69,6 +69,14 @@ pub struct Config {
     /// one pooled entry named `<tag>`. Raw (tag, regex-source) pairs; compiled
     /// once at startup (invalid regexes are warned and skipped there).
     pub bias_groups: Vec<(String, String)>,
+    /// Comm prefixes whose LEARNED bias is never applied (rules still are).
+    /// The learned axis is a bet on the workload; betting on init, the journal
+    /// or the display manager loses the whole machine. PID 1 is protected
+    /// structurally and needs no entry here. Prefix matching exists because
+    /// `comm` is capped at 15 bytes (`systemd-journald` arrives as
+    /// `systemd-journal`), so the default one entry `systemd` covers the
+    /// whole family.
+    pub bias_protect: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -167,6 +175,8 @@ config_key_table! {
     "bias_lean_hop_hz" => Reconfigurable . bias_lean_hop_hz;
     // Changing a family re-keys the history (the tag IS the history key).
     "bias_group.*" => Reconfigurable . bias_groups;
+    // Read by `decision::plan` from the per-event config snapshot.
+    "bias_protect" => Live . bias_protect;
     // Restart-only: captured at startup, named by the reload.
     "bias_enable" => RestartOnly . bias_enable;
     "bias_cadence_ms" => RestartOnly . bias_cadence_ms;
@@ -178,6 +188,21 @@ config_key_table! {
     // Accepted for compatibility, applied by nothing (warned at load).
     "x3d_mode" => AcceptedOnly . x3d_mode;
 }
+
+/// Comm prefixes the learned bias never touches unless the operator says
+/// otherwise: init's own services and the pieces that keep a session
+/// reachable. Rules can still target them — this gates the learned axis only.
+/// `comm` is capped at 15 bytes, hence the prefix rule and the short entries.
+pub const DEFAULT_BIAS_PROTECT: &[&str] = &[
+    "systemd",
+    "dbus-broker",
+    "dbus-daemon",
+    "sshd",
+    "gdm",
+    "sddm",
+    "polkitd",
+    "elogind",
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -218,6 +243,10 @@ impl Default for Config {
             bias_half_life_s: 1800,
             bias_state_path: "/var/lib/aranicy/bias-state".into(),
             bias_groups: Vec::new(),
+            bias_protect: DEFAULT_BIAS_PROTECT
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             warnings: Vec::new(),
         }
     }
@@ -324,6 +353,15 @@ impl Config {
                     Ok(v) => cfg.bias_half_life_s = v,
                     Err(_) => bad(&mut cfg, "bias_half_life_s (u64)"),
                 },
+                // Space- or comma-separated; an empty value clears the list
+                // (protects nothing beyond PID 1, which needs no entry).
+                "bias_protect" => {
+                    cfg.bias_protect = value
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
                 "bias_state_path" => {
                     if value.is_empty() {
                         cfg.warnings
@@ -736,6 +774,7 @@ mod tests {
             bias_half_life_s: 1,
             bias_state_path: "/var/lib/aranicy/other".into(),
             bias_groups: vec![("g".into(), "^x$".into())],
+            bias_protect: vec!["zz".into()],
             warnings: Vec::new(),
         };
         let changed = Config::default().changed_keys(&sentinel);
@@ -749,7 +788,7 @@ mod tests {
         assert_eq!(unique.len(), changed.len(), "duplicate key rows");
 
         let count = |l: Liveness| CONFIG_KEYS.iter().filter(|s| s.liveness == l).count();
-        assert_eq!(count(Liveness::Live), 14);
+        assert_eq!(count(Liveness::Live), 15);
         assert_eq!(count(Liveness::Reconfigurable), 14);
         assert_eq!(count(Liveness::RestartOnly), 7);
         assert_eq!(count(Liveness::AcceptedOnly), 1);

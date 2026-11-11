@@ -2,9 +2,10 @@
 //!
 //! Hot path contract: every helper here works on caller-provided stack buffers
 //! and performs no heap allocation. Name resolution order (docs/
-//! COMPATIBILITY.md): `basename(argv[0])` from `/proc/<pid>/cmdline` (first
-//! NUL-terminated argument only, capped), then `basename(/proc/<pid>/exe)`
-//! with a trailing `" (deleted)"` stripped, then the event's comm bytes.
+//! COMPATIBILITY.md): `basename(/proc/<pid>/exe)` with a trailing
+//! `" (deleted)"` stripped, then `basename(argv[0])` from
+//! `/proc/<pid>/cmdline` (first NUL-terminated argument only, capped), then
+//! the event's comm bytes.
 //!
 //! `/proc` access goes through [`ProcResolver`]: `/proc` is opened once as a
 //! dirfd (`O_PATH|O_DIRECTORY|O_CLOEXEC`) and per-event reads use
@@ -216,19 +217,25 @@ impl ProcResolver {
     /// name's length (0 = unresolved). `comm` is the kernel comm hint (may be
     /// empty). No heap allocation.
     pub fn derive_name(&self, pid: u32, comm: &[u8], buf: &mut [u8; NAME_CAP]) -> usize {
-        // 1. basename(argv[0]) from cmdline (single read, first NUL arg only).
-        if let Some(n) = self.read_at(pid, b"cmdline", buf) {
-            let arg0_len = first_nul_arg(&buf[..n]).len();
-            let name_len = compact_basename(buf, arg0_len);
+        // 1. basename of /proc/<pid>/exe (readlink), " (deleted)" stripped.
+        //    The executable is the only field the process cannot choose: both
+        //    `argv[0]` (exec -a) and `comm` (prctl) are writable by the task
+        //    itself, so either one lets any process select which rule it is
+        //    matched against. This is a deliberate divergence from
+        //    ananicy-cpp's argv[0] key, see docs/COMPATIBILITY.md.
+        if let Some(n) = self.link_at(pid, b"exe", buf) {
+            let target_len = strip_deleted(&buf[..n]).len();
+            let name_len = compact_basename(buf, target_len);
             if name_len > 0 {
                 return name_len;
             }
         }
 
-        // 2. basename of /proc/<pid>/exe (readlink), " (deleted)" stripped.
-        if let Some(n) = self.link_at(pid, b"exe", buf) {
-            let target_len = strip_deleted(&buf[..n]).len();
-            let name_len = compact_basename(buf, target_len);
+        // 2. basename(argv[0]) from cmdline (single read, first NUL arg only),
+        //    for the cases where /proc/<pid>/exe is unreadable.
+        if let Some(n) = self.read_at(pid, b"cmdline", buf) {
+            let arg0_len = first_nul_arg(&buf[..n]).len();
+            let name_len = compact_basename(buf, arg0_len);
             if name_len > 0 {
                 return name_len;
             }
@@ -506,6 +513,38 @@ mod tests {
         let mut buf = [0u8; NAME_CAP];
         let n = derive_name(u32::MAX - 1, b"ghost-comm", &mut buf);
         assert_eq!(&buf[..n], b"ghost-comm");
+    }
+
+    #[test]
+    fn the_executable_wins_over_argv_zero() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("argsentinel")
+            .spawn()
+            .expect("spawn sleep");
+        // Prove the fixture: argv[0] really is the sentinel, or the test is
+        // asserting nothing. The child's cmdline is briefly empty between
+        // fork and exec, so poll before believing it.
+        let path = format!("/proc/{}/cmdline", child.id());
+        let mut cmdline = Vec::new();
+        for _ in 0..200 {
+            cmdline = std::fs::read(&path).unwrap_or_default();
+            if !cmdline.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(cmdline.starts_with(b"argsentinel"), "{cmdline:?}");
+        let mut buf = [0u8; NAME_CAP];
+        let n = derive_name(child.id(), b"", &mut buf);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            &buf[..n],
+            b"sleep",
+            "identity must be the executed file, not the string argv[0] chose"
+        );
     }
 
     #[test]
