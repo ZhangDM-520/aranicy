@@ -47,21 +47,27 @@ but learned biases keep applying and age out gracefully
 
 ## Status
 
-Implemented and benchmarked (2026-10-22): **6.0× cheaper than ananicy-cpp
-under a 2 000 execs/s spawn storm (2.28% vs 13.7% of one core)**, applying
-policies at exec time. Read that number with its conditions: a uniform paced
-storm on an otherwise idle host, daemon only, no rule corpus. Real workloads
-differ — a parallel build delivers 2 000-5 000 execs/s in clustered bursts,
-the bias engine's window work scales with the observed task count, and on a
-2-vCPU box the same absolute cost is a larger share of a core. The budget is
-a target for the storm protocol, not a guarantee for your machine; measure
-your own with `tools/storm/` (source tree) or `pidstat -p $(pgrep aranicy)`. 112 unit/integration tests (2026-10-28). See
+Implemented and benchmarked (2026-10-22). The headline number is the one that
+describes what you install: **12.3% of one core at 2 000 execs/s for the pair**
+(daemon 6.1 + collector 6.2) on the benchmark host, against ananicy-cpp's
+13.7% for a single process. The older figures — 2.28% and "6.0× cheaper" —
+measure the retired single-process architecture and are kept in
+BENCHMARKS.md for comparison only; do not read them as this build's cost.
+
+Both numbers carry their conditions: a uniform paced storm on an otherwise
+idle 12-core host, no rule corpus. Real workloads differ — a parallel build
+delivers 2 000-5 000 execs/s in clustered bursts, the bias engine's window
+work scales with the observed task count, and on a 2-vCPU box the same
+absolute cost is a larger share of a core. The budget is a target for the
+storm protocol, not a guarantee for your machine; measure your own with
+`pidstat -p $(pgrep aranicy),$(pgrep aranicy-collectord)` (the `tools/storm/`
+harness is in the source tree, not in the package). 112 unit/integration tests (2026-10-28). See
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full measurement protocol
 and results.
 
 - Compatibility surface: [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - Measurements and acceptance target: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-- Benchmark harness: [tools/storm/](tools/storm/)
+- Benchmark harness: `tools/storm/` in the source tree (not shipped)
 
 ## Build
 
@@ -114,8 +120,9 @@ files in `/etc/ananicy.d/` (`*.rules`, `*.types`, `*.cgroups`, scanned
 recursively) or point `ANANICY_CPP_CONFDIR` at a corpus; `aranicy lint`
 reports `0 rules` until you do, and the daemon warns about it at startup.
 
-The packaged documentation is `/usr/share/doc/aranicy/README.md`,
-`COMPATIBILITY.md` and `BENCHMARKS.md`.
+The packaged documentation is `/usr/share/doc/aranicy/README.md` plus
+`docs/COMPATIBILITY.md` and `docs/BENCHMARKS.md` under the same directory
+(relative links below resolve from there).
 
 ### From the tree
 

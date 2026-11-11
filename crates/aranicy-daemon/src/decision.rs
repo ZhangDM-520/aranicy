@@ -193,6 +193,16 @@ pub fn plan<'a>(
         };
     }
 
+    // The daemon's own process is where the policy executes, not where it
+    // applies: a corpus entry named `aranicy` used to walk the daemon from the
+    // unit's Nice=-5 to +19 and the unit kept claiming -5. Same for the
+    // collector (its comm is in the default protect list).
+    if pid == std::process::id() {
+        return Plan::Skip {
+            reason: Skip::NoRule,
+        };
+    }
+
     let matched = rules.lookup(name);
     let base = matched.as_ref().map_or(0, |(p, _)| p.nice.unwrap_or(0));
     // The learned axis is a bet on the workload. PID 1 and the core system
@@ -792,6 +802,22 @@ mod tests {
                 reason: Skip::NoRule
             },
             "the unit's Nice= must survive: the daemon is not its own workload"
+        );
+    }
+
+    #[test]
+    fn a_rule_cannot_retune_the_daemon_itself() {
+        let rules = rules_with("aranicy", Some(19));
+        let engine = Mutex::new(engine_with("aranicy", 0));
+        let cfg = Config::default();
+
+        let plan = plan_locked(b"aranicy", b"aranicy", std::process::id(), &rules, &engine, &cfg);
+        assert_eq!(
+            plan,
+            Plan::Skip {
+                reason: Skip::NoRule
+            },
+            "the unit's Nice= is the operator's statement about the daemon itself"
         );
     }
 

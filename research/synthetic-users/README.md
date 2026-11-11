@@ -5,6 +5,13 @@ The point is to reproduce how a project improves from *outside* issue reports:
 users who know nothing about the design use the shipped package, file issues,
 and the project triages, fixes and re-verifies them.
 
+## The workflow, as a skill
+
+The reusable procedure (rounds, triage gate, fix discipline, the pitfalls that
+cost a round each) is the user-invoked skill `synthetic-user-review`
+(`~/.agents/skills/synthetic-user-review/SKILL.md`). This directory is its
+reference implementation: run the skill, read the harness.
+
 ## The clean-room guarantee
 
 A persona receives **only** a payload directory:

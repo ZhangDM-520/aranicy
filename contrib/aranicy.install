@@ -1,7 +1,9 @@
-# Keep going on upgrade/reinstall: the files below are replaced, the unit is
-# handled by the daemon's own restart logic on the next `systemctl start`.
+# A reinstall replaces the binary under a *running* process: systemd keeps the
+# old inode alive, so the machine keeps running the previous build and applies
+# nothing new until someone notices. Restart it (no-op if it is not running).
 post_upgrade() {
     systemctl --quiet daemon-reload 2>/dev/null || true
+    systemctl --quiet try-restart aranicy.service 2>/dev/null || true
 }
 
 # A daemon that outlives its package keeps applying priorities from deleted

@@ -110,6 +110,13 @@ fn lint(paths: &paths::Paths) -> anyhow::Result<()> {
     };
     let mut warned = false;
     for w in &cfg.warnings {
+        // A config file that does not exist is not a corpus defect: the daemon
+        // runs on defaults in that case too. Reporting it as a failure made
+        // `lint` unusable as a gate on a rules-only checkout.
+        if w.contains("not found; using defaults") {
+            eprintln!("note: config: {w}");
+            continue;
+        }
         eprintln!("warning: config: {w}");
         warned = true;
     }
@@ -119,7 +126,10 @@ fn lint(paths: &paths::Paths) -> anyhow::Result<()> {
     }
     // A green lint over an empty corpus is the worst answer this command can
     // give: it is the state every fresh install starts in.
-    if cfg.rule_load && load::rule_count(&rules) == 0 {
+    // Only a corpus with nothing in it at all: a `.types`- or
+    // `.cgroups`-only tree is legitimate (the rules that use them may live in
+    // another directory), and it must stay green.
+    if cfg.rule_load && load::rule_count(&rules) == 0 && rules.types.is_empty() && rules.cgroups.is_empty() {
         eprintln!(
             "warning: 0 rules loaded from {}: this corpus will apply nothing",
             paths.config_dir.display()
@@ -140,8 +150,9 @@ fn lint(paths: &paths::Paths) -> anyhow::Result<()> {
 }
 
 /// Dry-run matcher: never applies anything, no root required.
-fn match_test(name: &str, paths: &paths::Paths) -> anyhow::Result<()> {
+fn match_test(input: &str, paths: &paths::Paths) -> anyhow::Result<()> {
     let (_cfg, rules) = load::load_all(paths)?;
+    let name = input;
     // Look the argument up as given first: a rule may legitimately name a task
     // whose comm contains a slash (`kworker/0:1-events`), and stripping to the
     // basename would report a name the task does not have. Path arguments
@@ -149,7 +160,12 @@ fn match_test(name: &str, paths: &paths::Paths) -> anyhow::Result<()> {
     let name = if rules.lookup(name).is_some() {
         name
     } else {
-        procname::normalize_cli_name(name)
+        // Two attempts, and the fallback only decides which name matched - an
+        // argument that matches nothing is reported as the user typed it.
+        match procname::normalize_cli_name(name) {
+            base if rules.lookup(base).is_some() => base,
+            _ => name,
+        }
     };
     match rules.lookup(name) {
         Some((policy, kind)) => {
@@ -166,7 +182,7 @@ fn match_test(name: &str, paths: &paths::Paths) -> anyhow::Result<()> {
             Ok(())
         }
         None => {
-            eprintln!("match-test: no rule matches {name:?}");
+            eprintln!("match-test: no rule matches {input:?}");
             std::process::exit(1);
         }
     }

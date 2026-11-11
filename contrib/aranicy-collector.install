@@ -11,6 +11,7 @@ post_install() {
 
 post_upgrade() {
     systemctl --quiet daemon-reload 2>/dev/null || true
+    systemctl --quiet try-restart aranicy-collector.service 2>/dev/null || true
 }
 
 post_remove() {

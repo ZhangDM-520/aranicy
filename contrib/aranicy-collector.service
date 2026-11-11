@@ -2,6 +2,11 @@
 Description=aranicy collector - scheduler-agnostic BPF task statistics
 Documentation=https://github.com/ZhangDM-520/aranicy
 After=local-fs.target
+# Symmetric lifecycle: the daemon `Requires=` us (start together, and our
+# failure stops it), so a stop of the daemon must stop us too - otherwise
+# `systemctl stop aranicy` leaves a root BPF collector sampling a machine
+# nothing is acting on.
+PartOf=aranicy.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
