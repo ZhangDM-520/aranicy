@@ -48,6 +48,25 @@ green/clean — the done-gate for any code wave).
   one-off burst (each restored entry re-stamps wants on the first slew pass). Bias state comes from `aranicy dump bias` and
   `/var/lib/aranicy/bias-state`.
 
+## Outside-user testing (2026-11-11) — Last reviewed: 2026-11-11
+
+- Procedure: skill `synthetic-user-review`; harness `research/synthetic-users/`;
+  results `docs/reviews/2026-11-11-synthetic-usage.md`. Reuse both, do not
+  re-derive the VM/cloud-init details.
+- A root daemon that derives a match name from data the task controls
+  (`argv[0]`, `comm`) is a confused deputy: any user can borrow a rule,
+  including one that raises priority. Identity is `/proc/<pid>/exe`.
+- The dominant defect class in 65 outside reports was **silence**, not
+  breakage: empty corpus, unknown type/cgroup, skipped file, unusable cpuset,
+  a quota that is created but not applied. Judge a new feature by what it
+  says when it does nothing.
+- "Nothing puts it back" is its own class: check stop, uninstall, lost state
+  and upgrade, not only the running path. PID 1 and the daemon's own pid are
+  never targets (the unit file owns its Nice).
+- Subagents inherit the parent's cwd and project instructions; run persona
+  agents from a directory outside the repo and audit their artefacts
+  (`harness/audit.sh`, HARD = tokens absent from the shipped package).
+
 ## Pitfalls & lessons
 
 ## eBPF event source (aranicy-events) — Last reviewed: 2026-10-22
