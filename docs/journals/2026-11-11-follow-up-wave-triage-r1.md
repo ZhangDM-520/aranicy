@@ -113,15 +113,18 @@ and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
 - `an_unidentifiable_process_is_not_counted_as_a_revert` passes through the
   pre-existing non-UTF-8 early return, so it does not exercise the `Apply`
   gate it claims;
-- the `comm`-carries-a-separator sentence is broader than the truth (a
-  userspace `comm` can contain `/` via `prctl`, it just never becomes the
-  match key while `/proc/<pid>/exe` is readable);
+- the `comm`-carries-a-separator sentence was broader than the truth (a
+  userspace `comm` can contain `/` via `prctl`; it is the key only when `exe`
+  and `argv[0]` both yield no basename) — **corrected in round 12**, in the
+  `name` row and in the `lint` message;
 - the privilege pin returns early on a root runner instead of asserting the
   `Stale` outcome root actually gets;
 - `PidFile::drop` unlinks by path without comparing the inode it locked, so an
   externally removed pidfile can end up deleting a successor's file;
-  `name_regex` containing `/` is as dead as a `name` and is not warned about;
-  and the two hook copies are byte-identical by inspection only.
+  a rule whose exact `name` *and* `name_regex` both require a separator loads
+  silently — the recorded limit, pinned in
+  `a_name_with_a_path_separator_is_reported_at_load`; and the two hook copies
+  are byte-identical by inspection only.
 
 ## Round 9: one MEDIUM (a sentence I wrote), three LOWs
 
@@ -145,8 +148,8 @@ same doc item. All four are fixed:
 
 `deferred: 8 items at round 9` — the round-8 list less the `name_regex` item
 this round addressed. The round-8 section is 7 bullets but 9 distinct items;
-counted as items, and with `name_regex` re-deferred by round 10, the open set
-is 9 again.
+counted as items, `name_regex` re-deferred by round 10 put the set back to 9,
+and round 12 closed the `comm` sentence, so 8 are open at this head.
 
 ## Round 10: the regex-death warning was unsound and is reverted
 
@@ -162,16 +165,37 @@ sound: the exact-`name` warning fires unless the rule has a *compiled*
 `name_regex` (an uncompiled one is no escape and the rule already warns about
 it), and the contract row says so.
 
-Round 11 reviewed that commit and returned **PASS on both axes** (Standards
-with two NITs, Spec with one LOW and four observations — all about this
-record's wording, none about the code). Round 10's items were all about the
-removed check and are closed by the commit, so the open set is again the
-round-8 list; the wording corrections above are round 11's follow-up.
-
 Pins: `a_name_with_a_path_separator_is_reported_at_load` now covers the plain
 name, a live regex beside a dead exact key, an uncompiled pattern beside a
-dead exact key, a live pattern that contains a separator, and the both-dead
-silence this section records as the limit.
+dead exact key, and a live pattern that contains a separator.
+
+Round 11 reviewed that commit and returned **PASS on both axes** (Standards
+with two NITs, Spec with one LOW and four observations — all about this
+record's wording, none about the code). Its findings were all about the
+removed check and are closed by the follow-up, so the open set is the round-8
+list again.
+
+## Round 12: three wording defects in the contract and the ledger
+
+Round 12 reviewed round 11's follow-up: Standards FIX-FIRST (three MEDIUM),
+Spec PASS (three LOW). None is a code defect. The `name` row's new
+parenthetical contradicted its own next clause — a `comm` set via `prctl`
+*can* reach the key when `exe` and `argv[0]` yield no basename, which is not
+"the one separator-bearing comm … is a kernel thread". The `name_regex` row
+claimed the rest of the rule still applies (false for a regex-only rule) and
+called itself the only exception to "bad lines … are skipped" (a `cpuset` or
+`cgroup` that cannot be applied is another). The deferred ledger still counted
+the `comm` sentence as open after the row fixed it. The both-dead pin's
+message claimed the pattern matched no key while the rule's own path key is
+registered.
+
+All are corrected here: the row now scopes the claim to "matches no normal
+process" and names the shapes that can still present a separator (kernel
+thread, zombie, a non-dumpable task without `CAP_SYS_PTRACE`), the
+`name_regex` row says the rule's other fields apply when another key matches,
+the ledger marks the `comm` item closed and counts 8, and the pin asserts both
+that no basename matches and that the path key does. The `lint` message now
+states the same condition as the row.
 
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes

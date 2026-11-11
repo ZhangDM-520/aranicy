@@ -484,10 +484,12 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
         "the exact key still wins for `foo`"
     );
 
-    // Both keys dead is the recorded limit: the exact key is dead and the
-    // pattern matches no match key, but a pattern's reach is undecidable from
-    // its text, so the rule loads silently. Keep this pin honest if a language
-    // check ever replaces it.
+    // The recorded limit: no *basename* key can match this rule (the exact key
+    // is a path, the pattern needs one), so it is dead weight for every process
+    // the daemon acts on — yet a pattern's reach is undecidable from its text,
+    // so it loads silently. The rule itself is registered: a key carrying a
+    // separator would match it. Keep this pin honest if a language check ever
+    // replaces the limit.
     let f = Fixture::new("path-name-both-dead");
     f.write(
         "10-a.rules",
@@ -495,7 +497,12 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
     );
     let rs = f.load_default();
     assert!(messages(&rs).is_empty(), "{:?}", rs.warnings);
-    assert!(rs.lookup("foo").is_none(), "the pattern matches no match key");
+    assert!(rs.lookup("foo").is_none(), "no basename key matches it");
+    assert_eq!(
+        rs.lookup("/usr/bin/foo").map(|(p, kind)| (p.nice, kind)),
+        Some((Some(5), MatchKind::Exact)),
+        "the rule is registered; only a basename key is out of reach"
+    );
 }
 
 #[test]
