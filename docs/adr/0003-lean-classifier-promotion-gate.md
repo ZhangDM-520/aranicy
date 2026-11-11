@@ -50,8 +50,9 @@ BULK-at-~200 entries) and no build: the capture is taken on an idle VM.
 1. **Disagreement < 10 % of decided entries, over at least 200 decided
    entries**, computed by the replay, not by the live counters (the live
    denominator includes deadband windows). The replay reports the ratio as
-   `null` and `gate_cohort_ok: false` below that count: a small cohort cannot
-   clear the gate by being empty or unanimous.
+   `null` when nothing was decided, and `gate_cohort_ok: false` below that
+   count, so a small cohort cannot clear the gate by being empty or
+   unanimous — the operator has to read the flag, not the percentage.
 2. **Every inversion is inspected, not just counted** — the ADR 0001 flip gate.
    A chatty interactive name classified `Bulk` (the `shell` shape) is a
    blocker even if the percentage passes: that is the +3 the engine would add.

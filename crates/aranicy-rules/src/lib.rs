@@ -339,15 +339,30 @@ pub fn load_dir(dir: &Path, opts: &LoadOptions) -> std::io::Result<RuleSet> {
                 .extend(host_cpuset_warning(&draft.file, draft.line, cs, opts)),
             None => {}
         }
+        // A match key is a basename (exe, then argv[0]) or a comm. A comm may
+        // carry a separator (`kworker/0:1-events`), but kernel threads are
+        // never touched, so a pattern or a name that requires one can only
+        // describe a target this daemon refuses to act on. The regex is
+        // checked first: when it is dead the whole definition is, whatever the
+        // exact name says.
+        if let Some(pattern) = &draft.pattern {
+            if pattern.contains('/') {
+                resolve_warnings.push(LoadWarning {
+                    file: draft.file.clone(),
+                    line: draft.line,
+                    message: format!(
+                        "name_regex {pattern:?} contains a path separator; a match key is a \
+                         basename and the only separator-bearing comm is a kernel thread, \
+                         which is never touched — this definition can never apply"
+                    ),
+                });
+            }
+        }
         if let Some(name) = &draft.name {
-            // The match key is a basename (exe, then argv[0]) or a kernel
-            // comm. A comm may carry a separator (`kworker/0:1-events`), but
-            // kernel threads are never touched, so a name with one can only
-            // ever describe a target this daemon refuses to act on.
-            //
-            // Only when the rule has no regex: with one, the exact key is dead
-            // but the definition still applies, and a red `lint` would be a
-            // false alarm.
+            // Only when the rule has no regex at all: with a live one the exact
+            // key is dead but the definition still applies (a red `lint` would
+            // be a false alarm), and with a dead one the warning above already
+            // says the definition cannot apply.
             if draft.pattern.is_none() && name.contains('/') {
                 resolve_warnings.push(LoadWarning {
                     file: draft.file.clone(),

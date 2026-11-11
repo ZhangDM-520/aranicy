@@ -52,7 +52,7 @@ release_cgroups() (
             left=1
         fi
     done < "$record"
-    } || true
+    } || { [ ! -e "$record" ] || left=1; }
     # Keep the ledger when something is still pinned: a later run can retry,
     # and without the file those directories are unreachable forever.
     if [ "$left" = 0 ]; then

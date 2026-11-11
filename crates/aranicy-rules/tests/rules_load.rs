@@ -451,6 +451,19 @@ fn a_name_with_a_path_separator_is_reported_at_load() {
         Some(Some(5)),
         "the regex still matches"
     );
+
+    // A regex that itself requires a path separator is dead (no match key has
+    // one), so a rule whose exact key is also dead is reported — once, for the
+    // regex.
+    let f = Fixture::new("path-name-both-dead");
+    f.write(
+        "10-a.rules",
+        "{\"name\": \"/usr/bin/foo\", \"name_regex\": \"^/usr/bin/foo$\", \"nice\": 5}\n",
+    );
+    let rs = f.load_default();
+    let m = messages(&rs);
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(m[0].contains("name_regex") && m[0].contains("path separator"), "{m:?}");
 }
 
 #[test]

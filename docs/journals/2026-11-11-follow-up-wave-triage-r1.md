@@ -123,6 +123,31 @@ and `kept_cpuset` as what the pass *planned* rather than a count of syscalls.
   `name_regex` containing `/` is as dead as a `name` and is not warned about;
   and the two hook copies are byte-identical by inspection only.
 
+## Round 9: one MEDIUM (a sentence I wrote), three LOWs
+
+Standards returned FIX-FIRST on a documentation claim introduced in the
+round-8 commit — ADR 0003 said the replay reports `null` for every cohort below
+200, which is true only for an empty one (a 150-entry cohort returns a number
+with `gate_cohort_ok: false`) — plus three LOWs; Spec returned PASS with the
+same doc item. All four are fixed:
+
+- ADR 0003 gate 1 now says "`null` when nothing was decided, and
+  `gate_cohort_ok: false` below that count", which is what the tool does and
+  what its tests pin.
+- `COMPATIBILITY.md`'s `name` row now carries the `name_regex` exception, and
+  documents that a `name_regex` containing `/` is dead for the same reason and
+  warns.
+- rules: a `name_regex` containing a path separator now warns, so a rule whose
+  exact name *and* pattern both require one is no longer silent (one warning
+  naming the regex, mutation-probed red).
+- hooks: `} || { [ ! -e "$record" ] || left=1; }` — a redirect failure that is
+  not "the ledger vanished" keeps the ledger instead of letting `rm -f` delete
+  the only pointer to still-throttled cgroups.
+
+`deferred: 9 low/nit at round 9` — the round-8 list plus `released` counting a
+learned `nice` that is re-applied rather than reset (documented), and the
+inert `Apply` gating pin (documented).
+
 Reported for the record, not actioned (outside the reviewed diff): the
 reviewer's Q5 notes that `apply_cgroup=false` does not evacuate processes
 already placed in a cgroup, and that drift remains nice-only. Both are
