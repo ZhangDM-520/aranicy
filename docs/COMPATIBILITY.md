@@ -49,6 +49,24 @@ ananicy-cpp's OS order).
 3. Apply order (parity): nice → latency_nice → sched+rtprio → ioclass+ionice →
    oom_score_adj → cgroup → cpuset. Gates from `ananicy.conf` apply.
 
+### Trust model (read this before writing a corpus)
+
+The daemon runs as root and applies the corpus to every matching process, as
+ananicy-cpp does. Two consequences follow from that and neither is an
+oversight:
+
+* **The corpus is root's policy.** Keep `/etc/ananicy.d` owned by root and not
+  group/world-writable; a rule is an instruction to run `setpriority`,
+  `sched_setscheduler` and friends on anything that matches.
+* **A rule that raises priority is reachable by any user.** Identity is the
+  executable, so an unprivileged process can copy any binary, name it after a
+  rule (`cp /bin/sleep /tmp/game`), exec it, and receive that rule's
+  `rtprio`/negative `nice` from the root daemon. The same holds for a rule that
+  *lowers* priority, which is the useful direction and the reason the tool
+  exists. If that is not acceptable on a multi-user box, keep elevation rules
+  (`sched`, `rtprio`, negative `nice`, negative `latency_nice`) out of the
+  corpus and grant priority by cgroup/`systemd-run` instead.
+
 ## Dynamic nice bias (superset)
 
 Optional dynamic nice adjustment driven by per-task samples from
