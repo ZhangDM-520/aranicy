@@ -342,7 +342,6 @@ pub fn reconcile<'a>(
     let name = std::str::from_utf8(name).ok()?;
     let comm = std::str::from_utf8(comm).unwrap_or(name);
     let old_policy = old.lookup(name).map(|(p, _)| p);
-    let still_matched = new.lookup(name).is_some();
     match plan(name.as_bytes(), comm.as_bytes(), pid, new, bias, cfg) {
         Plan::Apply {
             mut policy,
@@ -350,8 +349,11 @@ pub fn reconcile<'a>(
             base,
             key,
         } => {
-            if !still_matched {
-                fill_released(&mut policy, old_policy?);
+            // Whatever the old rule set and the new plan does not is given
+            // back — a deleted rule and a field deleted from a live rule are
+            // the same reconciliation.
+            if let Some(old) = old_policy {
+                fill_released(&mut policy, old);
             }
             Some(Plan::Apply {
                 policy,
@@ -960,6 +962,33 @@ mod tests {
         assert_eq!(policy.autogroup, Some(0));
         assert!(policy.sched.is_none(), "the old rule set no scheduler");
         assert!(policy.cpuset.is_none());
+    }
+
+    /// `kaz-8` is also "the field was deleted, the rule stayed": the old
+    /// ionice was never revisited, so it has to be given back the same way.
+    #[test]
+    fn a_field_removed_from_a_live_rule_is_given_back_too() {
+        let old = rules_of(
+            "game",
+            Policy {
+                nice: Some(-5),
+                ioclass: Some(IoClass::BestEffort),
+                ionice: Some(7),
+                ..Policy::default()
+            },
+        );
+        let new = rules_with("game", Some(-5));
+        let engine = Mutex::new(engine_with("game", 0));
+        let cfg = Config::default();
+
+        let plan = reconcile_locked(b"game", b"game", 4242, &old, &new, &engine, &cfg)
+            .expect("a matched process is re-planned");
+        let Plan::Apply { policy, .. } = &plan else {
+            panic!("expected an apply, got {plan:?}");
+        };
+        assert_eq!(policy.nice, Some(-5), "the surviving field is the new rule's");
+        assert_eq!(policy.ioclass, Some(IoClass::None), "the deleted field is reset");
+        assert_eq!(policy.ionice, Some(0));
     }
 
     #[test]
