@@ -4,7 +4,6 @@ collector/target
 *.swp
 /.idea
 /.vscode
-/.logs/
 # benchmark generator (built by `gcc -O2 -o tools/storm/storm …`, see BENCHMARKS)
 tools/storm/storm
 __pycache__/

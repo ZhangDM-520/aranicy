@@ -23,7 +23,7 @@ A persona receives **only** a payload directory:
 | `MANIFEST.txt` | commit, sha256, build host, payload file list |
 
 Nothing else — no source tree, no `.git`, no `AGENTS.md`, no `docs/`, no
-`.logs/`, no harness scripts. This is structural: the payload directory is
+harness scripts. This is structural: the payload directory is
 built by `harness/build-payload.sh` from `git archive` of a commit, and only
 that directory is mounted into the environment.
 
