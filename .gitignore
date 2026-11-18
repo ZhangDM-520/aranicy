@@ -8,9 +8,9 @@ collector/target
 tools/storm/storm
 __pycache__/
 
-# synthetic-user harness: cloud image cache, VM disks, keys, raw runs
+# untracked harness cache left on disk (cloud image, payloads); the harness
+# itself is retired
 research/synthetic-users/.cache/
-research/synthetic-users/runs/*/transcripts/
 
 # crate-local test scratch (scratch_dir fallback when CARGO_TARGET_TMPDIR is unset)
 crates/*/target/

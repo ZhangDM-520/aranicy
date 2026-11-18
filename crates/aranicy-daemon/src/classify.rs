@@ -1,8 +1,10 @@
-//! The two-axis class boundary (candidate 7b, `docs/reviews/2026-11-08-wave2-design.md` §7.4/§7.5).
+//! The two-axis class boundary (candidate 7b, wave-2 design §7.4/§7.5, in the maintainer's
+//! private warehouse).
 //!
 //! `score = s0²` is dominated by the *interaction rate*
 //! (`ilog2(wait_ft·wake_ft)`), so a compiler that never sleeps and an idle
-//! audio daemon that rarely wakes look alike (`docs/adr/0001-classifier-boundary.md`).
+//! audio daemon that rarely wakes look alike (ADR 0001, in the maintainer's private
+//! warehouse).
 //! This module separates the two axes again, absolutely:
 //!
 //! ```text

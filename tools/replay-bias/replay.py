@@ -3,9 +3,9 @@
 
 Loads a `bias-state` file (v1 JSON), joins stored `score_ema`/`class` labels
 with a candidate boundary, and reports whether an absolute anchor would
-preserve them. This is the stage-0 gate from
-`docs/reviews/2026-11-08-wave2-design.md` section 7.7, written down so the next
-classifier change is measurable instead of asserted.
+preserve them. This is the stage-0 gate from the wave-2 design, section 7.7 (in
+the maintainer's private warehouse), written down so the next classifier change
+is measurable instead of asserted.
 
 The labels in the file were produced by the *population* boundary, so the
 sweep only shows compatibility, never accuracy — the best threshold recovers

@@ -279,11 +279,11 @@ silently live.
   actuated**. It logs `bias shadow name=… old=… new=… lean=… burst_ns=…
   hop_hz=…` once per name per 10 min when the two disagree, plus a
   `bias shadow summary windows=… disagreements=… unilateral=…` line per
-  10 min. The flip gate is `docs/adr/0001-classifier-boundary.md`: shadow data
-  over ≥ 1000 classified name-windows, disagreements ≤ the current boundary's
-  high-confidence violation rate, and no known-role regression. `bias_shadow`,
-  `bias_lean_stage_min_ns` (default 64 000) and `bias_lean_hop_hz` (default 100)
-  are all **reconfigurable** on reload.
+  10 min. The flip gate is ADR 0001 (in the maintainer's private warehouse):
+  shadow data over ≥ 1000 classified name-windows, disagreements ≤ the current
+  boundary's high-confidence violation rate, and no known-role regression.
+  `bias_shadow`, `bias_lean_stage_min_ns` (default 64 000) and
+  `bias_lean_hop_hz` (default 100) are all **reconfigurable** on reload.
 - Slew & fairness: attack (away from 0 toward the class target) ≤ 1 step per
   `attack_step_s` (30 s default) from want-onset; release (toward 0) ≤ 1 step
   per `release_step_s` (300 s); one bias step globally per 5 s. The attack
