@@ -3,7 +3,8 @@
 Vocabulary for humans and agents. Architecture terms (module, interface, depth,
 seam, adapter, leverage, locality) come from the codebase-design glossary; this
 file defines only the *domain*. Decisions are recorded as ADRs in `docs/adr/`
-(none yet).
+(0001 classifier boundary, 0002 live re-plan on reload, 0003 lean promotion
+gate); list them with `ls docs/adr/`.
 
 ## Roles
 

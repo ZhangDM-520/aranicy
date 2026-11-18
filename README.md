@@ -61,9 +61,10 @@ work scales with the observed task count, and on a 2-vCPU box the same
 absolute cost is a larger share of a core. The budget is a target for the
 storm protocol, not a guarantee for your machine; measure your own with
 `pidstat -p $(pgrep aranicy),$(pgrep aranicy-collectord)` (the `tools/storm/`
-harness is in the source tree, not in the package). 112 unit/integration tests (2026-10-28). See
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full measurement protocol
-and results.
+harness is in the source tree, not in the package). Count the gate yourself:
+`cargo test --workspace` (daemon crates) plus `cd collector && cargo test`
+(the BPF half). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full
+measurement protocol and results.
 
 - Compatibility surface: [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - Measurements and acceptance target: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
